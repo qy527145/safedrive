@@ -128,13 +128,18 @@ impl Storage for LocalFs {
         // 原子写：同目录临时文件 + rename
         let tmp = parent.join(format!(".sd-tmp-{}", uuid::Uuid::new_v4()));
         let result: ApiResult<()> = async {
-            let mut file = tokio::fs::File::create(&tmp).await?;
+            // HTTP body 往往由许多较小的数据帧组成；先聚合成较大的顺序写，
+            // 避免每帧都向 Tokio 的文件 I/O 后端提交一次操作。
+            let file = tokio::fs::File::create(&tmp).await?;
+            let mut file = tokio::io::BufWriter::with_capacity(256 * 1024, file);
             while let Some(chunk) = body.next().await {
                 let chunk = chunk?;
                 file.write_all(&chunk).await?;
             }
             file.flush().await?;
-            file.sync_all().await?;
+            // 上传成功要求原子可见，不要求每个分卷都强制物理落盘。逐卷
+            // sync_all 会在 Windows/SSD 上引入明显停顿；系统仍会正常回写缓存。
+            drop(file.into_inner());
             tokio::fs::rename(&tmp, &dst).await?;
             Ok(())
         }

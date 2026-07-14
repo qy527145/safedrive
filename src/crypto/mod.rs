@@ -20,7 +20,7 @@
 //! 由目录 FK 派生：本目录的名字加密/认证密钥（见 names.rs）。
 
 pub mod names;
-pub mod unishox2;
+pub mod short_text;
 
 use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};

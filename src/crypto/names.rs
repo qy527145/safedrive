@@ -18,19 +18,19 @@
 //!   标签又是名字加密密钥的派生盐 —— 同父钥同明文同密文（确定性），
 //!   不同明文 keystream 必不相同；解码后重算比对，解不开/密钥不符/
 //!   篡改都失败 → 识别为外来文件。
-//! - flags：bit0=目录，bit1=名字经 unishox2 压缩（压不小则存原文）；
+//! - flags：bit0=目录，bit1=名字经纯 Rust 短文本编码压缩（压不小则存原文）；
 //!   `size` LEB128 varint（目录恒 0）—— 一次 list 即见名字与大小。
 //!
 //! 固定开销 21 字节（siv 4 + flags 1 + secret 16）≈ 12 汉字 + 名字本体。
 //! 「测试视频.mp4」约 25 字。存储名 ≤255 字节（85 汉字）→ 纯中文原名
-//! 上限约 50 字（unishox2 压缩后）。
+//! 上限约 50 字（短文本压缩后）。
 
 use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use super::{SECRET_LEN, name_cipher_key, name_mac_key, unishox2};
+use super::{SECRET_LEN, name_cipher_key, name_mac_key, short_text};
 
 const SIV_LEN: usize = 4;
 const FLAG_DIR: u8 = 0b01;
@@ -141,6 +141,12 @@ fn cjk_encode(raw: &[u8]) -> String {
     out
 }
 
+fn cjk_encoded_chars(raw_len: usize) -> usize {
+    let full = raw_len / 7 * 4;
+    let remainder = raw_len % 7;
+    full + if remainder == 0 { 0 } else { (remainder * 8).div_ceil(14) + 1 }
+}
+
 fn cjk_decode(s: &str) -> Option<Vec<u8>> {
     let chars: Vec<u32> = s.chars().map(|c| c as u32).collect();
     if chars.is_empty() {
@@ -195,18 +201,25 @@ fn cjk_decode(s: &str) -> Option<Vec<u8>> {
 /// `parent_key` 是父目录的 FK（根目录条目用数据源 FK_root）。超长返回 None。
 pub fn encode_name(parent_key: &[u8], meta: &NameMeta) -> Option<String> {
     let mut flags = if meta.is_dir { FLAG_DIR } else { 0 };
-    let name_bytes = match unishox2::compress(&meta.name) {
-        Some(c) => {
+    let mut size_bytes = Vec::with_capacity(10);
+    write_varint(&mut size_bytes, if meta.is_dir { 0 } else { meta.size });
+    let fixed_len = SIV_LEN + 1 + SECRET_LEN + size_bytes.len();
+    let plain_name = meta.name.as_bytes();
+    let name_bytes = match short_text::compress(&meta.name).filter(|compressed| {
+        cjk_encoded_chars(fixed_len + compressed.len())
+            < cjk_encoded_chars(fixed_len + plain_name.len())
+    }) {
+        Some(compressed) => {
             flags |= FLAG_COMPRESSED;
-            c
+            compressed
         }
-        None => meta.name.as_bytes().to_vec(),
+        None => plain_name.to_vec(),
     };
 
-    let mut payload = Vec::with_capacity(1 + SECRET_LEN + 10 + name_bytes.len());
+    let mut payload = Vec::with_capacity(1 + SECRET_LEN + size_bytes.len() + name_bytes.len());
     payload.push(flags);
     payload.extend_from_slice(&meta.secret);
-    write_varint(&mut payload, if meta.is_dir { 0 } else { meta.size });
+    payload.extend_from_slice(&size_bytes);
     payload.extend_from_slice(&name_bytes);
 
     let siv = siv4(parent_key, &payload);
@@ -244,7 +257,7 @@ pub fn decode_name(parent_key: &[u8], enc: &str) -> Option<NameMeta> {
     let size = read_varint(&payload, &mut pos)?;
     let name_bytes = &payload[pos..];
     let name = if flags & FLAG_COMPRESSED != 0 {
-        unishox2::decompress(name_bytes, MAX_PLAIN_NAME)?
+        short_text::decompress(name_bytes, MAX_PLAIN_NAME)?
     } else {
         String::from_utf8(name_bytes.to_vec()).ok()?
     };
@@ -339,7 +352,7 @@ mod tests {
         let b = encode_name(&fk, &m).unwrap();
         assert_eq!(a, b, "SIV 模式：同父钥同明文同密文");
         assert!(a.chars().all(|c| ('\u{4E00}'..='\u{8E06}').contains(&c)), "{a}");
-        // 21B 开销 + varint 3B + unishox ~15B ≈ 39B → ⌈39*8/14⌉+1 ≈ 24 字
+        // 21B 开销 + varint 3B + 短文本压缩约 15B ≈ 39B → ⌈39*8/14⌉+1 ≈ 24 字
         assert!(a.chars().count() <= 26, "过长: {} 字 ({a})", a.chars().count());
 
         let firsts: std::collections::HashSet<char> = (0..40)
@@ -347,6 +360,16 @@ mod tests {
                 .chars().next().unwrap())
             .collect();
         assert!(firsts.len() > 30, "首字符应接近均匀分布: {firsts:?}");
+    }
+
+    #[test]
+    fn compression_never_expands_the_storage_name() {
+        let fk = gen_secret();
+        let short = encode_name(&fk, &meta("电影", 0, true)).unwrap();
+        // 不压缩时总长恰为 28B = 4 组 cjk14 = 16 字；虽然短文本编码
+        // 可把名字从 6B 压到 5B，但会触发 cjk14 尾标记，实际反而是 17 字。
+        assert_eq!(short.chars().count(), 16);
+        assert_eq!(decode_name(&fk, &short).unwrap().name, "电影");
     }
 
     #[test]

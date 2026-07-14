@@ -39,7 +39,7 @@ cargo build --release
 │ Rust 服务端（axum）                                          │
 │   /api/files/*  明文路径文件 API（list/mkdir/rename/…/upload）│
 │   /stream/{ds}/{path}  流式解密数据面（Range/206、断开即停）   │
-│   crypto  ChaCha20 + HKDF + 名称编码 v4（全汉字 + unishox2）   │
+│   crypto  ChaCha20 + HKDF + 名称编码 v5（全汉字 + 纯 Rust 压缩）│
 │   vault   密码本（一文件一随机密码）                          │
 │   engine  分片规划 / 并行拉取 / 顺序拼接                       │
 ├─────────────────────────────────────────────────────────────┤

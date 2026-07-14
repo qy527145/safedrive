@@ -408,6 +408,11 @@ async fn fetch_chunk(
 
 // ---------------- 上传：流式加密 + 分卷切写 ----------------
 
+/// 已封口但仍在等待存储端响应的最大分卷数。允许少量重叠可隐藏 WebDAV
+/// 每次 PUT 的响应延迟，同时限制临时任务与连接占用。
+const MAX_PENDING_UPLOADS: usize = 2;
+type UploadTask = (mpsc::Sender<io::Result<Bytes>>, JoinHandle<ApiResult<()>>);
+
 /// 把明文流加密并按分卷写入 `enc_folder/names[i]`。
 /// `names` 必须来自 `gen_chunk_names(pw, chunk_count(total, volume_size))`。
 /// 实际字节数与 `total` 不符即报错（调用方负责清理）。
@@ -434,28 +439,68 @@ where
     let mut vol_idx = 0usize;
     let mut sent_in_vol = 0u64;
     let mut received = 0u64;
-    let mut current: Option<(mpsc::Sender<io::Result<Bytes>>, JoinHandle<ApiResult<()>>)> = None;
+    let mut current: Option<UploadTask> = None;
+    let mut pending = std::collections::VecDeque::<JoinHandle<ApiResult<()>>>::new();
 
-    async fn finish(
-        cur: &mut Option<(mpsc::Sender<io::Result<Bytes>>, JoinHandle<ApiResult<()>>)>,
-    ) -> ApiResult<()> {
-        let Some((tx, handle)) = cur.take() else { return Ok(()) };
+    async fn close_current(
+        cur: &mut Option<UploadTask>,
+        pending: &mut std::collections::VecDeque<JoinHandle<ApiResult<()>>>,
+    ) {
+        let Some((tx, handle)) = cur.take() else { return };
         drop(tx); // 关闭写端 → put 的输入流结束
-        handle.await.map_err(|e| ApiError::Internal(anyhow::anyhow!("上传任务 panic: {e}")))?
+        pending.push_back(handle);
+    }
+
+    async fn wait_one(
+        pending: &mut std::collections::VecDeque<JoinHandle<ApiResult<()>>>,
+    ) -> ApiResult<()> {
+        let Some(handle) = pending.pop_front() else { return Ok(()) };
+        handle
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("上传任务 panic: {e}")))?
+    }
+
+    async fn wait_all(
+        pending: &mut std::collections::VecDeque<JoinHandle<ApiResult<()>>>,
+    ) -> ApiResult<()> {
+        let mut first_error = None;
+        while let Some(handle) = pending.pop_front() {
+            let result = handle
+                .await
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("上传任务 panic: {e}")))
+                .and_then(|result| result);
+            if first_error.is_none() {
+                first_error = result.err();
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     while let Some(item) = body.next().await {
-        let item = item.map_err(|e| ApiError::BadRequest(format!("请求体读取失败: {e}")))?;
+        let item = match item {
+            Ok(item) => item,
+            Err(e) => {
+                close_current(&mut current, &mut pending).await;
+                let _ = wait_all(&mut pending).await;
+                return Err(ApiError::BadRequest(format!("请求体读取失败: {e}")));
+            }
+        };
         if item.is_empty() {
             continue;
         }
         received += item.len() as u64;
         if received > total {
+            close_current(&mut current, &mut pending).await;
+            let _ = wait_all(&mut pending).await;
             return Err(ApiError::BadRequest("实际字节数超过声明大小".into()));
         }
-        let mut buf = item.to_vec();
+        // Axum/Hyper 通常会交付独占 Bytes，此时可直接取得其底层缓冲并原地
+        // 加密；只有共享缓冲才回退到复制。
+        let mut buf = item
+            .try_into_mut()
+            .unwrap_or_else(|shared| bytes::BytesMut::from(shared.as_ref()));
         cipher.apply_keystream(&mut buf);
-        let mut b = Bytes::from(buf);
+        let mut b = buf.freeze();
 
         while !b.is_empty() {
             if current.is_none() {
@@ -484,27 +529,35 @@ where
             };
             if !send_ok {
                 // put 任务提前退出（必然带错）→ 取回真实错误
-                finish(&mut current).await?;
+                close_current(&mut current, &mut pending).await;
+                wait_all(&mut pending).await?;
                 return Err(ApiError::Upstream("分卷写入提前中断".into()));
             }
             sent_in_vol += take as u64;
             if sent_in_vol == cap {
-                finish(&mut current).await?;
+                close_current(&mut current, &mut pending).await;
                 vol_idx += 1;
+                if pending.len() >= MAX_PENDING_UPLOADS
+                    && let Err(e) = wait_one(&mut pending).await
+                {
+                    let _ = wait_all(&mut pending).await;
+                    return Err(e);
+                }
             }
         }
     }
 
     if received != total {
         // 尽力收尾（忽略其结果，尺寸不符已是致命错误）
-        let _ = finish(&mut current).await;
+        close_current(&mut current, &mut pending).await;
+        let _ = wait_all(&mut pending).await;
         return Err(ApiError::BadRequest(format!(
             "实际字节数 {received} 与声明大小 {total} 不符"
         )));
     }
     // total>0 时最后一卷在 received==total 时恰好收口；防御性检查
-    finish(&mut current).await?;
-    Ok(())
+    close_current(&mut current, &mut pending).await;
+    wait_all(&mut pending).await
 }
 
 #[cfg(test)]
@@ -717,4 +770,5 @@ mod tests {
         assert_eq!(l.total, 0);
         assert!(l.volumes.is_empty());
     }
+
 }

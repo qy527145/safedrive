@@ -1309,7 +1309,6 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
- "cc",
  "chacha20 0.9.1",
  "clap",
  "dirs",
