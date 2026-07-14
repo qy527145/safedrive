@@ -1,0 +1,788 @@
+//! 明文路径文件 API + 流式代理（模仿 hydraria 的 /stream 数据平面）。
+//!
+//! v5 密钥架构（cryptree 信封链）：每个条目的秘密装在自己的加密名里，
+//! 用父目录 FK 派生的密钥加密。路径解析 = 从数据源根钥逐层 list + 解名
+//! 下钻；服务端用纯内存缓存加速（云端为准，miss 按需重建）。
+//! 云端数据 + 根钥 = 完整可恢复，没有「先记密码本再传字节」的顺序问题。
+
+use axum::body::Body;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::response::Response;
+use axum::routing::{get, post, put};
+use axum::{Json, Router};
+use futures_util::TryStreamExt;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::Arc;
+
+use crate::adapters::sanitize;
+use crate::crypto::names::{NameMeta, decode_name, encode_name};
+use crate::crypto::{SECRET_LEN, chunk_count, gen_chunk_names, gen_secret};
+use crate::engine::{self, RangeSpec, StreamParams};
+use crate::error::{ApiError, ApiResult};
+use crate::state::AppState;
+use crate::vault::CachedNode;
+
+pub fn api_routes() -> Router<AppState> {
+    Router::new()
+        .route("/files/{ds}/list", get(list))
+        .route("/files/{ds}/mkdir", post(mkdir))
+        .route("/files/{ds}/rename", post(rename))
+        .route("/files/{ds}/delete", post(delete))
+        .route("/files/{ds}/delete-foreign", post(delete_foreign))
+        .route("/files/{ds}/upload", put(upload))
+}
+
+/// /stream 挂在 /api 之外：供 <video>/VLC/下载器直接消费，鉴权走 ?token=。
+pub fn stream_routes() -> Router<AppState> {
+    Router::new().route("/stream/{ds}/{*path}", get(stream).head(stream))
+}
+
+// ---------------- 信封链解析 ----------------
+
+/// 解析结果：一个已定位的节点。
+#[derive(Clone)]
+pub(crate) struct Resolved {
+    /// 该节点自己的秘密（文件 pw / 目录 FK）。
+    pub(crate) secret: [u8; SECRET_LEN],
+    /// 加密它名字的父钥（重命名/移动/重编码时需要）。
+    pub(crate) parent_key: [u8; SECRET_LEN],
+    /// 存储端密文全路径。
+    pub(crate) enc_path: String,
+    pub(crate) nc: String,
+    pub(crate) dir: bool,
+    /// 解码本目录条目名的备选密钥（仅根目录在换密码过渡期非空：
+    /// 旧密码信封尚未迁移完时读路径回退用）。
+    pub(crate) alt_keys: Vec<[u8; SECRET_LEN]>,
+}
+
+impl Resolved {
+    /// 解码子条目名的密钥优先级列表：主钥在前。
+    fn decode_keys(&self) -> Vec<[u8; SECRET_LEN]> {
+        let mut keys = vec![self.secret];
+        keys.extend(self.alt_keys.iter().copied());
+        keys
+    }
+}
+
+/// 根「节点」：数据源根目录（无 nc，秘密即 FK_root）。
+fn resolve_root(state: &AppState, ds: &str) -> ApiResult<Resolved> {
+    let mut candidates = state.root_key_candidates_of(ds)?;
+    let fk = candidates.remove(0);
+    Ok(Resolved {
+        secret: fk,
+        parent_key: [0u8; SECRET_LEN], // 根没有父钥，永不用于编码
+        enc_path: String::new(),
+        nc: String::new(),
+        dir: true,
+        alt_keys: candidates,
+    })
+}
+
+/// 在目录里查找名为 `seg` 的受管条目。同名多条（并发竞态遗留的副本）时
+/// 取 **nc 字典序最小者** 为规范条目 —— 规则确定性，所有请求收敛到同一个。
+async fn find_child(
+    storage: &dyn crate::adapters::Storage,
+    parent_enc: &str,
+    parent_keys: &[[u8; SECRET_LEN]],
+    seg: &str,
+) -> ApiResult<Option<(String, NameMeta)>> {
+    let entries = storage.list(parent_enc).await?;
+    let mut found: Option<(String, NameMeta)> = None;
+    for e in entries {
+        if !e.is_dir {
+            continue; // 受管条目必然是存储端目录
+        }
+        if let Some(meta) = decode_multi(parent_keys, &e.name) {
+            if meta.name == seg {
+                match &found {
+                    Some((nc, _)) if *nc <= e.name => {}
+                    _ => found = Some((e.name, meta)),
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// 依候选密钥顺序解码（主钥优先；过渡期旧钥回退）。
+fn decode_multi(keys: &[[u8; SECRET_LEN]], enc: &str) -> Option<NameMeta> {
+    keys.iter().find_map(|k| decode_name(k, enc))
+}
+
+/// 明文路径 → 节点。缓存只加速**祖先**定位；**最后一段永远向存储端
+/// 现场核实** —— 云端被外部改动（手动删除、别的工具写入）时以云端为准，
+/// 顺带清退失效缓存。祖先缓存失效（云端 list 不到）会整链回退重解析。
+pub(crate) async fn resolve(
+    state: &AppState,
+    storage: &dyn crate::adapters::Storage,
+    ds: &str,
+    path: &str,
+) -> ApiResult<Resolved> {
+    if path.is_empty() {
+        return resolve_root(state, ds);
+    }
+    let segs: Vec<&str> = path.split('/').collect();
+
+    // 祖先（不含最后一段）优先走缓存；miss/失效则从更浅处下钻
+    let parent = match segs.len() {
+        1 => resolve_root(state, ds)?,
+        _ => resolve_cached_dir(state, storage, ds, &segs[..segs.len() - 1]).await?,
+    };
+    if !parent.dir {
+        return Err(ApiError::NotFound(format!(
+            "{} 不是目录",
+            segs[..segs.len() - 1].join("/")
+        )));
+    }
+
+    // 叶子：现场 list 核实（这是防缓存幻觉的关键——upload 判存、
+    // stream 取数都依赖这里的真实性）
+    let seg = segs[segs.len() - 1];
+    match find_child(storage, &parent.enc_path, &parent.decode_keys(), seg).await? {
+        Some((nc, meta)) => {
+            state.cache.put(
+                ds,
+                path,
+                CachedNode { secret: meta.secret, nc: nc.clone(), dir: meta.is_dir },
+            );
+            Ok(Resolved {
+                secret: meta.secret,
+                parent_key: parent.secret,
+                enc_path: join_enc(&parent.enc_path, &nc),
+                nc,
+                dir: meta.is_dir,
+                alt_keys: Vec::new(),
+            })
+        }
+        None => {
+            state.cache.evict_subtree(ds, path); // 清退幻觉
+            Err(ApiError::NotFound(format!("路径不存在: {path}")))
+        }
+    }
+}
+
+/// 祖先目录解析：缓存命中即用（这里**不**逐层验证云端 —— 祖先失效时
+/// 后续 list 会报 NotFound，我们捕获后清退缓存整链重试一次）。
+async fn resolve_cached_dir(
+    state: &AppState,
+    storage: &dyn crate::adapters::Storage,
+    ds: &str,
+    segs: &[&str],
+) -> ApiResult<Resolved> {
+    match resolve_cached_dir_inner(state, storage, ds, segs).await {
+        Ok(n) => Ok(n),
+        Err(ApiError::NotFound(_)) => {
+            // 缓存可能整链失效（云端外部变更）：全部清退后纯下钻重试
+            state.cache.evict_subtree(ds, segs[0]);
+            resolve_cached_dir_inner(state, storage, ds, segs).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn resolve_cached_dir_inner(
+    state: &AppState,
+    storage: &dyn crate::adapters::Storage,
+    ds: &str,
+    segs: &[&str],
+) -> ApiResult<Resolved> {
+    // 从最深的已缓存前缀开始（parent_key 需要上一层的 secret，所以缓存
+    // 命中要求父层也可得——逐层向上回退直到根）。
+    let mut depth = segs.len();
+    let mut cur: Option<Resolved> = None;
+    while depth > 0 {
+        let prefix = segs[..depth].join("/");
+        if let Some(hit) = state.cache.get(ds, &prefix) {
+            let parent_key = if depth == 1 {
+                state.root_key_of(ds)?
+            } else {
+                match state.cache.get(ds, &segs[..depth - 1].join("/")) {
+                    Some(p) => p.secret,
+                    None => {
+                        depth -= 1;
+                        continue;
+                    }
+                }
+            };
+            let enc_parent = enc_path_of(state, ds, &segs[..depth - 1])?;
+            cur = Some(Resolved {
+                secret: hit.secret,
+                parent_key,
+                enc_path: join_enc(&enc_parent, &hit.nc),
+                nc: hit.nc,
+                dir: hit.dir,
+                alt_keys: Vec::new(),
+            });
+            break;
+        }
+        depth -= 1;
+    }
+    let mut node = match cur {
+        Some(n) => n,
+        None => resolve_root(state, ds)?,
+    };
+
+    // 从 depth 层继续向下钻
+    for (i, seg) in segs.iter().enumerate().skip(depth) {
+        if !node.dir {
+            return Err(ApiError::NotFound(format!("{} 不是目录", segs[..i].join("/"))));
+        }
+        let (nc, meta) = find_child(storage, &node.enc_path, &node.decode_keys(), seg)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("路径不存在: {}", segs[..=i].join("/"))))?;
+        let prefix = segs[..=i].join("/");
+        state.cache.put(
+            ds,
+            &prefix,
+            CachedNode { secret: meta.secret, nc: nc.clone(), dir: meta.is_dir },
+        );
+        node = Resolved {
+            secret: meta.secret,
+            parent_key: node.secret,
+            enc_path: join_enc(&node.enc_path, &nc),
+            nc,
+            dir: meta.is_dir,
+            alt_keys: Vec::new(),
+        };
+    }
+    Ok(node)
+}
+
+/// 由缓存拼出前缀的密文路径（调用方保证各段已缓存）。
+fn enc_path_of(state: &AppState, ds: &str, segs: &[&str]) -> ApiResult<String> {
+    let mut parts = Vec::with_capacity(segs.len());
+    for i in 0..segs.len() {
+        let prefix = segs[..=i].join("/");
+        let n = state
+            .cache
+            .get(ds, &prefix)
+            .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("缓存缺失: {prefix}")))?;
+        parts.push(n.nc);
+    }
+    Ok(parts.join("/"))
+}
+
+pub(crate) fn join_enc(parent_enc: &str, nc: &str) -> String {
+    if parent_enc.is_empty() { nc.to_string() } else { format!("{parent_enc}/{nc}") }
+}
+
+// ---------------- 列目录 ----------------
+
+#[derive(Deserialize)]
+struct PathQuery {
+    path: String,
+}
+
+async fn list(
+    State(state): State<AppState>,
+    Path(ds): Path<String>,
+    Query(q): Query<PathQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let path = sanitize(&q.path)?;
+    let storage = state.adapter(&ds)?;
+    let node = resolve(&state, storage.as_ref(), &ds, &path).await?;
+    if !node.dir {
+        return Err(ApiError::BadRequest(format!("{path} 不是目录")));
+    }
+    let raw = storage.list(&node.enc_path).await?;
+
+    // 第一遍：解名并按明文名分组，同名多条（并发竞态遗留副本）时
+    // nc 最小者为规范条目 —— 与 resolve/find_child 的选择规则一致。
+    let decode_keys = node.decode_keys();
+    let mut decoded: Vec<(crate::adapters::Entry, Option<NameMeta>)> = raw
+        .into_iter()
+        .map(|e| {
+            let meta = if e.is_dir { decode_multi(&decode_keys, &e.name) } else { None };
+            (e, meta)
+        })
+        .collect();
+    let mut canonical: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (e, meta) in &decoded {
+        if let Some(m) = meta {
+            canonical
+                .entry(m.name.clone())
+                .and_modify(|nc| {
+                    if e.name < *nc {
+                        *nc = e.name.clone();
+                    }
+                })
+                .or_insert_with(|| e.name.clone());
+        }
+    }
+
+    let mut entries = Vec::with_capacity(decoded.len());
+    for (e, meta) in decoded.drain(..) {
+        match meta {
+            Some(m) if canonical.get(&m.name) == Some(&e.name) => {
+                // 顺手回填缓存，后续 resolve 免下钻
+                let child_path =
+                    if path.is_empty() { m.name.clone() } else { format!("{path}/{}", m.name) };
+                state.cache.put(
+                    &ds,
+                    &child_path,
+                    CachedNode { secret: m.secret, nc: e.name.clone(), dir: m.is_dir },
+                );
+                entries.push(json!({
+                    "name": m.name,
+                    "isDir": m.is_dir,
+                    "size": m.size,
+                    "mtime": e.mtime,
+                    "foreign": false,
+                }));
+            }
+            // 非规范副本：按外来条目暴露（原始存储名），可用 delete-foreign 清理
+            Some(m) => {
+                tracing::warn!("发现同名副本（解密名 {}，存储名 {}），已按外来条目暴露", m.name, e.name);
+                entries.push(json!({
+                    "name": e.name,
+                    "isDir": e.is_dir,
+                    "size": e.size,
+                    "mtime": e.mtime,
+                    "foreign": true,
+                }));
+            }
+            None => entries.push(json!({
+                "name": e.name,
+                "isDir": e.is_dir,
+                "size": e.size,
+                "mtime": e.mtime,
+                "foreign": true,
+            })),
+        }
+    }
+    entries.sort_by(|a, b| {
+        let dir_a = a["isDir"].as_bool().unwrap_or(false);
+        let dir_b = b["isDir"].as_bool().unwrap_or(false);
+        dir_b.cmp(&dir_a).then_with(|| {
+            a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+        })
+    });
+    Ok(Json(json!({ "entries": entries })))
+}
+
+// ---------------- 新建目录 ----------------
+
+#[derive(Deserialize)]
+struct MkdirBody {
+    path: String,
+}
+
+async fn mkdir(
+    State(state): State<AppState>,
+    Path(ds): Path<String>,
+    Json(body): Json<MkdirBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let path = sanitize(&body.path)?;
+    if path.is_empty() {
+        return Err(ApiError::BadRequest("目录名不能为空".into()));
+    }
+    let storage = state.adapter(&ds)?;
+    ensure_dir(&state, storage.as_ref(), &ds, &path).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 确保明文目录 `path` 及其所有祖先存在。
+/// 全程持有数据源级 mkdir 锁：「云端判存 → mkdir」必须互斥，否则并发
+/// 上传同一文件夹会各自判到「不存在」、各建一个解密后同名的加密目录。
+/// 判存走 find_child（fresh list），不信缓存。
+async fn ensure_dir(
+    state: &AppState,
+    storage: &dyn crate::adapters::Storage,
+    ds: &str,
+    path: &str,
+) -> ApiResult<Resolved> {
+    let lock = state.mkdir_lock(ds);
+    let _guard = lock.lock().await;
+
+    let segs: Vec<&str> = path.split('/').collect();
+    let mut node = resolve_root(state, ds)?;
+    for (i, seg) in segs.iter().enumerate() {
+        let sub_path = segs[..=i].join("/");
+        // 锁内 fresh list 判存（同名多条时取规范条目，与 resolve 一致）
+        if let Some((nc, meta)) =
+            find_child(storage, &node.enc_path, &node.decode_keys(), seg).await?
+        {
+            if !meta.is_dir {
+                return Err(ApiError::BadRequest(format!("{sub_path} 已存在且是文件")));
+            }
+            state.cache.put(
+                ds,
+                &sub_path,
+                CachedNode { secret: meta.secret, nc: nc.clone(), dir: true },
+            );
+            node = Resolved {
+                secret: meta.secret,
+                parent_key: node.secret,
+                enc_path: join_enc(&node.enc_path, &nc),
+                nc,
+                dir: true,
+                alt_keys: Vec::new(),
+            };
+            continue;
+        }
+        // 创建这一段
+        let meta = NameMeta {
+            name: seg.to_string(),
+            size: 0,
+            is_dir: true,
+            secret: gen_secret(),
+        };
+        let nc = encode_name(&node.secret, &meta)
+            .ok_or_else(|| ApiError::BadRequest(format!("目录名过长: {seg}")))?;
+        let enc_path = join_enc(&node.enc_path, &nc);
+        storage.mkdir(&enc_path).await?;
+        state.cache.put(
+            ds,
+            &sub_path,
+            CachedNode { secret: meta.secret, nc: nc.clone(), dir: true },
+        );
+        node = Resolved {
+            secret: meta.secret,
+            parent_key: node.secret,
+            enc_path,
+            nc,
+            dir: true,
+            alt_keys: Vec::new(),
+        };
+    }
+    Ok(node)
+}
+
+// ---------------- 重命名 / 移动 ----------------
+
+#[derive(Deserialize)]
+struct RenameBody {
+    from: String,
+    to: String,
+}
+
+async fn rename(
+    State(state): State<AppState>,
+    Path(ds): Path<String>,
+    Json(body): Json<RenameBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let from = sanitize(&body.from)?;
+    let to = sanitize(&body.to)?;
+    if from.is_empty() || to.is_empty() {
+        return Err(ApiError::BadRequest("非法重命名路径".into()));
+    }
+    if to == from || to.starts_with(&format!("{from}/")) {
+        return Err(ApiError::BadRequest("不能移动到自身或其子目录".into()));
+    }
+    let storage = state.adapter(&ds)?;
+    let node = resolve(&state, storage.as_ref(), &ds, &from).await?;
+    // size 缓存路径下拿不到，从 nc 解出（decode 必然成功——刚 resolve 过）
+    let old_meta = decode_name(&node.parent_key, &node.nc)
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("无法解码 {from} 的密文名")))?;
+
+    // 目标父目录必须已存在且是目录
+    let to_parent = to.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+    let target_parent = resolve(&state, storage.as_ref(), &ds, to_parent).await?;
+    if !target_parent.dir {
+        return Err(ApiError::BadRequest(format!("{to_parent} 不是目录")));
+    }
+    // 目标名不能已存在
+    if resolve(&state, storage.as_ref(), &ds, &to).await.is_ok() {
+        return Err(ApiError::BadRequest("目标名称已存在".into()));
+    }
+
+    // 密钥入名的核心收益：换父钥重编码信封（secret 原样带走），
+    // 一次存储端 rename，子孙锚在 secret 上完全不动。
+    let new_last = to.rsplit('/').next().expect("非空路径必有末段");
+    let new_meta = NameMeta {
+        name: new_last.to_string(),
+        size: old_meta.size,
+        is_dir: node.dir,
+        secret: node.secret,
+    };
+    let new_nc = encode_name(&target_parent.secret, &new_meta)
+        .ok_or_else(|| ApiError::BadRequest(format!("名称过长: {new_last}")))?;
+    let enc_to = join_enc(&target_parent.enc_path, &new_nc);
+
+    storage.rename(&node.enc_path, &enc_to).await?;
+    // 缓存：旧子树全部失效（enc 路径变了），新位置回填根节点
+    state.cache.evict_subtree(&ds, &from);
+    state
+        .cache
+        .put(&ds, &to, CachedNode { secret: node.secret, nc: new_nc, dir: node.dir });
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------- 删除 ----------------
+
+#[derive(Deserialize)]
+struct DeleteBody {
+    path: String,
+}
+
+async fn delete(
+    State(state): State<AppState>,
+    Path(ds): Path<String>,
+    Json(body): Json<DeleteBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let path = sanitize(&body.path)?;
+    if path.is_empty() {
+        return Err(ApiError::BadRequest("不允许删除根目录".into()));
+    }
+    let storage = state.adapter(&ds)?;
+    let node = resolve(&state, storage.as_ref(), &ds, &path).await?;
+    match storage.delete(&node.enc_path).await {
+        Ok(()) | Err(ApiError::NotFound(_)) => {}
+        Err(e) => return Err(e),
+    }
+    state.cache.evict_subtree(&ds, &path);
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct DeleteForeignBody {
+    /// 外来条目所在的明文目录（"" = 根）。
+    path: String,
+    /// 存储端原始名字。
+    name: String,
+}
+
+async fn delete_foreign(
+    State(state): State<AppState>,
+    Path(ds): Path<String>,
+    Json(body): Json<DeleteForeignBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let dir = sanitize(&body.path)?;
+    let name = body.name.trim();
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        return Err(ApiError::BadRequest("非法名称".into()));
+    }
+    let storage = state.adapter(&ds)?;
+    let parent = resolve(&state, storage.as_ref(), &ds, &dir).await?;
+    // 允许删除：解不开的真外来条目，或解得开但非规范的同名副本；
+    // 只保护规范条目本身（请走常规删除）。
+    if let Some(m) = decode_multi(&parent.decode_keys(), name) {
+        let canonical =
+            find_child(storage.as_ref(), &parent.enc_path, &parent.decode_keys(), &m.name)
+                .await?
+                .map(|(nc, _)| nc);
+        if canonical.as_deref() == Some(name) {
+            return Err(ApiError::BadRequest("该条目是受管数据，请用常规删除".into()));
+        }
+    }
+    let target = join_enc(&parent.enc_path, name);
+    storage.delete(&target).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---------------- 上传 ----------------
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    /// 明文全路径（含文件名），如 "电影/2026/a.mp4"。
+    path: String,
+    /// 明文总字节数（分卷计划需要预知）。
+    size: u64,
+}
+
+async fn upload(
+    State(state): State<AppState>,
+    Path(ds): Path<String>,
+    Query(q): Query<UploadQuery>,
+    request: Request,
+) -> ApiResult<Json<serde_json::Value>> {
+    let path = sanitize(&q.path)?;
+    if path.is_empty() {
+        return Err(ApiError::BadRequest("文件路径不能为空".into()));
+    }
+    let strategy = state.strategy_of(&ds)?;
+    let storage = state.adapter_arc(&ds)?;
+
+    let (parent, file_name) = match path.rsplit_once('/') {
+        Some((p, n)) => (p.to_string(), n.to_string()),
+        None => (String::new(), path.clone()),
+    };
+
+    // 并发防线：同一路径同时只允许一个上传
+    let upload_key = format!("{ds}:{path}");
+    if !state.uploading.lock().unwrap().insert(upload_key.clone()) {
+        return Err(ApiError::BadRequest(format!("该文件正在上传中: {path}")));
+    }
+    struct UploadingGuard<'a>(&'a AppState, String);
+    impl Drop for UploadingGuard<'_> {
+        fn drop(&mut self) {
+            self.0.uploading.lock().unwrap().remove(&self.1);
+        }
+    }
+    let _uploading_guard = UploadingGuard(&state, upload_key);
+
+    // 文件夹上传：自动创建缺失的中间目录
+    let parent_node = if parent.is_empty() {
+        resolve_root(&state, &ds)?
+    } else {
+        ensure_dir(&state, storage.as_ref(), &ds, &parent).await?
+    };
+    // 同名检查（云端为准）
+    if resolve(&state, storage.as_ref(), &ds, &path).await.is_ok() {
+        return Err(ApiError::BadRequest(format!("已存在同名条目: {path}")));
+    }
+
+    // v5：秘密装在名字里，mkdir 即自洽 —— 无「先记密码本」顺序问题，
+    // 失败清理也只需删存储端文件夹（没有会变孤儿的密钥记录）。
+    let pw = gen_secret();
+    let nc = encode_name(
+        &parent_node.secret,
+        &NameMeta { name: file_name.clone(), size: q.size, is_dir: false, secret: pw },
+    )
+    .ok_or_else(|| ApiError::BadRequest(format!("文件名过长: {file_name}")))?;
+    let enc_folder = join_enc(&parent_node.enc_path, &nc);
+
+    // 不分卷策略：整文件一个分卷（volume_size = 文件大小）
+    let volume_size = strategy.volume_size.unwrap_or(q.size.max(1));
+    let names = if q.size == 0 {
+        Vec::new()
+    } else {
+        gen_chunk_names(&pw, chunk_count(q.size, volume_size))
+    };
+    let body = request.into_body().into_data_stream().map_err(std::io::Error::other);
+
+    let result: ApiResult<()> = async {
+        storage.mkdir(&enc_folder).await?;
+        engine::upload_stream(
+            Arc::clone(&storage),
+            &enc_folder,
+            &pw,
+            q.size,
+            volume_size,
+            &names,
+            Box::pin(body),
+        )
+        .await
+    }
+    .await;
+
+    if let Err(e) = result {
+        // 失败/取消：尽力清掉半成品（清不掉也只是留下可再删的密文垃圾）
+        if let Err(del_err) = storage.delete(&enc_folder).await {
+            if !matches!(del_err, ApiError::NotFound(_)) {
+                tracing::warn!("上传失败后清理 {enc_folder} 也失败: {del_err}");
+            }
+        }
+        return Err(e);
+    }
+    state
+        .cache
+        .put(&ds, &path, CachedNode { secret: pw, nc, dir: false });
+    Ok(Json(json!({ "ok": true, "volumes": names.len() })))
+}
+
+// ---------------- 流式下载 / 播放 ----------------
+
+#[derive(Deserialize)]
+struct StreamQuery {
+    #[serde(default)]
+    dl: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+/// /stream 鉴权：免登录模式直接放行；否则 Bearer 头或 ?token= 任一有效。
+fn check_stream_auth(state: &AppState, headers: &HeaderMap, token: Option<&str>) -> ApiResult<()> {
+    if state.admin_password.is_none() {
+        return Ok(());
+    }
+    let header_token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let candidate = header_token.or(token).unwrap_or("");
+    if !candidate.is_empty() && state.sessions.read().unwrap().contains(candidate) {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized)
+    }
+}
+
+async fn stream(
+    State(state): State<AppState>,
+    Path((ds, path)): Path<(String, String)>,
+    Query(q): Query<StreamQuery>,
+    method: Method,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    check_stream_auth(&state, &headers, q.token.as_deref())?;
+    let path = sanitize(&path)?;
+    let storage = state.adapter_arc(&ds)?;
+    let node = resolve(&state, storage.as_ref(), &ds, &path).await?;
+    if node.dir {
+        return Err(ApiError::BadRequest("不能下载目录".into()));
+    }
+    let meta = decode_name(&node.parent_key, &node.nc)
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("无法解码 {path} 的密文名")))?;
+    let transfer = state.settings.get();
+    let enc_folder = node.enc_path.clone();
+
+    // 布局：列分卷 + 前缀和（≈ hydraria probe，本地信息、开销小，不做缓存）
+    let layout = Arc::new(engine::load_layout(storage.as_ref(), &enc_folder, &node.secret).await?);
+    if layout.total != meta.size {
+        return Err(ApiError::Upstream(format!(
+            "云端分卷总大小 {} 与记录 {} 不符（数据可能被外部修改）",
+            layout.total, meta.size,
+        )));
+    }
+    let total = layout.total;
+
+    let file_name = meta.name;
+    let mime = mime_guess::from_path(&file_name).first_or_octet_stream();
+    let disposition = if q.dl.is_some() { "attachment" } else { "inline" };
+    let encoded_name = utf8_percent_encode(&file_name, NON_ALPHANUMERIC).to_string();
+
+    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    let (spec, open_ended) = engine::parse_range(range_header, total);
+
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, mime.essence_str())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("{disposition}; filename*=UTF-8''{encoded_name}"),
+        );
+
+    let (status, start, end) = match spec {
+        RangeSpec::Unsatisfiable => {
+            return builder
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+                .body(Body::empty())
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)));
+        }
+        RangeSpec::Full => (StatusCode::OK, 0, total.saturating_sub(1)),
+        RangeSpec::Slice { start, end } => {
+            builder = builder
+                .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"));
+            (StatusCode::PARTIAL_CONTENT, start, end)
+        }
+    };
+    let length = if total == 0 { 0 } else { end - start + 1 };
+    builder = builder.status(status).header(header::CONTENT_LENGTH, length);
+
+    if method == Method::HEAD || total == 0 {
+        return builder.body(Body::empty()).map_err(|e| ApiError::Internal(anyhow::anyhow!(e)));
+    }
+
+    let rx = engine::stream_range(
+        storage,
+        enc_folder,
+        node.secret,
+        layout,
+        start,
+        end,
+        open_ended,
+        &StreamParams {
+            max_split: transfer.max_split,
+            max_threads: transfer.max_threads,
+            max_per_volume: transfer.max_per_volume,
+        },
+    );
+    let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+    builder.body(body).map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))
+}

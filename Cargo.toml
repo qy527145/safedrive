@@ -1,0 +1,52 @@
+[package]
+name = "safedrive"
+version = "0.1.0"
+edition = "2024"
+description = "端到端零知识加密的数据源管理 Web 客户端（单二进制，前端嵌入）"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+bytes = "1"
+chacha20 = "0.9"
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+futures-util = "0.3"
+getrandom = "0.3"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+httpdate = "1"
+mime_guess = "2"
+percent-encoding = "2"
+quick-xml = "0.37"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+rust-embed = { version = "8", features = ["mime-guess"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[build-dependencies]
+cc = "1.2.67"
