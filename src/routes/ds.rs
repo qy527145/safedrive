@@ -56,32 +56,37 @@ fn validate(state: &AppState, body: &DsBody) -> ApiResult<()> {
             }
         }
         "baidupan" => {
-            let cookie = body
+            let has_bduss = body
+                .config
+                .get("bduss")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty());
+            let legacy_cookie_has_bduss = body
                 .config
                 .get("cookie")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if !cookie
-                .split(';')
-                .any(|part| part.trim().starts_with("BDUSS="))
-            {
-                return Err(ApiError::BadRequest(
-                    "百度网盘需要包含 BDUSS 的 cookie".into(),
-                ));
+                .and_then(|value| value.as_str())
+                .is_some_and(|cookie| {
+                    cookie
+                        .split(';')
+                        .any(|part| part.trim().starts_with("BDUSS="))
+                });
+            if !has_bduss && !legacy_cookie_has_bduss {
+                return Err(ApiError::BadRequest("百度网盘需要 BDUSS".into()));
             }
-            for (field, label) in [
-                ("clientId", "开放平台 API Key"),
-                ("clientSecret", "开放平台 Secret Key"),
-                ("refreshToken", "开放平台 Refresh Token"),
-            ] {
-                if body
-                    .config
-                    .get(field)
-                    .and_then(|value| value.as_str())
-                    .is_none_or(|value| value.trim().is_empty())
-                {
-                    return Err(ApiError::BadRequest(format!("百度网盘需要{label}")));
-                }
+            let has_client_id = body
+                .config
+                .get("clientId")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty());
+            let has_client_secret = body
+                .config
+                .get("clientSecret")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty());
+            if has_client_id != has_client_secret {
+                return Err(ApiError::BadRequest(
+                    "百度开放平台 API Key 与 Secret Key 必须同时填写或同时留空".into(),
+                ));
             }
             let root = body
                 .config

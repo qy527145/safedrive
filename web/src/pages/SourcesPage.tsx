@@ -12,12 +12,10 @@ interface FormValues {
   url?: string;
   username?: string;
   password?: string;
-  cookie?: string;
+  bduss?: string;
   userAgent?: string;
   clientId?: string;
   clientSecret?: string;
-  accessToken?: string;
-  refreshToken?: string;
 }
 
 /** 数据源管理：基础信息（由类型决定）+ 绑定数据映射策略。 */
@@ -61,12 +59,14 @@ export default function SourcesPage() {
       url: d.config.url,
       username: d.config.username,
       password: d.config.password,
-      cookie: d.config.cookie,
+      bduss:
+        d.config.bduss ??
+        (typeof d.config.cookie === 'string'
+          ? /(?:^|;\s*)BDUSS=([^;]+)/.exec(d.config.cookie)?.[1]
+          : undefined),
       userAgent: d.config.userAgent,
       clientId: d.config.clientId,
       clientSecret: d.config.clientSecret,
-      accessToken: d.config.accessToken,
-      refreshToken: d.config.refreshToken,
     });
     setDsType(d.type);
     setOpen(true);
@@ -74,6 +74,15 @@ export default function SourcesPage() {
 
   const onSubmit = async () => {
     const v = await form.validateFields();
+    const previousBduss =
+      editing?.config.bduss ??
+      (typeof editing?.config.cookie === 'string'
+        ? /(?:^|;\s*)BDUSS=([^;]+)/.exec(editing.config.cookie)?.[1]
+        : undefined);
+    const preserveTokens =
+      previousBduss === v.bduss &&
+      (editing?.config.clientId ?? '') === (v.clientId ?? '') &&
+      (editing?.config.clientSecret ?? '') === (v.clientSecret ?? '');
     const config: Record<string, string> =
       v.type === 'localfs'
         ? { root: v.root ?? '' }
@@ -81,12 +90,12 @@ export default function SourcesPage() {
           ? { url: v.url ?? '', username: v.username ?? '', password: v.password ?? '' }
           : {
               root: v.root ?? '/safedrive',
-              cookie: v.cookie ?? '',
+              bduss: v.bduss ?? '',
               userAgent: v.userAgent ?? '',
               clientId: v.clientId ?? '',
               clientSecret: v.clientSecret ?? '',
-              accessToken: v.accessToken ?? '',
-              refreshToken: v.refreshToken ?? '',
+              accessToken: preserveTokens ? (editing?.config.accessToken ?? '') : '',
+              refreshToken: preserveTokens ? (editing?.config.refreshToken ?? '') : '',
             };
     const body = { name: v.name, type: v.type, config, strategyId: v.strategyId };
     setSaving(true);
@@ -265,43 +274,27 @@ export default function SourcesPage() {
               </Form.Item>
               <Form.Item
                 name="clientId"
-                label="开放平台 API Key"
-                rules={[{ required: true, message: '请输入百度开放平台 API Key' }]}
+                label="开放平台 API Key（可选）"
+                extra="留空使用内置客户端；如使用自己的开放平台应用，请同时填写 API Key 和 Secret Key"
               >
                 <Input autoComplete="off" />
               </Form.Item>
               <Form.Item
                 name="clientSecret"
-                label="开放平台 Secret Key"
-                rules={[{ required: true, message: '请输入百度开放平台 Secret Key' }]}
+                label="开放平台 Secret Key（可选）"
               >
                 <Input.Password autoComplete="off" />
               </Form.Item>
               <Form.Item
-                name="refreshToken"
-                label="开放平台 Refresh Token"
-                rules={[{ required: true, message: '请输入 Refresh Token' }]}
-                extra="用于自动获取和刷新 Access Token；刷新后服务端会持久化百度返回的新令牌"
-              >
-                <Input.TextArea autoComplete="off" rows={2} />
-              </Form.Item>
-              <Form.Item
-                name="accessToken"
-                label="开放平台 Access Token（可选）"
-                extra="留空时首次连接会使用 Refresh Token 自动获取"
-              >
-                <Input.TextArea autoComplete="off" rows={2} />
-              </Form.Item>
-              <Form.Item
-                name="cookie"
-                label="百度网盘 Cookie"
+                name="bduss"
+                label="BDUSS"
                 rules={[
-                  { required: true, message: '请输入 Cookie' },
-                  { pattern: /(?:^|;\s*)BDUSS=/, message: 'Cookie 必须包含 BDUSS' },
+                  { required: true, message: '请输入 BDUSS' },
+                  { pattern: /^[^;\s]+$/, message: '只需填写 BDUSS 的值，不要包含 BDUSS= 或其他 Cookie' },
                 ]}
-                extra="仅用于获取下载链接，不参与列目录、CRUD 或上传；凭证将保存在服务端配置中"
+                extra="首次连接会使用 BDUSS 自动完成设备授权并换取 Access/Refresh Token；之后也用于获取下载直链"
               >
-                <Input.TextArea autoComplete="off" rows={4} placeholder="BDUSS=...; STOKEN=...; BAIDUID=..." />
+                <Input.Password autoComplete="off" />
               </Form.Item>
               <Form.Item name="userAgent" label="下载 User-Agent（留空使用 Android 网盘 UA）">
                 <Input autoComplete="off" placeholder="netdisk;P2SP;2.2.61.31;android" />

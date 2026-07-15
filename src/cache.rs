@@ -397,4 +397,14 @@ mod tests {
         let entry = reopened.open("k", 2 * BLOCK_SIZE).unwrap();
         assert!(entry.has_range(0, BLOCK_SIZE - 1));
     }
+
+    #[test]
+    fn cache_key_uses_stable_server_object_identity() {
+        let key = CacheStore::key("datasource-1", "encrypted/folder");
+        assert_eq!(key, CacheStore::key("datasource-1", "encrypted/folder"));
+        assert_ne!(key, CacheStore::key("datasource-2", "encrypted/folder"));
+        assert_ne!(key, CacheStore::key("datasource-1", "encrypted/other"));
+        // 下载直链不参与 API，也不进入 key；直链刷新不会改变服务器侧缓存身份。
+        assert_eq!(key.len(), 32);
+    }
 }

@@ -25,8 +25,12 @@ use crate::error::{ApiError, ApiResult};
 
 const XPAN_API: &str = "https://pan.baidu.com/rest/2.0/";
 const OAUTH_TOKEN_API: &str = "https://openapi.baidu.com/oauth/2.0/token";
+const OAUTH_DEVICE_CODE_API: &str = "https://openapi.baidu.com/oauth/2.0/device/code";
+const OAUTH_DEVICE_APPROVE_API: &str = "https://openapi.baidu.com/device";
 const PCS_FILE_API: &str = "https://pcs.baidu.com/rest/2.0/pcs/file";
 const PCS_UPLOAD_API: &str = "https://d.pcs.baidu.com/rest/2.0/pcs/superfile2";
+const DEFAULT_CLIENT_ID: &str = "iYCeC9g08h5vuP9UqvPHKKSVrKFXGa1v";
+const DEFAULT_CLIENT_SECRET: &str = "jXiFMOPVPCWlO2M5CwWQzffpNPaGTRBG";
 const PAN_APP_ID: &str = "250528";
 const DEFAULT_DOWNLOAD_UA: &str = "netdisk;P2SP;2.2.61.31;android";
 const DEFAULT_WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -34,7 +38,7 @@ const MAX_PREVIEW_RANGE: u64 = 5 * 1024 * 1024;
 const UPLOAD_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 const MAX_UPLOAD_BLOCKS: usize = 2048;
 const UPLOAD_CONCURRENCY: usize = 3;
-const LINK_TTL: Duration = Duration::from_secs(120);
+const LINK_TTL: Duration = Duration::from_secs(10 * 60);
 
 pub type TokenPersister = Arc<dyn Fn(&str, &str) -> ApiResult<()> + Send + Sync>;
 
@@ -75,6 +79,8 @@ pub struct BaiduPanFs {
     root: String,
     xpan_api_base: Url,
     oauth_token_api: Url,
+    oauth_device_code_api: Url,
+    oauth_device_approve_api: Url,
     pcs_api_base: Url,
     upload_api_base: Url,
     client_id: String,
@@ -113,18 +119,20 @@ impl BaiduPanFs {
         http: Client,
         persist_tokens: Option<TokenPersister>,
     ) -> ApiResult<Self> {
-        let required = |name: &str| -> ApiResult<String> {
-            config
-                .get(name)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .ok_or_else(|| ApiError::BadRequest(format!("百度网盘配置缺少 {name}")))
-        };
-        let cookie_text = required("cookie")?;
-        let bduss = cookie_value(&cookie_text, "BDUSS")
-            .ok_or_else(|| ApiError::BadRequest("百度网盘 cookie 中缺少 BDUSS".into()))?;
+        let bduss = config
+            .get("bduss")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                config
+                    .get("cookie")
+                    .and_then(Value::as_str)
+                    .and_then(|cookie| cookie_value(cookie, "BDUSS"))
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| ApiError::BadRequest("百度网盘配置缺少 BDUSS".into()))?;
         let download_cookie = HeaderValue::from_str(&format!("BDUSS={bduss}"))
             .map_err(|_| ApiError::BadRequest("百度网盘 BDUSS 含非法字符".into()))?;
         let download_user_agent = HeaderValue::from_str(
@@ -152,14 +160,38 @@ impl BaiduPanFs {
             }
             Ok(url)
         };
+        let configured_client_id = config
+            .get("clientId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let configured_client_secret = config
+            .get("clientSecret")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let (client_id, client_secret) = match (configured_client_id, configured_client_secret) {
+            (Some(id), Some(secret)) => (id.to_owned(), secret.to_owned()),
+            (None, None) => (
+                DEFAULT_CLIENT_ID.to_owned(),
+                DEFAULT_CLIENT_SECRET.to_owned(),
+            ),
+            _ => {
+                return Err(ApiError::BadRequest(
+                    "百度开放平台 API Key 与 Secret Key 必须同时填写或同时留空".into(),
+                ));
+            }
+        };
         Ok(Self {
             root,
             xpan_api_base: parse_url("openApiBase", XPAN_API)?,
             oauth_token_api: parse_url("oauthTokenUrl", OAUTH_TOKEN_API)?,
+            oauth_device_code_api: parse_url("oauthDeviceCodeUrl", OAUTH_DEVICE_CODE_API)?,
+            oauth_device_approve_api: parse_url("oauthDeviceApproveUrl", OAUTH_DEVICE_APPROVE_API)?,
             pcs_api_base: parse_url("pcsApiBase", PCS_FILE_API)?,
             upload_api_base: parse_url("uploadApiBase", PCS_UPLOAD_API)?,
-            client_id: required("clientId")?,
-            client_secret: required("clientSecret")?,
+            client_id,
+            client_secret,
             tokens: Mutex::new(OAuthTokens {
                 access_token: config
                     .get("accessToken")
@@ -167,7 +199,12 @@ impl BaiduPanFs {
                     .unwrap_or("")
                     .trim()
                     .to_owned(),
-                refresh_token: required("refreshToken")?,
+                refresh_token: config
+                    .get("refreshToken")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned(),
                 expires_at: None,
             }),
             persist_tokens,
@@ -274,18 +311,105 @@ impl BaiduPanFs {
         {
             return Ok(tokens.access_token.clone());
         }
-        let mut url = self.oauth_token_api.clone();
-        url.query_pairs_mut()
-            .append_pair("grant_type", "refresh_token")
-            .append_pair("refresh_token", &tokens.refresh_token)
-            .append_pair("client_id", &self.client_id)
-            .append_pair("client_secret", &self.client_secret);
-        let resp = self
-            .web_request(Method::GET, url)
-            .send()
-            .await
-            .map_err(|e| ApiError::Upstream(format!("刷新百度开放平台令牌失败: {e}")))?;
-        let value = Self::response_json(resp, "刷新开放平台令牌").await?;
+        let value = if tokens.refresh_token.is_empty() {
+            let mut code_url = self.oauth_device_code_api.clone();
+            code_url
+                .query_pairs_mut()
+                .append_pair("response_type", "device_code")
+                .append_pair("client_id", &self.client_id)
+                .append_pair("client_secret", &self.client_secret)
+                .append_pair("scope", "basic,netdisk");
+            let code_resp = self
+                .http
+                .get(code_url)
+                .header(USER_AGENT, "pan.baidu.com")
+                .send()
+                .await
+                .map_err(|e| ApiError::Upstream(format!("获取百度设备码失败: {e}")))?;
+            let code_info = Self::response_json(code_resp, "获取设备码").await?;
+            let device_code = code_info
+                .get("device_code")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::Upstream(format!("设备码响应无 device_code: {code_info}"))
+                })?;
+            let user_code = code_info
+                .get("user_code")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::Upstream(format!("设备码响应无 user_code: {code_info}"))
+                })?;
+
+            let mut approve_url = self.oauth_device_approve_api.clone();
+            approve_url
+                .query_pairs_mut()
+                .append_pair("code", user_code)
+                .append_pair("display", "page")
+                .append_pair("redirect_uri", "")
+                .append_pair("force_login", "");
+            let approve = self
+                .web_request(Method::GET, approve_url)
+                .header(COOKIE, self.download_cookie.clone())
+                .send()
+                .await
+                .map_err(|e| ApiError::Upstream(format!("使用 BDUSS 授权设备码失败: {e}")))?;
+            if !approve.status().is_success() {
+                return Err(ApiError::Upstream(format!(
+                    "使用 BDUSS 授权设备码失败: HTTP {}",
+                    approve.status()
+                )));
+            }
+
+            let interval = code_info
+                .get("interval")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                .clamp(1, 5);
+            let mut token_info = None;
+            for attempt in 0..6 {
+                let mut token_url = self.oauth_token_api.clone();
+                token_url
+                    .query_pairs_mut()
+                    .append_pair("grant_type", "device_token")
+                    .append_pair("code", device_code)
+                    .append_pair("client_id", &self.client_id)
+                    .append_pair("client_secret", &self.client_secret);
+                let token_resp = self
+                    .web_request(Method::GET, token_url)
+                    .send()
+                    .await
+                    .map_err(|e| ApiError::Upstream(format!("设备码换取令牌失败: {e}")))?;
+                let candidate = Self::response_json(token_resp, "设备码换取令牌").await?;
+                let pending = candidate
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .is_some_and(|error| matches!(error, "authorization_pending" | "slow_down"));
+                if !pending {
+                    token_info = Some(candidate);
+                    break;
+                }
+                if attempt < 5 {
+                    tokio::time::sleep(Duration::from_secs(interval)).await;
+                }
+            }
+            token_info
+                .ok_or_else(|| ApiError::Upstream("BDUSS 设备授权超时，请确认 BDUSS 有效".into()))?
+        } else {
+            let mut url = self.oauth_token_api.clone();
+            url.query_pairs_mut()
+                .append_pair("grant_type", "refresh_token")
+                .append_pair("refresh_token", &tokens.refresh_token)
+                .append_pair("client_id", &self.client_id)
+                .append_pair("client_secret", &self.client_secret);
+            let resp = self
+                .web_request(Method::GET, url)
+                .send()
+                .await
+                .map_err(|e| ApiError::Upstream(format!("刷新百度开放平台令牌失败: {e}")))?;
+            Self::response_json(resp, "刷新开放平台令牌").await?
+        };
         if let Some(error) = value.get("error").and_then(Value::as_str) {
             let description = value
                 .get("error_description")
@@ -359,8 +483,8 @@ impl BaiduPanFs {
         unreachable!()
     }
 
-    async fn locatedownload(&self, remote_path: &str, force: bool) -> ApiResult<Vec<String>> {
-        if !force {
+    async fn locatedownload(&self, remote_path: &str) -> ApiResult<Vec<String>> {
+        {
             let links = self.links.lock().await;
             if let Some(hit) = links.get(remote_path)
                 && hit.inserted.elapsed() < LINK_TTL
@@ -377,7 +501,7 @@ impl BaiduPanFs {
             )
         };
         let _guard = path_lock.lock().await;
-        if !force {
+        {
             let links = self.links.lock().await;
             if let Some(hit) = links.get(remote_path)
                 && hit.inserted.elapsed() < LINK_TTL
@@ -457,13 +581,23 @@ impl BaiduPanFs {
         Ok(urls)
     }
 
+    async fn invalidate_links_if_same(&self, remote_path: &str, used_urls: &[String]) {
+        let mut links = self.links.lock().await;
+        if links
+            .get(remote_path)
+            .is_some_and(|cached| cached.urls == used_urls)
+        {
+            links.remove(remote_path);
+        }
+    }
+
     async fn download_response(
         &self,
         remote_path: &str,
         range: Option<(u64, u64)>,
     ) -> ApiResult<reqwest::Response> {
-        for force in [false, true] {
-            let urls = self.locatedownload(remote_path, force).await?;
+        for attempt in 0..2 {
+            let urls = self.locatedownload(remote_path).await?;
             let pick =
                 range.map_or(0, |(start, _)| (start / MAX_PREVIEW_RANGE) as usize) % urls.len();
             let url = Url::parse(&urls[pick])
@@ -483,8 +617,10 @@ impl BaiduPanFs {
             if resp.status().is_success() {
                 return Ok(resp);
             }
-            if !force && matches!(resp.status(), StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) {
-                self.links.lock().await.remove(remote_path);
+            if attempt == 0
+                && matches!(resp.status(), StatusCode::FORBIDDEN | StatusCode::NOT_FOUND)
+            {
+                self.invalidate_links_if_same(remote_path, &urls).await;
                 continue;
             }
             let status = resp.status();
@@ -927,6 +1063,7 @@ fn normalize_root(root: &str) -> ApiResult<String> {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use axum::body::Body;
@@ -936,17 +1073,21 @@ mod tests {
     use axum::routing::{get, post};
     use axum::{Json, Router};
 
+    #[derive(Clone)]
+    struct MockState {
+        download_url: String,
+        locate_calls: Arc<AtomicUsize>,
+    }
+
     fn config(base: &str) -> Value {
         json!({
-            "cookie": "BDUSS=test; BAIDUID=must-not-be-sent",
-            "clientId": "client-id",
-            "clientSecret": "client-secret",
-            "accessToken": "expired-token",
-            "refreshToken": "refresh-old",
+            "bduss": "test",
             "root": "/safe",
             "userAgent": "download-android-test",
             "openApiBase": format!("{base}/rest/2.0/"),
             "oauthTokenUrl": format!("{base}/oauth/token"),
+            "oauthDeviceCodeUrl": format!("{base}/oauth/device/code"),
+            "oauthDeviceApproveUrl": format!("{base}/device"),
             "pcsApiBase": format!("{base}/rest/2.0/pcs/file"),
             "uploadApiBase": format!("{base}/rest/2.0/pcs/superfile2")
         })
@@ -961,8 +1102,11 @@ mod tests {
         assert_eq!(fs.remote_path("a/b"), "/safe/a/b");
         assert_eq!(fs.max_range_size(), Some(5 * 1024 * 1024));
         let mut invalid = config(base);
-        invalid.as_object_mut().unwrap().remove("refreshToken");
+        invalid.as_object_mut().unwrap().remove("bduss");
         assert!(BaiduPanFs::from_config_with_persister(&invalid, Client::new(), None).is_err());
+        let mut half_client = config(base);
+        half_client["clientId"] = "custom-client".into();
+        assert!(BaiduPanFs::from_config_with_persister(&half_client, Client::new(), None).is_err());
         assert!(normalize_root("/a/../b").is_err());
     }
 
@@ -1009,6 +1153,33 @@ mod tests {
         assert!(!temp_path.exists());
     }
 
+    #[tokio::test]
+    async fn stale_link_invalidation_never_removes_a_concurrent_refresh() {
+        let fs = BaiduPanFs::from_config_with_persister(
+            &config("http://127.0.0.1:1"),
+            Client::new(),
+            None,
+        )
+        .unwrap();
+        let old = vec!["https://cdn.example/old".to_owned()];
+        let new = vec!["https://cdn.example/new".to_owned()];
+        fs.links.lock().await.insert(
+            "/safe/volume".into(),
+            CachedLinks {
+                inserted: Instant::now(),
+                urls: new.clone(),
+            },
+        );
+        fs.invalidate_links_if_same("/safe/volume", &old).await;
+        assert_eq!(
+            fs.links.lock().await["/safe/volume"].urls,
+            new,
+            "晚到的旧链接 403 不能删除其他分片刚刷新的链接"
+        );
+        fs.invalidate_links_if_same("/safe/volume", &new).await;
+        assert!(!fs.links.lock().await.contains_key("/safe/volume"));
+    }
+
     fn assert_open_headers(headers: &HeaderMap) {
         assert!(headers.get(COOKIE).is_none(), "开放平台请求不得携带 Cookie");
         let ua = headers.get(USER_AGENT).unwrap().to_str().unwrap();
@@ -1022,22 +1193,58 @@ mod tests {
     ) -> impl IntoResponse {
         assert_open_headers(&headers);
         assert_eq!(
-            query.get("grant_type").map(String::as_str),
-            Some("refresh_token")
+            query.get("client_id").map(String::as_str),
+            Some(DEFAULT_CLIENT_ID)
         );
-        assert_eq!(
-            query.get("refresh_token").map(String::as_str),
-            Some("refresh-old")
-        );
+        match query.get("grant_type").map(String::as_str) {
+            Some("device_token") => {
+                assert_eq!(query.get("code").map(String::as_str), Some("device-code"));
+                Json(json!({
+                    "access_token": "fresh-token",
+                    "refresh_token": "refresh-new",
+                    "expires_in": 3600
+                }))
+            }
+            Some("refresh_token") => {
+                assert_eq!(
+                    query.get("refresh_token").map(String::as_str),
+                    Some("refresh-new")
+                );
+                Json(json!({
+                    "access_token": "renewed-token",
+                    "refresh_token": "refresh-new-2",
+                    "expires_in": 3600
+                }))
+            }
+            other => panic!("unexpected grant_type: {other:?}"),
+        }
+    }
+
+    async fn oauth_device_code(
+        headers: HeaderMap,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        assert!(headers.get(COOKIE).is_none());
+        assert_eq!(headers.get(USER_AGENT).unwrap(), "pan.baidu.com");
         assert_eq!(
             query.get("client_id").map(String::as_str),
-            Some("client-id")
+            Some(DEFAULT_CLIENT_ID)
         );
         Json(json!({
-            "access_token": "fresh-token",
-            "refresh_token": "refresh-new",
-            "expires_in": 3600
+            "device_code": "device-code",
+            "user_code": "user-code",
+            "interval": 1,
+            "expires_in": 60
         }))
+    }
+
+    async fn oauth_device_approve(
+        headers: HeaderMap,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        assert_eq!(headers.get(COOKIE).unwrap(), "BDUSS=test");
+        assert_eq!(query.get("code").map(String::as_str), Some("user-code"));
+        StatusCode::OK
     }
 
     async fn xpan_get(
@@ -1046,13 +1253,11 @@ mod tests {
     ) -> impl IntoResponse {
         assert_open_headers(&headers);
         assert_eq!(query.get("method").map(String::as_str), Some("list"));
-        if query.get("access_token").map(String::as_str) == Some("expired-token") {
+        let token = query.get("access_token").map(String::as_str);
+        if token == Some("expired-token") {
             return Json(json!({"errno": 111}));
         }
-        assert_eq!(
-            query.get("access_token").map(String::as_str),
-            Some("fresh-token")
-        );
+        assert!(matches!(token, Some("fresh-token" | "renewed-token")));
         assert_eq!(query.get("dir").map(String::as_str), Some("/safe"));
         Json(json!({
             "errno": 0,
@@ -1073,7 +1278,7 @@ mod tests {
         assert_open_headers(&headers);
         assert_eq!(
             query.get("access_token").map(String::as_str),
-            Some("fresh-token")
+            Some("renewed-token")
         );
         match query.get("method").map(String::as_str) {
             Some("precreate") => {
@@ -1099,14 +1304,14 @@ mod tests {
         assert_open_headers(&headers);
         assert_eq!(
             query.get("access_token").map(String::as_str),
-            Some("fresh-token")
+            Some("renewed-token")
         );
         assert_eq!(query.get("uploadid").map(String::as_str), Some("upload-1"));
         Json(json!({"errno": 0, "md5": "8d777f385d3dfec8815d20f7496026dc"}))
     }
 
     async fn locatedownload(
-        State(download_url): State<String>,
+        State(state): State<MockState>,
         headers: HeaderMap,
         Query(query): Query<HashMap<String, String>>,
     ) -> impl IntoResponse {
@@ -1116,17 +1321,30 @@ mod tests {
         );
         assert_eq!(headers.get(USER_AGENT).unwrap(), "download-android-test");
         assert_eq!(headers.get(COOKIE).unwrap(), "BDUSS=test");
-        Json(json!({"urls": [{"url": download_url}]}))
+        state.locate_calls.fetch_add(1, Ordering::SeqCst);
+        Json(json!({"urls": [{"url": state.download_url}]}))
     }
 
     async fn download(headers: HeaderMap) -> Response<Body> {
-        assert_eq!(headers.get(RANGE).unwrap(), "bytes=2-5");
         assert_eq!(headers.get(USER_AGENT).unwrap(), "download-android-test");
         assert_eq!(headers.get(COOKIE).unwrap(), "BDUSS=test");
+        let range = headers.get(RANGE).unwrap().to_str().unwrap();
+        let (start, end) = range
+            .strip_prefix("bytes=")
+            .unwrap()
+            .split_once('-')
+            .map(|(start, end)| {
+                (
+                    start.parse::<usize>().unwrap(),
+                    end.parse::<usize>().unwrap(),
+                )
+            })
+            .unwrap();
+        let source = b"0123456789";
         Response::builder()
             .status(StatusCode::PARTIAL_CONTENT)
-            .header(CONTENT_RANGE, "bytes 2-5/10")
-            .body(Body::from("2345"))
+            .header(CONTENT_RANGE, format!("bytes {start}-{end}/10"))
+            .body(Body::from(source[start..=end].to_vec()))
             .unwrap()
     }
 
@@ -1135,13 +1353,19 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = format!("http://{addr}");
+        let locate_calls = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
             .route("/oauth/token", get(oauth_token))
+            .route("/oauth/device/code", get(oauth_device_code))
+            .route("/device", get(oauth_device_approve))
             .route("/rest/2.0/xpan/file", get(xpan_get).post(xpan_post))
             .route("/rest/2.0/pcs/superfile2", post(upload_block))
             .route("/rest/2.0/pcs/file", get(locatedownload))
             .route("/download", get(download))
-            .with_state(format!("{base}/download"));
+            .with_state(MockState {
+                download_url: format!("{base}/download"),
+                locate_calls: Arc::clone(&locate_calls),
+            });
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let persisted = Arc::new(StdMutex::new(None));
@@ -1160,6 +1384,16 @@ mod tests {
             *persisted.lock().unwrap(),
             Some(("fresh-token".into(), "refresh-new".into()))
         );
+        {
+            let mut tokens = fs.tokens.lock().await;
+            tokens.access_token = "expired-token".into();
+            tokens.expires_at = None;
+        }
+        fs.list("").await.unwrap();
+        assert_eq!(
+            *persisted.lock().unwrap(),
+            Some(("renewed-token".into(), "refresh-new-2".into()))
+        );
         fs.mkdir("new").await.unwrap();
         fs.rename("new", "renamed").await.unwrap();
         fs.delete("renamed").await.unwrap();
@@ -1170,6 +1404,23 @@ mod tests {
         )
         .await
         .unwrap();
+
+        assert_eq!(locate_calls.load(Ordering::SeqCst), 0);
+        let (first, second) =
+            tokio::join!(fs.get_range("volume", 0, 1), fs.get_range("volume", 2, 5));
+        drop(first.unwrap());
+        drop(second.unwrap());
+        assert_eq!(
+            locate_calls.load(Ordering::SeqCst),
+            1,
+            "同一分卷并发 Range 必须通过单飞只获取一次直链"
+        );
+        drop(fs.get_range("another-volume", 0, 1).await.unwrap());
+        assert_eq!(
+            locate_calls.load(Ordering::SeqCst),
+            2,
+            "只有实际访问另一个分卷时才按需获取其直链"
+        );
 
         let mut stream = fs.get_range("volume", 2, 5).await.unwrap();
         let mut got = Vec::new();
