@@ -69,7 +69,7 @@ impl AppState {
             .registry
             .get(ds_id)
             .ok_or_else(|| ApiError::NotFound(format!("数据源不存在: {ds_id}")))?;
-        adapters::make(&ds, self.http.clone())
+        adapters::make_with_token_persister(&ds, self.http.clone(), self.baidu_token_persister(&ds))
     }
 
     /// `Arc` 版本（下载/上传引擎多任务共享）。
@@ -78,7 +78,27 @@ impl AppState {
             .registry
             .get(ds_id)
             .ok_or_else(|| ApiError::NotFound(format!("数据源不存在: {ds_id}")))?;
-        adapters::make_arc(&ds, self.http.clone())
+        adapters::make_arc_with_token_persister(
+            &ds,
+            self.http.clone(),
+            self.baidu_token_persister(&ds),
+        )
+    }
+
+    fn baidu_token_persister(
+        &self,
+        datasource: &crate::registry::DataSource,
+    ) -> Option<crate::adapters::baidupan::TokenPersister> {
+        if datasource.ds_type != "baidupan" {
+            return None;
+        }
+        let state = self.clone();
+        let id = datasource.id.clone();
+        Some(Arc::new(move |access_token, refresh_token| {
+            state
+                .registry
+                .update_baidu_tokens(&id, access_token, refresh_token)
+        }))
     }
 
     /// 数据源级目录创建锁（惰性创建）。

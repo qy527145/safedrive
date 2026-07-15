@@ -14,6 +14,10 @@ interface FormValues {
   password?: string;
   cookie?: string;
   userAgent?: string;
+  clientId?: string;
+  clientSecret?: string;
+  accessToken?: string;
+  refreshToken?: string;
 }
 
 /** 数据源管理：基础信息（由类型决定）+ 绑定数据映射策略。 */
@@ -59,6 +63,10 @@ export default function SourcesPage() {
       password: d.config.password,
       cookie: d.config.cookie,
       userAgent: d.config.userAgent,
+      clientId: d.config.clientId,
+      clientSecret: d.config.clientSecret,
+      accessToken: d.config.accessToken,
+      refreshToken: d.config.refreshToken,
     });
     setDsType(d.type);
     setOpen(true);
@@ -71,7 +79,15 @@ export default function SourcesPage() {
         ? { root: v.root ?? '' }
         : v.type === 'webdav'
           ? { url: v.url ?? '', username: v.username ?? '', password: v.password ?? '' }
-          : { root: v.root ?? '/safedrive', cookie: v.cookie ?? '', userAgent: v.userAgent ?? '' };
+          : {
+              root: v.root ?? '/safedrive',
+              cookie: v.cookie ?? '',
+              userAgent: v.userAgent ?? '',
+              clientId: v.clientId ?? '',
+              clientSecret: v.clientSecret ?? '',
+              accessToken: v.accessToken ?? '',
+              refreshToken: v.refreshToken ?? '',
+            };
     const body = { name: v.name, type: v.type, config, strategyId: v.strategyId };
     setSaving(true);
     try {
@@ -248,13 +264,42 @@ export default function SourcesPage() {
                 <Input placeholder="/safedrive" />
               </Form.Item>
               <Form.Item
+                name="clientId"
+                label="开放平台 API Key"
+                rules={[{ required: true, message: '请输入百度开放平台 API Key' }]}
+              >
+                <Input autoComplete="off" />
+              </Form.Item>
+              <Form.Item
+                name="clientSecret"
+                label="开放平台 Secret Key"
+                rules={[{ required: true, message: '请输入百度开放平台 Secret Key' }]}
+              >
+                <Input.Password autoComplete="off" />
+              </Form.Item>
+              <Form.Item
+                name="refreshToken"
+                label="开放平台 Refresh Token"
+                rules={[{ required: true, message: '请输入 Refresh Token' }]}
+                extra="用于自动获取和刷新 Access Token；刷新后服务端会持久化百度返回的新令牌"
+              >
+                <Input.TextArea autoComplete="off" rows={2} />
+              </Form.Item>
+              <Form.Item
+                name="accessToken"
+                label="开放平台 Access Token（可选）"
+                extra="留空时首次连接会使用 Refresh Token 自动获取"
+              >
+                <Input.TextArea autoComplete="off" rows={2} />
+              </Form.Item>
+              <Form.Item
                 name="cookie"
                 label="百度网盘 Cookie"
                 rules={[
                   { required: true, message: '请输入 Cookie' },
                   { pattern: /(?:^|;\s*)BDUSS=/, message: 'Cookie 必须包含 BDUSS' },
                 ]}
-                extra="从 pan.baidu.com 已登录请求中复制完整 Cookie；凭证将保存在服务端配置中"
+                extra="仅用于获取下载链接，不参与列目录、CRUD 或上传；凭证将保存在服务端配置中"
               >
                 <Input.TextArea autoComplete="off" rows={4} placeholder="BDUSS=...; STOKEN=...; BAIDUID=..." />
               </Form.Item>

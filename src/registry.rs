@@ -38,7 +38,10 @@ impl Registry {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
         };
-        Ok(Self { path, inner: Mutex::new(list) })
+        Ok(Self {
+            path,
+            inner: Mutex::new(list),
+        })
     }
 
     pub fn list(&self) -> Vec<DataSource> {
@@ -46,7 +49,12 @@ impl Registry {
     }
 
     pub fn get(&self, id: &str) -> Option<DataSource> {
-        self.inner.lock().unwrap().iter().find(|d| d.id == id).cloned()
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|d| d.id == id)
+            .cloned()
     }
 
     pub fn create(&self, ds: DataSource) -> ApiResult<DataSource> {
@@ -62,10 +70,37 @@ impl Registry {
             .iter_mut()
             .find(|d| d.id == id)
             .ok_or_else(|| ApiError::NotFound(format!("数据源不存在: {id}")))?;
-        *slot = DataSource { id: id.to_string(), ..ds };
+        *slot = DataSource {
+            id: id.to_string(),
+            ..ds
+        };
         let saved = slot.clone();
         self.save(&guard)?;
         Ok(saved)
+    }
+
+    /// 百度开放平台刷新令牌后原子更新凭证，避免服务重启后退回已经轮换的 refresh token。
+    pub fn update_baidu_tokens(
+        &self,
+        id: &str,
+        access_token: &str,
+        refresh_token: &str,
+    ) -> ApiResult<()> {
+        let mut guard = self.inner.lock().unwrap();
+        let datasource = guard
+            .iter_mut()
+            .find(|datasource| datasource.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("数据源不存在: {id}")))?;
+        if datasource.ds_type != "baidupan" {
+            return Err(ApiError::BadRequest("数据源不是百度网盘".into()));
+        }
+        let config = datasource
+            .config
+            .as_object_mut()
+            .ok_or_else(|| ApiError::BadRequest("百度网盘配置不是对象".into()))?;
+        config.insert("accessToken".into(), access_token.into());
+        config.insert("refreshToken".into(), refresh_token.into());
+        self.save(&guard)
     }
 
     pub fn remove(&self, id: &str) -> ApiResult<()> {
@@ -81,7 +116,10 @@ impl Registry {
 
     /// 原子写：临时文件 + rename；权限 0600（配置内含 WebDAV 凭证）。
     fn save(&self, list: &[DataSource]) -> ApiResult<()> {
-        let file = RegistryFile { version: 1, datasources: list.to_vec() };
+        let file = RegistryFile {
+            version: 1,
+            datasources: list.to_vec(),
+        };
         let data = serde_json::to_vec_pretty(&file).map_err(|e| anyhow::anyhow!(e))?;
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, &data)?;
@@ -124,7 +162,14 @@ mod tests {
         let reg = Registry::load(path.clone()).unwrap();
         reg.create(ds("a")).unwrap();
         reg.create(ds("b")).unwrap();
-        reg.update("a", DataSource { name: "renamed".into(), ..ds("a") }).unwrap();
+        reg.update(
+            "a",
+            DataSource {
+                name: "renamed".into(),
+                ..ds("a")
+            },
+        )
+        .unwrap();
         reg.remove("b").unwrap();
         assert!(reg.remove("b").is_err());
 
@@ -134,5 +179,27 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "renamed");
         assert_eq!(reg2.get("a").unwrap().id, "a");
+    }
+
+    #[test]
+    fn refreshed_baidu_tokens_are_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("datasources.json");
+        let registry = Registry::load(path.clone()).unwrap();
+        let mut source = ds("baidu");
+        source.ds_type = "baidupan".into();
+        source.config = serde_json::json!({
+            "accessToken": "old-access",
+            "refreshToken": "old-refresh"
+        });
+        registry.create(source).unwrap();
+        registry
+            .update_baidu_tokens("baidu", "new-access", "new-refresh")
+            .unwrap();
+
+        let reloaded = Registry::load(path).unwrap();
+        let config = reloaded.get("baidu").unwrap().config;
+        assert_eq!(config["accessToken"], "new-access");
+        assert_eq!(config["refreshToken"], "new-refresh");
     }
 }

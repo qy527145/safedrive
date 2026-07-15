@@ -1,5 +1,5 @@
-pub mod localfs;
 pub mod baidupan;
+pub mod localfs;
 pub mod webdav;
 
 use async_trait::async_trait;
@@ -78,19 +78,33 @@ pub trait Storage: Send + Sync {
     }
 }
 
-/// 由数据源配置实例化适配器。
-pub fn make(ds: &DataSource, http: reqwest::Client) -> ApiResult<Box<dyn Storage>> {
+pub fn make_with_token_persister(
+    ds: &DataSource,
+    http: reqwest::Client,
+    persist_tokens: Option<baidupan::TokenPersister>,
+) -> ApiResult<Box<dyn Storage>> {
     match ds.ds_type.as_str() {
         "localfs" => Ok(Box::new(localfs::LocalFs::from_config(&ds.config)?)),
         "webdav" => Ok(Box::new(webdav::WebdavFs::from_config(&ds.config, http)?)),
-        "baidupan" => Ok(Box::new(baidupan::BaiduPanFs::from_config(&ds.config, http)?)),
+        "baidupan" => Ok(Box::new(baidupan::BaiduPanFs::from_config_with_persister(
+            &ds.config,
+            http,
+            persist_tokens,
+        )?)),
         other => Err(ApiError::BadRequest(format!("未知数据源类型: {other}"))),
     }
 }
 
-/// `Arc` 版本 —— 下载引擎的多个 fetcher 需要共享适配器。
-pub fn make_arc(ds: &DataSource, http: reqwest::Client) -> ApiResult<std::sync::Arc<dyn Storage>> {
-    Ok(std::sync::Arc::from(make(ds, http)?))
+pub fn make_arc_with_token_persister(
+    ds: &DataSource,
+    http: reqwest::Client,
+    persist_tokens: Option<baidupan::TokenPersister>,
+) -> ApiResult<std::sync::Arc<dyn Storage>> {
+    Ok(std::sync::Arc::from(make_with_token_persister(
+        ds,
+        http,
+        persist_tokens,
+    )?))
 }
 
 /// 规范化并校验相对路径：拒绝 `..`、空段、反斜杠与控制字符，返回 "a/b/c" 或 ""（根）。
@@ -100,10 +114,7 @@ pub fn sanitize(path: &str) -> ApiResult<String> {
         if seg.is_empty() || seg == "." {
             continue;
         }
-        if seg == ".."
-            || seg.contains('\\')
-            || seg.bytes().any(|b| b < 0x20 || b == 0x7f)
-        {
+        if seg == ".." || seg.contains('\\') || seg.bytes().any(|b| b < 0x20 || b == 0x7f) {
             return Err(ApiError::BadRequest(format!("非法路径: {path}")));
         }
         parts.push(seg);

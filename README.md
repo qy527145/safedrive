@@ -18,7 +18,7 @@ cargo build --release
 打开 `http://<host>:5266`：
 
 1. **策略管理** —— 新建映射策略（根密码 + 上传分卷大小，默认 300MiB，可选不分卷）
-2. **数据源管理** —— 添加百度网盘（Cookie）、WebDAV 或本地文件系统数据源，绑定策略
+2. **数据源管理** —— 添加百度网盘（开放平台 OAuth + 下载 Cookie）、WebDAV 或本地文件系统数据源，绑定策略
 3. **数据管理** —— 浏览 / 上传 / 下载 / 在线预览播放 / 复制外部播放链接
 4. **设置** —— 全局传输参数（最大分片/并发）、持久密文块缓存、策略备份导出/导入
 
@@ -29,6 +29,12 @@ cargo build --release
 | `--admin-password` / 环境变量 `SAFEDRIVE_ADMIN_PASSWORD` | 管理密码；不设置则免登录（仅建议本机使用） |
 
 > 策略文件 `strategies.json`（含根密码）明文存放在 `--data-dir`。**根密码丢失 = 该策略下云端数据永久无法解密**，创建策略后请立即在「设置」页导出备份。公网部署请置于 HTTPS 反向代理之后。
+
+### 百度网盘凭证
+
+先在百度智能云/网盘开放平台创建具备网盘权限的应用，并按官方 OAuth 授权码流程取得 Refresh Token。数据源中填写应用的 API Key（Client ID）、Secret Key（Client Secret）与 Refresh Token；Access Token 可以留空，首次连接时会自动获取。令牌过期后服务会自动刷新，并将百度返回的新 Access/Refresh Token 原子写回 `datasources.json`。
+
+Cookie 仍需提供，但只发送给 `locatedownload` 与其返回的 CDN 下载地址；列目录、CRUD 和上传不会携带 Cookie。开放平台应用只能访问其获授权的路径时，请将“网盘根目录”设置在该授权范围内。
 
 ## 架构
 
@@ -51,13 +57,13 @@ cargo build --release
 - ChaCha20 密文长度 = 明文长度，分卷布局由 list + 前缀和自描述，任意字节偏移可直接寻址解密（视频拖动即发 Range 请求）
 - 下载引擎按全局参数并行拉取分片、按序拼接、断流从准确偏移续拉，客户端断开立即中止全部上游请求（参考 hydraria）
 - 全局缓存以 1 MiB 完整块持久化云端密文；缓存命中后仍按合并偏移解密，重启后可继续复用
-- 百度网盘列目录、建目录、移动、删除和分块上传采用 Pan Web API（完整 Cookie + 浏览器 UA）；只有 `locatedownload` 与 CDN 下载使用 Android UA，单个 Range 自动限制为 5 MiB，并在多个 CDN URL 间分散分片
+- 百度网盘列目录、建目录、移动、删除和分块上传采用开放平台 OAuth `xpan` API，Access Token 失效时用 Client ID、Client Secret 与 Refresh Token 自动刷新并持久化；Cookie 只用于 Android `locatedownload` 与 CDN 下载，单个 Range 自动限制为 5 MiB，并在多个 CDN URL 间分散分片
 
 ## 安全边界
 
 - **云端看不到**：文件名与各节点密钥（v5 信封编码：一段随机汉字，无格式特征）、内容（ChaCha20）、目录结构语义
 - **服务器持有**：策略根密码 —— 服务器被攻破即数据泄露，这是有意的取舍（换取免解锁、外部播放器直连）
-- 百度网盘完整 Cookie 明文保存在 `datasources.json`；必须像根密码一样保护 `--data-dir`，Cookie 失效后需在数据源管理中更新
+- 百度网盘开放平台 Client Secret、Access/Refresh Token 与下载 Cookie 明文保存在 `datasources.json`；必须像根密码一样保护 `--data-dir`，凭证失效后需在数据源管理中更新
 - **跨目录移动/重命名**：仅一次云端 rename，内容永不重加密；分享目录 = 交出该目录密钥（快照与长期分享皆可）
 - 内容加密无完整性校验（ChaCha20 无 MAC）：云端篡改密文会解出乱码而不会被检测
 - 单文件上限约 256 GiB（ChaCha20 32 位块计数器）
