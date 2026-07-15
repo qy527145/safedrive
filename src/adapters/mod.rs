@@ -22,6 +22,9 @@ pub struct Entry {
 
 pub type ByteStream = BoxStream<'static, std::io::Result<bytes::Bytes>>;
 
+/// 上传进度回调：报告「已确认写入上游」的**增量**字节数。
+pub type ProgressFn = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
+
 /// 数据源适配器：纯粹的 I/O 驱动。路径为数据源根内的相对路径（"a/b/c"，根为 ""）。
 #[async_trait]
 pub trait Storage: Send + Sync {
@@ -76,6 +79,25 @@ pub trait Storage: Send + Sync {
     async fn put_sized(&self, path: &str, _size: u64, body: ByteStream) -> ApiResult<()> {
         self.put(path, body).await
     }
+    /// 带进度的已知长度写入。默认实现按 body 被消费的速率上报 ——
+    /// 流式直传的适配器（localfs/WebDAV）背压即真实上传进度；先本地
+    /// 落盘再上传的适配器（百度网盘）必须覆盖，否则上报的是缓冲进度。
+    async fn put_sized_tracked(
+        &self,
+        path: &str,
+        size: u64,
+        body: ByteStream,
+        progress: ProgressFn,
+    ) -> ApiResult<()> {
+        use futures_util::StreamExt;
+        let counted = body.map(move |item| {
+            if let Ok(b) = &item {
+                progress(b.len() as u64);
+            }
+            item
+        });
+        self.put_sized(path, size, counted.boxed()).await
+    }
 }
 
 pub fn make_with_token_persister(
@@ -105,6 +127,22 @@ pub fn make_arc_with_token_persister(
         http,
         persist_tokens,
     )?))
+}
+
+/// 排查日志用：把响应头拼成一行（Set-Cookie 脱敏——可能含会话凭据）。
+pub(crate) fn log_headers(headers: &reqwest::header::HeaderMap) -> String {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            let v = if k == reqwest::header::SET_COOKIE {
+                "…(已脱敏)".into()
+            } else {
+                String::from_utf8_lossy(v.as_bytes()).into_owned()
+            };
+            format!("{k}: {v}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// 规范化并校验相对路径：拒绝 `..`、空段、反斜杠与控制字符，返回 "a/b/c" 或 ""（根）。

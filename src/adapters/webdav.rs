@@ -75,10 +75,24 @@ impl WebdavFs {
             return Ok(resp);
         }
         if status == StatusCode::NOT_FOUND {
+            // 判存走这里属常态，不打错误日志
             return Err(ApiError::NotFound(format!("{what}: 不存在")));
         }
+        // 凭据在 Basic 头里，URL 可整体落日志
+        let url = resp.url().clone();
+        let headers = super::log_headers(resp.headers());
         let body = resp.text().await.unwrap_or_default();
-        let snippet: String = body.chars().take(200).collect();
+        let body_log = if body.trim().is_empty() {
+            "(空)".to_string()
+        } else {
+            body.chars().take(4096).collect()
+        };
+        tracing::error!("WebDAV {what}失败: {status} url={url} 响应头: {headers} 原始响应: {body_log}");
+        let snippet: String = if body.trim().is_empty() {
+            "(空响应体，详见日志文件)".to_string()
+        } else {
+            body.chars().take(200).collect()
+        };
         Err(ApiError::Upstream(format!("{what} 失败 ({status}): {snippet}")))
     }
 }

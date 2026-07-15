@@ -26,6 +26,8 @@ pub struct Inner {
     pub sessions: RwLock<HashSet<String>>,
     /// 正在上传中的 "dsId:明文路径"（内存态）——同路径并发上传串行化。
     pub uploading: Mutex<HashSet<String>>,
+    /// 进行中上传的双维度进度（key = 前端生成的进度 ID，上传结束即移除）。
+    pub upload_progress: Mutex<HashMap<String, Arc<crate::engine::UploadProgress>>>,
     /// 每数据源一把目录创建锁：ensure_dir 的「云端判存 + mkdir」必须
     /// 互斥，否则并发上传同一文件夹会各建一个同名加密目录。
     pub mkdir_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -57,6 +59,7 @@ impl AppState {
             content_cache,
             sessions: RwLock::new(HashSet::new()),
             uploading: Mutex::new(HashSet::new()),
+            upload_progress: Mutex::new(HashMap::new()),
             mkdir_locks: Mutex::new(HashMap::new()),
             admin_password,
             http,

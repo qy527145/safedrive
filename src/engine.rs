@@ -12,6 +12,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use chacha20::ChaCha20;
@@ -464,6 +465,22 @@ async fn fetch_chunk(
 
 // ---------------- 上传：流式加密 + 分卷切写 ----------------
 
+/// 上传双维度进度：`encrypted` 是本地已加密并切入分卷的字节（受通道
+/// 缓冲与 pending 上传数影响，会领先于真实上传）；`uploaded` 是存储端
+/// 已确认接收的字节（由适配器上报，见 `Storage::put_sized_tracked`）。
+#[derive(Debug)]
+pub struct UploadProgress {
+    pub total: u64,
+    pub encrypted: AtomicU64,
+    pub uploaded: AtomicU64,
+}
+
+impl UploadProgress {
+    pub fn new(total: u64) -> Self {
+        Self { total, encrypted: AtomicU64::new(0), uploaded: AtomicU64::new(0) }
+    }
+}
+
 /// 已封口但仍在等待存储端响应的最大分卷数。允许少量重叠可隐藏 WebDAV
 /// 每次 PUT 的响应延迟，同时限制临时任务与连接占用。
 const MAX_PENDING_UPLOADS: usize = 2;
@@ -472,6 +489,7 @@ type UploadTask = (mpsc::Sender<io::Result<Bytes>>, JoinHandle<ApiResult<()>>);
 /// 把明文流加密并按分卷写入 `enc_folder/names[i]`。
 /// `names` 必须来自 `gen_chunk_names(pw, chunk_count(total, volume_size))`。
 /// 实际字节数与 `total` 不符即报错（调用方负责清理）。
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_stream<S>(
     storage: Arc<dyn Storage>,
     enc_folder: &str,
@@ -480,6 +498,7 @@ pub async fn upload_stream<S>(
     volume_size: u64,
     names: &[String],
     mut body: S,
+    progress: Arc<UploadProgress>,
 ) -> ApiResult<()>
 where
     S: Stream<Item = io::Result<Bytes>> + Unpin,
@@ -556,6 +575,7 @@ where
             .try_into_mut()
             .unwrap_or_else(|shared| bytes::BytesMut::from(shared.as_ref()));
         cipher.apply_keystream(&mut buf);
+        progress.encrypted.fetch_add(buf.len() as u64, Ordering::Relaxed);
         let mut b = buf.freeze();
 
         while !b.is_empty() {
@@ -571,8 +591,12 @@ where
                 };
                 let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(8);
                 let st = Arc::clone(&storage);
+                let uploaded = Arc::clone(&progress);
+                let on_upload: crate::adapters::ProgressFn =
+                    Arc::new(move |n| { uploaded.uploaded.fetch_add(n, Ordering::Relaxed); });
                 let handle = tokio::spawn(async move {
-                    st.put_sized(&obj_path, cap, ReceiverStream::new(rx).boxed()).await
+                    st.put_sized_tracked(&obj_path, cap, ReceiverStream::new(rx).boxed(), on_upload)
+                        .await
                 });
                 current = Some((tx, handle));
                 sent_in_vol = 0;
@@ -758,9 +782,21 @@ mod tests {
         let body = stream::iter(
             plain.chunks(17_000).map(|c| Ok(Bytes::copy_from_slice(c))).collect::<Vec<_>>(),
         );
-        upload_stream(Arc::clone(&storage), "ENCFOLDER", &pw, total, volume_size, &names, body)
-            .await
-            .unwrap();
+        let progress = Arc::new(UploadProgress::new(total));
+        upload_stream(
+            Arc::clone(&storage),
+            "ENCFOLDER",
+            &pw,
+            total,
+            volume_size,
+            &names,
+            body,
+            Arc::clone(&progress),
+        )
+        .await
+        .unwrap();
+        assert_eq!(progress.encrypted.load(Ordering::Relaxed), total);
+        assert_eq!(progress.uploaded.load(Ordering::Relaxed), total, "localfs 直写：消费即上传");
 
         // 存储形态：3 个随机名分卷，大小 = 明文分段大小（流密码无膨胀），内容 ≠ 明文
         let entries = storage.list("ENCFOLDER").await.unwrap();
@@ -841,13 +877,18 @@ mod tests {
         // 少给
         let names = gen_chunk_names(&pw, 1);
         let body = stream::iter(vec![Ok(Bytes::from_static(b"short"))]);
+        let progress = || Arc::new(UploadProgress::new(100));
         assert!(
-            upload_stream(Arc::clone(&storage), "F", &pw, 100, 1024, &names, body).await.is_err()
+            upload_stream(Arc::clone(&storage), "F", &pw, 100, 1024, &names, body, progress())
+                .await
+                .is_err()
         );
         // 多给
         let body = stream::iter(vec![Ok(Bytes::from(vec![0u8; 200]))]);
         assert!(
-            upload_stream(Arc::clone(&storage), "F", &pw, 100, 1024, &names, body).await.is_err()
+            upload_stream(Arc::clone(&storage), "F", &pw, 100, 1024, &names, body, progress())
+                .await
+                .is_err()
         );
     }
 
@@ -861,7 +902,18 @@ mod tests {
         storage.mkdir("E").await.unwrap();
         let pw = gen_secret();
         let body = stream::iter(Vec::<io::Result<Bytes>>::new());
-        upload_stream(Arc::clone(&storage), "E", &pw, 0, 1024, &[], body).await.unwrap();
+        upload_stream(
+            Arc::clone(&storage),
+            "E",
+            &pw,
+            0,
+            1024,
+            &[],
+            body,
+            Arc::new(UploadProgress::new(0)),
+        )
+        .await
+        .unwrap();
         let l = load_layout(storage.as_ref(), "E", &pw).await.unwrap();
         assert_eq!(l.total, 0);
         assert!(l.volumes.is_empty());

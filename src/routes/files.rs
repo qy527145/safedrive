@@ -33,6 +33,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/files/{ds}/delete", post(delete))
         .route("/files/{ds}/delete-foreign", post(delete_foreign))
         .route("/files/{ds}/upload", put(upload))
+        .route("/uploads/{id}/progress", get(upload_progress))
 }
 
 /// /stream 挂在 /api 之外：供 <video>/VLC/下载器直接消费，鉴权走 ?token=。
@@ -581,6 +582,30 @@ struct UploadQuery {
     path: String,
     /// 明文总字节数（分卷计划需要预知）。
     size: u64,
+    /// 进度 ID（前端生成的随机串）；提供后可轮询
+    /// GET /api/uploads/{id}/progress 获取加密/上传双维度进度。
+    #[serde(default)]
+    progress: Option<String>,
+}
+
+/// 查询进行中上传的双维度进度。上传结束（成功或失败）后条目即移除，
+/// 此后返回 404 —— 前端以上传请求本身的结束为准。
+async fn upload_progress(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let progress = state
+        .upload_progress
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| ApiError::NotFound(format!("上传进度不存在: {id}")))?;
+    Ok(Json(json!({
+        "total": progress.total,
+        "encrypted": progress.encrypted.load(std::sync::atomic::Ordering::Relaxed),
+        "uploaded": progress.uploaded.load(std::sync::atomic::Ordering::Relaxed),
+    })))
 }
 
 async fn upload(
@@ -613,6 +638,26 @@ async fn upload(
         }
     }
     let _uploading_guard = UploadingGuard(&state, upload_key);
+
+    // 双维度进度：注册到 state 供 /api/uploads/{id}/progress 轮询
+    let progress = Arc::new(engine::UploadProgress::new(q.size));
+    struct ProgressGuard<'a>(&'a AppState, Option<String>);
+    impl Drop for ProgressGuard<'_> {
+        fn drop(&mut self) {
+            if let Some(id) = &self.1 {
+                self.0.upload_progress.lock().unwrap().remove(id);
+            }
+        }
+    }
+    let progress_id = q.progress.as_deref().map(str::trim).filter(|id| !id.is_empty());
+    if let Some(id) = progress_id {
+        state
+            .upload_progress
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), Arc::clone(&progress));
+    }
+    let _progress_guard = ProgressGuard(&state, progress_id.map(str::to_owned));
 
     // 文件夹上传：自动创建缺失的中间目录
     let parent_node = if parent.is_empty() {
@@ -654,12 +699,21 @@ async fn upload(
             volume_size,
             &names,
             Box::pin(body),
+            Arc::clone(&progress),
         )
         .await
     }
     .await;
 
     if let Err(e) = result {
+        // 锚点日志：适配器层已记录请求参数与原始响应，这里给出任务全貌
+        tracing::error!(
+            "上传失败: ds={ds} path={path} size={} volume_size={volume_size} 分卷数={} 已加密={} 已确认上传={} err={e}",
+            q.size,
+            names.len(),
+            progress.encrypted.load(std::sync::atomic::Ordering::Relaxed),
+            progress.uploaded.load(std::sync::atomic::Ordering::Relaxed),
+        );
         // 失败/取消：尽力清掉半成品（清不掉也只是留下可再删的密文垃圾）
         if let Err(del_err) = storage.delete(&enc_folder).await
             && !matches!(del_err, ApiError::NotFound(_))

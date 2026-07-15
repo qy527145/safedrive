@@ -30,7 +30,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { api, streamUrl, uploadFile, type FsEntry } from '../api/client';
 import PreviewModal from '../components/PreviewModal';
 import { useSources } from '../stores/sources';
-import { taskProgress, useTasks } from '../stores/tasks';
+import { taskProgress, taskUploaded, useTasks } from '../stores/tasks';
 import { formatBytes, formatTime, previewKind } from '../utils/format';
 
 /** 加密文件浏览器：与服务端只交换明文路径，加解密全部发生在服务端。 */
@@ -96,13 +96,25 @@ export default function BrowserPage() {
           totalBytes: file.size,
         },
         async (_task, signal) => {
-          const { promise, cancel } = uploadFile(dsId, target, file, (sent) =>
-            taskProgress(id, sent),
+          const { promise, cancel } = uploadFile(
+            dsId,
+            target,
+            file,
+            (sent) => taskProgress(id, sent),
+            id,
           );
           signal.addEventListener('abort', cancel);
+          // XHR 进度只反映本地加密/分卷；真实上传进度轮询服务端
+          const poll = window.setInterval(() => {
+            api
+              .uploadProgress(id)
+              .then((p) => taskUploaded(id, p.uploaded))
+              .catch(() => undefined);
+          }, 500);
           try {
             await promise;
           } finally {
+            window.clearInterval(poll);
             signal.removeEventListener('abort', cancel);
           }
           void refresh();

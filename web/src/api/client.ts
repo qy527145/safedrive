@@ -182,20 +182,29 @@ export const api = {
       method: 'POST',
       body: data,
     }),
+
+  // ---- 上传双维度进度（encrypted = 本地已加密，uploaded = 远端已确认） ----
+  uploadProgress: (id: string) =>
+    request<{ total: number; encrypted: number; uploaded: number }>(
+      `/api/uploads/${encodeURIComponent(id)}/progress`,
+    ),
 };
 
 /**
  * XHR 流式上传（fetch 无上传进度事件）。返回可取消句柄。
+ * `progressId` 会透传给服务端，供 api.uploadProgress 轮询真实上传进度。
  */
 export function uploadFile(
   ds: string,
   path: string,
   file: File,
   onProgress: (sent: number) => void,
+  progressId?: string,
 ): { promise: Promise<void>; cancel: () => void } {
   const xhr = new XMLHttpRequest();
   const promise = new Promise<void>((resolve, reject) => {
-    const url = `/api/files/${ds}/upload?path=${encodeURIComponent(path)}&size=${file.size}`;
+    let url = `/api/files/${ds}/upload?path=${encodeURIComponent(path)}&size=${file.size}`;
+    if (progressId) url += `&progress=${encodeURIComponent(progressId)}`;
     xhr.open('PUT', url);
     if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
     xhr.upload.onprogress = (e) => onProgress(e.loaded);

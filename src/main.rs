@@ -33,18 +33,28 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "safedrive=info,tower_http=warn".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
     let data_dir = cli
         .data_dir
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| ".".into()).join(".safedrive"));
     std::fs::create_dir_all(&data_dir)?;
+
+    // 日志双写：stdout + <data_dir>/logs/safedrive.log.YYYY-MM-DD（按天滚动）。
+    // 上游报错细节（请求参数、原始响应）都打在 error 级，落盘可事后排查。
+    let log_dir = data_dir.join("logs");
+    std::fs::create_dir_all(&log_dir)?;
+    let (file_writer, _log_guard) =
+        tracing_appender::non_blocking(tracing_appender::rolling::daily(&log_dir, "safedrive.log"));
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "safedrive=info,tower_http=warn".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(file_writer))
+        .init();
 
     if cli.admin_password.is_none() {
         tracing::warn!("未设置 --admin-password / SAFEDRIVE_ADMIN_PASSWORD，API 免登录（仅建议本机使用）");

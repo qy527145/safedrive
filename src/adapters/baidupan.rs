@@ -2,10 +2,17 @@
 //!
 //! 目录、写操作和上传使用 OAuth `xpan` 开放平台 API；Cookie 只用于 onepan
 //! `get_download_url1` 对应的 Android `locatedownload` 下载链路。
+//! 上传对齐 OpenList baidu_netdisk 驱动的实测高速形态：
+//! precreate → locateupload 取最优上传域名 → superfile2 并发分片
+//! （type=tmpfile，分片大小按会员等级 4/16/32MiB，失败重试 3 次）→ create。
+//! 其余开放平台接口（list / filemanager / OAuth）对齐官方 Python SDK
+//! （pythonsdk_20220616）：请求 query 均带 `openapi=xpansdk` 标识
+//! （superfile2 除外——与 OpenList 一致不带）。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -20,7 +27,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use super::{ByteStream, Entry, Storage};
+use super::{ByteStream, Entry, ProgressFn, Storage};
 use crate::error::{ApiError, ApiResult};
 
 const XPAN_API: &str = "https://pan.baidu.com/rest/2.0/";
@@ -29,16 +36,59 @@ const OAUTH_DEVICE_CODE_API: &str = "https://openapi.baidu.com/oauth/2.0/device/
 const OAUTH_DEVICE_APPROVE_API: &str = "https://openapi.baidu.com/device";
 const PCS_FILE_API: &str = "https://pcs.baidu.com/rest/2.0/pcs/file";
 const PCS_UPLOAD_API: &str = "https://d.pcs.baidu.com/rest/2.0/pcs/superfile2";
+/// locateupload（动态上传域名调度）走 d.pcs 域（对齐 OpenList）。
+const PCS_LOCATE_UPLOAD_API: &str = "https://d.pcs.baidu.com/rest/2.0/pcs/file";
 const DEFAULT_CLIENT_ID: &str = "iYCeC9g08h5vuP9UqvPHKKSVrKFXGa1v";
 const DEFAULT_CLIENT_SECRET: &str = "jXiFMOPVPCWlO2M5CwWQzffpNPaGTRBG";
 const PAN_APP_ID: &str = "250528";
 const DEFAULT_DOWNLOAD_UA: &str = "netdisk;P2SP;2.2.61.31;android";
 const DEFAULT_WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const MAX_PREVIEW_RANGE: u64 = 5 * 1024 * 1024;
-const UPLOAD_BLOCK_SIZE: usize = 4 * 1024 * 1024;
+/// 分片大小按会员等级（对齐 OpenList）：普通 4MiB、会员 16MiB、超级会员 32MiB。
+const DEFAULT_SLICE_SIZE: usize = 4 * 1024 * 1024;
+const VIP_SLICE_SIZE: usize = 16 * 1024 * 1024;
+const SVIP_SLICE_SIZE: usize = 32 * 1024 * 1024;
 const MAX_UPLOAD_BLOCKS: usize = 2048;
-const UPLOAD_CONCURRENCY: usize = 3;
+/// 瞬时故障（网络错误 / 5xx）重试的基础退避毫秒数；测试构建下压缩以免拖慢用例。
+const RETRY_BACKOFF_MS: u64 = if cfg!(test) { 10 } else { 500 };
+/// 整卷兜底重试的基础退避毫秒数。
+const VOLUME_RETRY_BACKOFF_MS: u64 = if cfg!(test) { 50 } else { 5_000 };
+/// superfile2 分片并发数（OpenList 默认 3，可配 uploadThreads 1..=32）。
+/// 早期实测「并发即 BFE 500」是在静态 d.pcs 域名 + 无 type=tmpfile 的
+/// 组合下发生的；对齐 OpenList（locateupload 动态域名 + type=tmpfile）
+/// 后并发稳定。仍以账号级信号量限制同账号总并发。
+const DEFAULT_UPLOAD_THREADS: usize = 3;
 const LINK_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// 账号级（BDUSS 维度）superfile2 并发槽：同一账号哪怕来自不同适配器
+/// 实例（并发上传多个文件时每个请求各建一个实例）也共享同一配额，
+/// 避免多文件叠加把账号总并发推过上游容忍度。适配器按请求新建，
+/// uploadThreads 变更时换新信号量（在途任务持旧槽自然收尾）。
+type SlotMap = HashMap<u64, (usize, Arc<tokio::sync::Semaphore>)>;
+static UPLOAD_SLOTS: std::sync::LazyLock<std::sync::Mutex<SlotMap>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// 账号级会员类型缓存（决定分片大小；进程生命周期内成功查询一次即复用）。
+static VIP_TYPES: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, i64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn account_key(bduss: &HeaderValue) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    bduss.as_bytes().hash(&mut hasher);
+    hasher.finish()
+}
+
+fn upload_slots_for(key: u64, threads: usize) -> Arc<tokio::sync::Semaphore> {
+    let mut slots = UPLOAD_SLOTS.lock().unwrap();
+    let entry = slots
+        .entry(key)
+        .or_insert_with(|| (threads, Arc::new(tokio::sync::Semaphore::new(threads))));
+    if entry.0 != threads {
+        *entry = (threads, Arc::new(tokio::sync::Semaphore::new(threads)));
+    }
+    Arc::clone(&entry.1)
+}
 
 pub type TokenPersister = Arc<dyn Fn(&str, &str) -> ApiResult<()> + Send + Sync>;
 
@@ -83,6 +133,7 @@ pub struct BaiduPanFs {
     oauth_device_approve_api: Url,
     pcs_api_base: Url,
     upload_api_base: Url,
+    upload_locate_api: Url,
     client_id: String,
     client_secret: String,
     tokens: Mutex<OAuthTokens>,
@@ -93,6 +144,12 @@ pub struct BaiduPanFs {
     http: Client,
     links: Mutex<HashMap<String, CachedLinks>>,
     link_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// 账号级 superfile2 并发槽（见 UPLOAD_SLOTS）。
+    upload_slots: Arc<tokio::sync::Semaphore>,
+    /// superfile2 分片并发数（uploadThreads，1..=32，默认 3）。
+    upload_threads: usize,
+    /// 账号哈希（UPLOAD_SLOTS / VIP_TYPES 缓存键）。
+    account_key: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,8 +166,6 @@ struct BaiduListItem {
 struct SpooledUpload {
     temp: TempUpload,
     block_md5: Vec<String>,
-    content_md5: String,
-    slice_md5: String,
 }
 
 impl BaiduPanFs {
@@ -182,6 +237,12 @@ impl BaiduPanFs {
                 ));
             }
         };
+        let upload_threads = config
+            .get("uploadThreads")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok()))
+            .map_or(DEFAULT_UPLOAD_THREADS, |n| (n as usize).clamp(1, 32));
+        let account_key = account_key(&download_cookie);
+        let upload_slots = upload_slots_for(account_key, upload_threads);
         Ok(Self {
             root,
             xpan_api_base: parse_url("openApiBase", XPAN_API)?,
@@ -190,6 +251,7 @@ impl BaiduPanFs {
             oauth_device_approve_api: parse_url("oauthDeviceApproveUrl", OAUTH_DEVICE_APPROVE_API)?,
             pcs_api_base: parse_url("pcsApiBase", PCS_FILE_API)?,
             upload_api_base: parse_url("uploadApiBase", PCS_UPLOAD_API)?,
+            upload_locate_api: parse_url("uploadLocateApi", PCS_LOCATE_UPLOAD_API)?,
             client_id,
             client_secret,
             tokens: Mutex::new(OAuthTokens {
@@ -214,6 +276,9 @@ impl BaiduPanFs {
             http,
             links: Mutex::new(HashMap::new()),
             link_locks: Mutex::new(HashMap::new()),
+            upload_slots,
+            upload_threads,
+            account_key,
         })
     }
 
@@ -242,24 +307,42 @@ impl BaiduPanFs {
 
     async fn response_json(resp: reqwest::Response, what: &str) -> ApiResult<Value> {
         let status = resp.status();
+        let url = log_url(resp.url());
+        // 失败时响应体可能为空（如 superfile2 偶发 500），响应头是仅剩线索
+        let headers = super::log_headers(resp.headers());
         let text = resp
             .text()
             .await
-            .map_err(|e| ApiError::Upstream(format!("读取百度网盘{what}响应失败: {e}")))?;
-        let value = if text.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&text).map_err(|e| {
-                ApiError::Upstream(format!("解析百度网盘{what}响应失败: {e}; {text}"))
-            })?
-        };
+            .map_err(|e| {
+                tracing::error!(
+                    "百度网盘{what}读取响应失败: HTTP {status} 请求: {url} 响应头: {headers} err: {e}"
+                );
+                ApiError::Upstream(format!("读取百度网盘{what}响应失败: {e}"))
+            })?;
         if !status.is_success() {
+            tracing::error!(
+                "百度网盘{what}失败: HTTP {status} 请求: {url} 响应头: {headers} 原始响应: {}",
+                log_body(&text),
+            );
             return Err(ApiError::Upstream(format!(
                 "百度网盘{what}失败 ({status}): {}",
-                text.chars().take(300).collect::<String>()
+                if text.trim().is_empty() {
+                    "(空响应体，详见日志文件)".to_string()
+                } else {
+                    text.chars().take(300).collect::<String>()
+                },
             )));
         }
-        Ok(value)
+        if text.trim().is_empty() {
+            return Ok(json!({}));
+        }
+        serde_json::from_str(&text).map_err(|e| {
+            tracing::error!(
+                "百度网盘{what}响应无法解析: HTTP {status} 请求: {url} 响应头: {headers} 原始响应: {}",
+                log_body(&text),
+            );
+            ApiError::Upstream(format!("解析百度网盘{what}响应失败: {e}; {text}"))
+        })
     }
 
     fn api_code(value: &Value) -> i64 {
@@ -316,6 +399,7 @@ impl BaiduPanFs {
             code_url
                 .query_pairs_mut()
                 .append_pair("response_type", "device_code")
+                .append_pair("openapi", "xpansdk")
                 .append_pair("client_id", &self.client_id)
                 .append_pair("client_secret", &self.client_secret)
                 .append_pair("scope", "basic,netdisk");
@@ -325,7 +409,7 @@ impl BaiduPanFs {
                 .header(USER_AGENT, "pan.baidu.com")
                 .send()
                 .await
-                .map_err(|e| ApiError::Upstream(format!("获取百度设备码失败: {e}")))?;
+                .map_err(|e| ApiError::Upstream(format!("获取百度设备码失败: {}", mask_err(&e))))?;
             let code_info = Self::response_json(code_resp, "获取设备码").await?;
             let device_code = code_info
                 .get("device_code")
@@ -354,7 +438,9 @@ impl BaiduPanFs {
                 .header(COOKIE, self.download_cookie.clone())
                 .send()
                 .await
-                .map_err(|e| ApiError::Upstream(format!("使用 BDUSS 授权设备码失败: {e}")))?;
+                .map_err(|e| {
+                    ApiError::Upstream(format!("使用 BDUSS 授权设备码失败: {}", mask_err(&e)))
+                })?;
             if !approve.status().is_success() {
                 return Err(ApiError::Upstream(format!(
                     "使用 BDUSS 授权设备码失败: HTTP {}",
@@ -373,6 +459,7 @@ impl BaiduPanFs {
                 token_url
                     .query_pairs_mut()
                     .append_pair("grant_type", "device_token")
+                    .append_pair("openapi", "xpansdk")
                     .append_pair("code", device_code)
                     .append_pair("client_id", &self.client_id)
                     .append_pair("client_secret", &self.client_secret);
@@ -380,7 +467,9 @@ impl BaiduPanFs {
                     .web_request(Method::GET, token_url)
                     .send()
                     .await
-                    .map_err(|e| ApiError::Upstream(format!("设备码换取令牌失败: {e}")))?;
+                    .map_err(|e| {
+                        ApiError::Upstream(format!("设备码换取令牌失败: {}", mask_err(&e)))
+                    })?;
                 let candidate = Self::response_json(token_resp, "设备码换取令牌").await?;
                 let pending = candidate
                     .get("error")
@@ -400,6 +489,7 @@ impl BaiduPanFs {
             let mut url = self.oauth_token_api.clone();
             url.query_pairs_mut()
                 .append_pair("grant_type", "refresh_token")
+                .append_pair("openapi", "xpansdk")
                 .append_pair("refresh_token", &tokens.refresh_token)
                 .append_pair("client_id", &self.client_id)
                 .append_pair("client_secret", &self.client_secret);
@@ -407,7 +497,9 @@ impl BaiduPanFs {
                 .web_request(Method::GET, url)
                 .send()
                 .await
-                .map_err(|e| ApiError::Upstream(format!("刷新百度开放平台令牌失败: {e}")))?;
+                .map_err(|e| {
+                    ApiError::Upstream(format!("刷新百度开放平台令牌失败: {}", mask_err(&e)))
+                })?;
             Self::response_json(resp, "刷新开放平台令牌").await?
         };
         if let Some(error) = value.get("error").and_then(Value::as_str) {
@@ -415,6 +507,12 @@ impl BaiduPanFs {
                 .get("error_description")
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            // 失败响应只含 error/error_description，无凭据，可整体落日志
+            tracing::error!(
+                "百度 OAuth 令牌请求被拒: grant_type={} 原始响应: {}",
+                if tokens.refresh_token.is_empty() { "device_token" } else { "refresh_token" },
+                truncate_chars(&value.to_string(), LOG_BODY_MAX),
+            );
             return Err(ApiError::Upstream(format!(
                 "刷新百度开放平台令牌失败: {error}: {description}"
             )));
@@ -442,6 +540,10 @@ impl BaiduPanFs {
         tokens.access_token = access.clone();
         tokens.refresh_token = refresh;
         tokens.expires_at = Some(Instant::now() + Duration::from_secs(expires));
+        tracing::info!(
+            "百度开放平台 access_token 已更新: {} (有效期 {expires}s)",
+            mask_secret(&access),
+        );
         Ok(access)
     }
 
@@ -455,32 +557,82 @@ impl BaiduPanFs {
         allowed: &[i64],
     ) -> ApiResult<Value> {
         let mut token = self.access_token().await?;
-        for attempt in 0..2 {
+        // 失败日志用（惰性构造）：query 不含 access_token（已单独脱敏），form 原样截断
+        let query_log = || log_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
+        let form_log = || {
+            form.map_or_else(String::new, |f| {
+                log_pairs(f.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            })
+        };
+        let mut refreshed = false;
+        let mut last_err: Option<ApiError> = None;
+        // 瞬时故障（网络错误 / 5xx）兜底重试；errno 拒绝是确定性失败，不重试
+        for attempt in 1..=3usize {
             let mut url = self.xpan_url(endpoint)?;
             {
                 let mut pairs = url.query_pairs_mut();
                 pairs.append_pair("access_token", &token);
+                // 官方 Python SDK：所有开放平台请求都带此标识
+                pairs.append_pair("openapi", "xpansdk");
                 for (key, value) in query {
                     pairs.append_pair(key, value);
                 }
             }
+            // 正常请求也留痕（token 首尾可辨认）；日常 CRUD 走 debug 免刷屏
+            tracing::debug!("百度网盘{what}请求: {method} {}", log_url(&url));
             let mut request = self.web_request(method.clone(), url);
             if let Some(form) = form {
                 request = request.form(form);
             }
-            let resp = request
-                .send()
-                .await
-                .map_err(|e| ApiError::Upstream(format!("百度网盘{what}请求失败: {e}")))?;
-            let value = Self::response_json(resp, what).await?;
-            if matches!(Self::api_code(&value), 111 | -6) && attempt == 0 {
+            let resp = match request.send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let masked = mask_err(&e);
+                    tracing::warn!(
+                        "百度网盘{what}请求发送失败(第 {attempt}/3 次): {method} {endpoint} query: {} form: {} err: {masked}",
+                        query_log(),
+                        form_log(),
+                    );
+                    last_err = Some(ApiError::Upstream(format!("百度网盘{what}请求失败: {masked}")));
+                    tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS * attempt as u64)).await;
+                    continue;
+                }
+            };
+            let status = resp.status();
+            let value = match Self::response_json(resp, what).await {
+                Ok(value) => value,
+                Err(e) => {
+                    // response_json 已记录请求地址与原始响应，这里补 form 体
+                    if form.is_some() {
+                        tracing::error!("百度网盘{what}失败时的 form 参数: {}", form_log());
+                    }
+                    // 5xx 属上游瞬时故障（bfe 偶发 500/502），重试；4xx 等确定性失败直接返回
+                    if !status.is_server_error() {
+                        return Err(e);
+                    }
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS * attempt as u64)).await;
+                    continue;
+                }
+            };
+            if matches!(Self::api_code(&value), 111 | -6) && !refreshed {
+                refreshed = true;
                 token = self.refresh_access_token(Some(&token)).await?;
                 continue;
             }
-            Self::ensure_api_ok(&value, what, allowed)?;
+            if let Err(e) = Self::ensure_api_ok(&value, what, allowed) {
+                tracing::error!(
+                    "百度网盘{what}被拒: {method} {endpoint} query: {} form: {} 原始响应: {}",
+                    query_log(),
+                    form_log(),
+                    truncate_chars(&value.to_string(), LOG_BODY_MAX),
+                );
+                return Err(e);
+            }
             return Ok(value);
         }
-        unreachable!()
+        Err(last_err
+            .unwrap_or_else(|| ApiError::Upstream(format!("百度网盘{what}失败: 重试耗尽"))))
     }
 
     async fn locatedownload(&self, remote_path: &str) -> ApiResult<Vec<String>> {
@@ -556,7 +708,13 @@ impl BaiduPanFs {
             .await
             .map_err(|e| ApiError::Upstream(format!("百度网盘获取下载链接失败: {e}")))?;
         let value = Self::response_json(resp, "获取下载链接").await?;
-        Self::ensure_api_ok(&value, "获取下载链接", &[])?;
+        if let Err(e) = Self::ensure_api_ok(&value, "获取下载链接", &[]) {
+            tracing::error!(
+                "百度网盘获取下载链接被拒: path={remote_path} 原始响应: {}",
+                truncate_chars(&value.to_string(), LOG_BODY_MAX),
+            );
+            return Err(e);
+        }
         let urls = value
             .get("urls")
             .and_then(Value::as_array)
@@ -633,11 +791,16 @@ impl BaiduPanFs {
         unreachable!()
     }
 
-    async fn spool_upload(&self, size: u64, mut body: ByteStream) -> ApiResult<SpooledUpload> {
+    async fn spool_upload(
+        &self,
+        size: u64,
+        slice_size: usize,
+        mut body: ByteStream,
+    ) -> ApiResult<SpooledUpload> {
         if size == 0 {
             return Err(ApiError::BadRequest("百度网盘开放平台不支持空文件".into()));
         }
-        let block_count = size.div_ceil(UPLOAD_BLOCK_SIZE as u64) as usize;
+        let block_count = size.div_ceil(slice_size as u64) as usize;
         if block_count > MAX_UPLOAD_BLOCKS {
             return Err(ApiError::BadRequest(format!(
                 "单个百度网盘分卷超过开放平台上限: {block_count} 块"
@@ -645,11 +808,8 @@ impl BaiduPanFs {
         }
         let temp = TempUpload::new();
         let mut file = tokio::fs::File::create(&temp.path).await?;
-        let mut content = Md5::new();
-        let mut slice = Md5::new();
         let mut block = Md5::new();
         let mut block_bytes = 0usize;
-        let mut slice_bytes = 0usize;
         let mut received = 0u64;
         let mut block_md5 = Vec::with_capacity(block_count);
         while let Some(chunk) = body.next().await {
@@ -659,19 +819,13 @@ impl BaiduPanFs {
                 return Err(ApiError::BadRequest("上传数据超过声明大小".into()));
             }
             file.write_all(&chunk).await?;
-            content.update(&chunk);
-            if slice_bytes < 256 * 1024 {
-                let take = (256 * 1024 - slice_bytes).min(chunk.len());
-                slice.update(&chunk[..take]);
-                slice_bytes += take;
-            }
             let mut offset = 0usize;
             while offset < chunk.len() {
-                let take = (UPLOAD_BLOCK_SIZE - block_bytes).min(chunk.len() - offset);
+                let take = (slice_size - block_bytes).min(chunk.len() - offset);
                 block.update(&chunk[offset..offset + take]);
                 block_bytes += take;
                 offset += take;
-                if block_bytes == UPLOAD_BLOCK_SIZE {
+                if block_bytes == slice_size {
                     block_md5.push(hex::encode(block.finalize_reset()));
                     block_bytes = 0;
                 }
@@ -687,17 +841,17 @@ impl BaiduPanFs {
         if block_bytes != 0 {
             block_md5.push(hex::encode(block.finalize()));
         }
-        Ok(SpooledUpload {
-            temp,
-            block_md5,
-            content_md5: hex::encode(content.finalize()),
-            slice_md5: hex::encode(slice.finalize()),
-        })
+        Ok(SpooledUpload { temp, block_md5 })
     }
 
-    async fn read_upload_block(path: &Path, part_seq: usize, size: u64) -> ApiResult<Bytes> {
-        let offset = part_seq as u64 * UPLOAD_BLOCK_SIZE as u64;
-        let length = (size - offset).min(UPLOAD_BLOCK_SIZE as u64) as usize;
+    async fn read_upload_block(
+        path: &Path,
+        part_seq: usize,
+        size: u64,
+        slice_size: usize,
+    ) -> ApiResult<Bytes> {
+        let offset = part_seq as u64 * slice_size as u64;
+        let length = (size - offset).min(slice_size as u64) as usize;
         let mut file = tokio::fs::File::open(path).await?;
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         let mut bytes = vec![0; length];
@@ -705,15 +859,95 @@ impl BaiduPanFs {
         Ok(Bytes::from(bytes))
     }
 
+    /// 会员类型（0 普通 / 1 会员 / 2 超级会员），决定分片大小。
+    /// 账号级缓存；查询失败按普通账号处理（4MiB 分片总是可用）。
+    async fn vip_type(&self) -> i64 {
+        if let Some(&cached) = VIP_TYPES.lock().unwrap().get(&self.account_key) {
+            return cached;
+        }
+        let vip = match self
+            .xpan_request(Method::GET, "xpan/nas", &[("method", "uinfo".into())], None, "查询账号信息", &[])
+            .await
+        {
+            Ok(value) => value.get("vip_type").and_then(Value::as_i64).unwrap_or(0),
+            Err(e) => {
+                tracing::warn!("百度网盘查询会员类型失败，按普通账号 4MiB 分片: {e}");
+                return 0;
+            }
+        };
+        VIP_TYPES.lock().unwrap().insert(self.account_key, vip);
+        vip
+    }
+
+    fn slice_size_for(vip_type: i64) -> usize {
+        match vip_type {
+            2 => SVIP_SLICE_SIZE,
+            1 => VIP_SLICE_SIZE,
+            _ => DEFAULT_SLICE_SIZE,
+        }
+    }
+
+    /// locateupload 动态获取最近的上传集群域名（OpenList 实测这是高速
+    /// 上传的关键：静态 d.pcs.baidu.com 常被调度到远端/限速节点）。
+    /// 失败时回退配置的静态上传地址。
+    async fn upload_url(&self, remote: &str, upload_id: &str) -> Url {
+        let fallback = self.upload_api_base.clone();
+        let token = match self.access_token().await {
+            Ok(token) => token,
+            Err(_) => return fallback,
+        };
+        let mut url = self.upload_locate_api.clone();
+        url.query_pairs_mut()
+            .append_pair("method", "locateupload")
+            .append_pair("appid", PAN_APP_ID)
+            .append_pair("access_token", &token)
+            .append_pair("path", remote)
+            .append_pair("uploadid", upload_id)
+            .append_pair("upload_version", "2.0");
+        let server = async {
+            let resp = self.web_request(Method::GET, url).send().await.ok()?;
+            let value = Self::response_json(resp, "获取上传域名").await.ok()?;
+            let pick = |key: &str| {
+                value
+                    .get(key)?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|item| item.get("server")?.as_str())
+                    .find(|server| server.starts_with("https://") || server.starts_with("http://"))
+                    .map(str::to_owned)
+            };
+            pick("servers").or_else(|| pick("bak_servers"))
+        }
+        .await;
+        match server
+            .and_then(|server| Url::parse(&server).ok()?.join("/rest/2.0/pcs/superfile2").ok())
+        {
+            Some(url) => {
+                tracing::info!(
+                    "百度网盘 locateupload 选定上传域名: {}",
+                    url.host_str().unwrap_or("?"),
+                );
+                url
+            }
+            None => {
+                tracing::warn!("百度网盘 locateupload 未返回可用域名，回退静态上传地址");
+                fallback
+            }
+        }
+    }
+
     async fn upload_block_once(
         &self,
+        upload_url: &Url,
         remote: &str,
         upload_id: &str,
         part_seq: usize,
         block: Bytes,
         token: &str,
     ) -> ApiResult<Value> {
-        let mut url = self.upload_api_base.clone();
+        // 对齐 OpenList：superfile2 带 method/access_token/type=tmpfile/
+        // path/uploadid/partseq（不带 openapi），multipart 字段名 "file"
+        let mut url = upload_url.clone();
         url.query_pairs_mut()
             .append_pair("method", "upload")
             .append_pair("access_token", token)
@@ -722,8 +956,10 @@ impl BaiduPanFs {
             .append_pair("uploadid", upload_id)
             .append_pair("partseq", &part_seq.to_string());
         let len = block.len() as u64;
+        // 正常请求留痕：实际上传地址（locateupload 动态域名）+ 所用 token（首尾可辨认）
+        tracing::info!("百度网盘上传分块: POST {} len={len}", log_url(&url));
         let part = Part::stream_with_length(reqwest::Body::from(block), len)
-            .file_name("blob")
+            .file_name("file")
             .mime_str("application/octet-stream")
             .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
         let resp = self
@@ -731,50 +967,171 @@ impl BaiduPanFs {
             .multipart(Form::new().part("file", part))
             .send()
             .await
-            .map_err(|e| ApiError::Upstream(format!("百度网盘上传第 {part_seq} 块失败: {e}")))?;
+            .map_err(|e| {
+                ApiError::Upstream(format!("百度网盘上传第 {part_seq} 块失败: {}", mask_err(&e)))
+            })?;
         Self::response_json(resp, "上传文件块").await
     }
 
     async fn upload_block(
         &self,
+        upload_url: &Url,
         remote: &str,
         upload_id: &str,
         part_seq: usize,
         block: Bytes,
     ) -> ApiResult<()> {
         let mut token = self.access_token().await?;
-        for attempt in 0..2 {
-            let value = self
-                .upload_block_once(remote, upload_id, part_seq, block.clone(), &token)
-                .await?;
-            if matches!(Self::api_code(&value), 111 | -6) && attempt == 0 {
+        let block_len = block.len();
+        let mut refreshed = false;
+        let mut last_err: Option<ApiError> = None;
+        // OpenList/官方 SDK 均对 superfile2 重试 3 次；偶发 500 重试即恢复
+        for attempt in 1..=3usize {
+            let result = {
+                // 账号级并发槽：限制同账号跨文件/跨分卷的 superfile2 总并发
+                let _permit = self.upload_slots.acquire().await.map_err(|_| {
+                    ApiError::Internal(anyhow::anyhow!("上传并发槽已关闭"))
+                })?;
+                self.upload_block_once(upload_url, remote, upload_id, part_seq, block.clone(), &token)
+                    .await
+            };
+            let value = match result {
+                Ok(value) => value,
+                Err(e) => {
+                    tracing::warn!(
+                        "百度网盘上传分块第 {attempt}/3 次失败: path={remote} uploadid={upload_id} partseq={part_seq} len={block_len} err: {e}"
+                    );
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS * attempt as u64)).await;
+                    continue;
+                }
+            };
+            if matches!(Self::api_code(&value), 111 | -6) && !refreshed {
+                refreshed = true;
                 token = self.refresh_access_token(Some(&token)).await?;
                 continue;
             }
-            Self::ensure_api_ok(&value, "上传文件块", &[])?;
+            // errno != 0 是确定性拒绝，不重试
+            if let Err(e) = Self::ensure_api_ok(&value, "上传文件块", &[]) {
+                tracing::error!(
+                    "百度网盘上传分块被拒: path={remote} uploadid={upload_id} partseq={part_seq} len={block_len} 原始响应: {}",
+                    truncate_chars(&value.to_string(), LOG_BODY_MAX),
+                );
+                return Err(e);
+            }
+            // 官方 SDK 校验：成功响应必须带该分块的 md5
+            if value
+                .get("md5")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                tracing::error!(
+                    "百度网盘上传分块未返回 md5: path={remote} uploadid={upload_id} partseq={part_seq} len={block_len} 原始响应: {}",
+                    truncate_chars(&value.to_string(), LOG_BODY_MAX),
+                );
+                return Err(ApiError::Upstream(format!(
+                    "百度网盘上传第 {part_seq} 块异常: 响应未返回 md5"
+                )));
+            }
             return Ok(());
         }
-        unreachable!()
+        Err(last_err.unwrap_or_else(|| {
+            ApiError::Upstream(format!("百度网盘上传第 {part_seq} 块失败: 重试耗尽"))
+        }))
     }
 
-    async fn upload_sized(&self, path: &str, size: u64, body: ByteStream) -> ApiResult<()> {
+    async fn upload_sized(
+        &self,
+        path: &str,
+        size: u64,
+        body: ByteStream,
+        progress: ProgressFn,
+    ) -> ApiResult<()> {
         let remote = self.remote_path(path);
-        let spooled = self.spool_upload(size, body).await?;
+        let slice_size = Self::slice_size_for(self.vip_type().await);
+        // spool 阶段只是本地落盘算 md5，不算上传进度
+        let spooled = self.spool_upload(size, slice_size, body).await?;
+        tracing::info!(
+            "百度网盘上传分卷开始: path={remote} size={size} 分片大小={slice_size} 分块数={}",
+            spooled.block_md5.len(),
+        );
+        // 进度高水位：report 收「本卷累计已确认字节」，只把超出历史水位的
+        // 增量转发给 progress —— 整卷重试时已上报的字节不会重复计数
+        let reported = Arc::new(AtomicU64::new(0));
+        let report: ProgressFn = {
+            let reported = Arc::clone(&reported);
+            Arc::new(move |confirmed: u64| {
+                let mut prev = reported.load(Ordering::Relaxed);
+                while confirmed > prev {
+                    match reported.compare_exchange(
+                        prev,
+                        confirmed,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            progress(confirmed - prev);
+                            break;
+                        }
+                        Err(now) => prev = now,
+                    }
+                }
+            })
+        };
+        // 整卷兜底重试：块级/请求级重试都耗尽后，隔段时间从 precreate 重来
+        // （分卷已落盘，重试不需要重新接收数据）
+        let mut last_err: Option<ApiError> = None;
+        for attempt in 1..=3usize {
+            match self
+                .upload_spooled(&remote, size, slice_size, &spooled, &report)
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!("百度网盘分卷上传完成: path={remote} size={size}");
+                    return Ok(());
+                }
+                // 只有上游瞬时故障值得整卷重试；BadRequest 等确定性错误直接失败
+                Err(e @ ApiError::Upstream(_)) if attempt < 3 => {
+                    tracing::warn!(
+                        "百度网盘分卷上传第 {attempt}/3 次失败，稍后整卷重试: path={remote} err: {e}"
+                    );
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(VOLUME_RETRY_BACKOFF_MS * attempt as u64)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            ApiError::Upstream(format!("百度网盘分卷上传失败: 重试耗尽 path={remote}"))
+        }))
+    }
+
+    /// 已落盘分卷的 precreate → superfile2 分块 → create 全流程。
+    /// `report` 语义为「本卷累计已确认字节」（高水位去重，可安全重放）。
+    async fn upload_spooled(
+        &self,
+        remote: &str,
+        size: u64,
+        slice_size: usize,
+        spooled: &SpooledUpload,
+        report: &ProgressFn,
+    ) -> ApiResult<()> {
         let block_list = serde_json::to_string(&spooled.block_md5).unwrap();
+        // 官方 SDK 表单：path/size/block_list/isdir/autoinit/rtype，
+        // 不带 content-md5 / slice-md5（秒传探测对唯一密文永不命中）
         let precreate = self
             .xpan_request(
                 Method::POST,
                 "xpan/file",
                 &[("method", "precreate".into())],
                 Some(&[
-                    ("path".into(), remote.clone()),
+                    ("path".into(), remote.to_owned()),
                     ("size".into(), size.to_string()),
+                    ("block_list".into(), block_list.clone()),
                     ("isdir".into(), "0".into()),
                     ("autoinit".into(), "1".into()),
-                    ("rtype".into(), "3".into()),
-                    ("block_list".into(), block_list.clone()),
-                    ("content-md5".into(), spooled.content_md5),
-                    ("slice-md5".into(), spooled.slice_md5),
+                    // path 冲突且 block_list 不同才重命名（与官方 SDK 一致）
+                    ("rtype".into(), "2".into()),
                 ]),
                 "预创建上传",
                 &[],
@@ -785,6 +1142,8 @@ impl BaiduPanFs {
             .and_then(Value::as_i64)
             .is_some_and(|kind| kind == 2)
         {
+            tracing::info!("百度网盘秒传命中: path={remote}");
+            report(size); // 秒传：整卷即刻完成
             return Ok(());
         }
         let upload_id = precreate
@@ -805,24 +1164,46 @@ impl BaiduPanFs {
             })
             .unwrap_or_else(|| (0..spooled.block_md5.len()).collect());
         let block_count = spooled.block_md5.len();
+        tracing::info!(
+            "百度网盘 precreate 完成: uploadid={upload_id} 待传分块 {}/{block_count}",
+            missing.len(),
+        );
         let temp_path = spooled.temp.path.clone();
+        // 分块字节数（末块可能不满）；越界序号记 0，后面会精确报错
+        let block_len = |seq: usize| -> u64 {
+            size.saturating_sub(seq as u64 * slice_size as u64)
+                .min(slice_size as u64)
+        };
+        // precreate 未列出的分块 = 上游已持有，直接计入进度
+        let missing_bytes: u64 = missing.iter().map(|&seq| block_len(seq)).sum();
+        let confirmed = Arc::new(AtomicU64::new(size.saturating_sub(missing_bytes)));
+        report(confirmed.load(Ordering::Relaxed));
+        // 每个分卷取一次动态上传域名（uploadid 生命周期内有效）
+        let upload_url = self.upload_url(remote, &upload_id).await;
         stream::iter(missing)
             .map(|part_seq| {
-                let remote = remote.clone();
+                let remote = remote.to_owned();
                 let upload_id = upload_id.clone();
+                let upload_url = upload_url.clone();
                 let path = temp_path.clone();
+                let confirmed = Arc::clone(&confirmed);
+                let report = Arc::clone(report);
                 async move {
                     if part_seq >= block_count {
                         return Err(ApiError::Upstream(format!(
                             "百度返回非法上传分片序号: {part_seq}"
                         )));
                     }
-                    let block = Self::read_upload_block(&path, part_seq, size).await?;
-                    self.upload_block(&remote, &upload_id, part_seq, block)
-                        .await
+                    let block =
+                        Self::read_upload_block(&path, part_seq, size, slice_size).await?;
+                    let len = block.len() as u64;
+                    self.upload_block(&upload_url, &remote, &upload_id, part_seq, block)
+                        .await?;
+                    report(confirmed.fetch_add(len, Ordering::Relaxed) + len);
+                    Ok(())
                 }
             })
-            .buffer_unordered(UPLOAD_CONCURRENCY)
+            .buffer_unordered(self.upload_threads)
             .try_collect::<Vec<_>>()
             .await?;
         self.xpan_request(
@@ -830,18 +1211,18 @@ impl BaiduPanFs {
             "xpan/file",
             &[("method", "create".into())],
             Some(&[
-                ("path".into(), remote),
+                ("rtype".into(), "2".into()),
+                ("path".into(), remote.to_owned()),
                 ("size".into(), size.to_string()),
                 ("isdir".into(), "0".into()),
-                ("rtype".into(), "3".into()),
-                ("uploadid".into(), upload_id),
                 ("block_list".into(), block_list),
+                ("uploadid".into(), upload_id),
             ]),
             "合并上传文件",
             &[],
         )
-        .await
-        .map(|_| ())
+        .await?;
+        Ok(())
     }
 }
 
@@ -914,7 +1295,8 @@ impl Storage for BaiduPanFs {
         if path.is_empty() {
             return Err(ApiError::BadRequest("不允许删除数据源根目录".into()));
         }
-        let file_list = serde_json::to_string(&[self.remote_path(path)]).unwrap();
+        // 官方 Python SDK 演示形态：filelist 为对象数组
+        let file_list = json!([{"path": self.remote_path(path)}]).to_string();
         self.xpan_request(
             Method::POST,
             "xpan/file",
@@ -1031,12 +1413,23 @@ impl Storage for BaiduPanFs {
             path,
             size,
             stream::once(async move { Ok(bytes.freeze()) }).boxed(),
+            Arc::new(|_| {}),
         )
         .await
     }
 
     async fn put_sized(&self, path: &str, size: u64, body: ByteStream) -> ApiResult<()> {
-        self.upload_sized(path, size, body).await
+        self.upload_sized(path, size, body, Arc::new(|_| {})).await
+    }
+
+    async fn put_sized_tracked(
+        &self,
+        path: &str,
+        size: u64,
+        body: ByteStream,
+        progress: ProgressFn,
+    ) -> ApiResult<()> {
+        self.upload_sized(path, size, body, progress).await
     }
 }
 
@@ -1045,6 +1438,102 @@ fn cookie_value<'a>(cookies: &'a str, name: &str) -> Option<&'a str> {
         let (key, value) = part.trim().split_once('=')?;
         (key == name && !value.is_empty()).then_some(value)
     })
+}
+
+// ---------------- 排查日志辅助 ----------------
+
+/// 日志中原始响应体的最大长度（字符）。
+const LOG_BODY_MAX: usize = 4096;
+/// 单个参数值在日志中的最大长度（block_list 之类可达几十 KB）。
+const LOG_PARAM_MAX: usize = 512;
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        return s.to_owned();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…(截断，共 {total} 字符)")
+}
+
+/// 响应体日志形态：空体明确标注（区别于「没打出来」），非空截断。
+fn log_body(text: &str) -> String {
+    if text.trim().is_empty() {
+        "(空)".to_owned()
+    } else {
+        truncate_chars(text, LOG_BODY_MAX)
+    }
+}
+
+/// 凭据脱敏：保留首 8 位 + 尾 6 位（可辨认是哪个 token 而不暴露全值）；
+/// 过短的值全遮。
+fn mask_secret(value: &str) -> String {
+    let n = value.chars().count();
+    if n <= 16 {
+        return "…(已脱敏)".to_owned();
+    }
+    let head: String = value.chars().take(8).collect();
+    let tail: String = value.chars().skip(n - 6).collect();
+    format!("{head}…{tail}(已脱敏,共{n}字符)")
+}
+
+/// 参数值脱敏：凭据类走 mask_secret；超长值截断。
+fn log_value(key: &str, value: &str) -> String {
+    if matches!(
+        key,
+        "access_token" | "refresh_token" | "client_secret" | "code"
+    ) {
+        return mask_secret(value);
+    }
+    truncate_chars(value, LOG_PARAM_MAX)
+}
+
+fn log_pairs<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}={}", log_value(k, v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// 完整请求地址（query 参数脱敏后），供错误日志还原现场。
+fn log_url(url: &Url) -> String {
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let mut base = url.clone();
+    base.set_query(None);
+    if pairs.is_empty() {
+        return base.to_string();
+    }
+    let qs = log_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    format!("{base}?{qs}")
+}
+
+/// reqwest 错误信息内嵌完整 URL（含 access_token 等凭据），入日志或
+/// 返回给客户端前必须脱敏。
+fn mask_err(e: &reqwest::Error) -> String {
+    mask_credentials(&e.to_string())
+}
+
+fn mask_credentials(s: &str) -> String {
+    let mut text = s.to_owned();
+    for key in ["access_token=", "refresh_token=", "client_secret=", "code="] {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text.as_str();
+        while let Some(pos) = rest.find(key) {
+            let start = pos + key.len();
+            out.push_str(&rest[..start]);
+            let tail = &rest[start..];
+            let end = tail.find(['&', ' ', ')']).unwrap_or(tail.len());
+            out.push_str(&mask_secret(&tail[..end]));
+            rest = &tail[end..];
+        }
+        out.push_str(rest);
+        text = out;
+    }
+    text
 }
 
 fn normalize_root(root: &str) -> ApiResult<String> {
@@ -1076,7 +1565,10 @@ mod tests {
     #[derive(Clone)]
     struct MockState {
         download_url: String,
+        upload_server: String,
         locate_calls: Arc<AtomicUsize>,
+        /// 剩余注入的 upload-create 瞬时 500 次数（模拟 bfe 偶发故障）。
+        create_failures: Arc<AtomicUsize>,
     }
 
     fn config(base: &str) -> Value {
@@ -1089,8 +1581,26 @@ mod tests {
             "oauthDeviceCodeUrl": format!("{base}/oauth/device/code"),
             "oauthDeviceApproveUrl": format!("{base}/device"),
             "pcsApiBase": format!("{base}/rest/2.0/pcs/file"),
-            "uploadApiBase": format!("{base}/rest/2.0/pcs/superfile2")
+            "uploadApiBase": format!("{base}/rest/2.0/pcs/superfile2"),
+            "uploadLocateApi": format!("{base}/rest/2.0/pcs/locateupload")
         })
+    }
+
+    #[test]
+    fn mask_credentials_hides_all_secret_query_values() {
+        let raw = "error sending request for url (https://pan.baidu.com/rest/2.0/xpan/file?access_token=126.a7b45358db9a19f7022eec804c56a140.YGiVySf2.i0ZBMw&openapi=xpansdk&method=create)";
+        let masked = mask_credentials(raw);
+        assert!(!masked.contains("a7b45358db9a19f7022eec804c56a140"), "{masked}");
+        assert!(
+            masked.contains("access_token=126.a7b4…i0ZBMw(已脱敏"),
+            "首尾保留便于辨认 token: {masked}"
+        );
+        assert!(masked.contains("openapi=xpansdk"), "非敏感参数保留");
+        let oauth = "url (https://openapi.baidu.com/oauth/2.0/token?grant_type=device_token&code=secret-device-code&client_id=abc&client_secret=verysecretvalue)";
+        let masked = mask_credentials(oauth);
+        assert!(!masked.contains("verysecretvalue"), "{masked}");
+        assert!(!masked.contains("secret-device-code"), "{masked}");
+        assert!(masked.contains("client_id=abc"), "{masked}");
     }
 
     #[test]
@@ -1111,14 +1621,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spooling_uses_real_openlist_compatible_hashes_and_cleans_up() {
+    async fn spooling_uses_official_block_md5_and_cleans_up() {
         let fs = BaiduPanFs::from_config_with_persister(
             &config("http://127.0.0.1:1"),
             Client::new(),
             None,
         )
         .unwrap();
-        let data = (0..UPLOAD_BLOCK_SIZE + 37)
+        let data = (0..DEFAULT_SLICE_SIZE + 37)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
         let chunks = vec![
@@ -1129,23 +1639,20 @@ mod tests {
         let spooled = fs
             .spool_upload(
                 data.len() as u64,
+                DEFAULT_SLICE_SIZE,
                 stream::iter(chunks.into_iter().map(Ok)).boxed(),
             )
             .await
             .unwrap();
+        // 官方 SDK 语义：block_list = 每个分片的 md5（末块不满照算）
         assert_eq!(spooled.block_md5.len(), 2);
         assert_eq!(
             spooled.block_md5[0],
-            hex::encode(Md5::digest(&data[..UPLOAD_BLOCK_SIZE]))
+            hex::encode(Md5::digest(&data[..DEFAULT_SLICE_SIZE]))
         );
         assert_eq!(
             spooled.block_md5[1],
-            hex::encode(Md5::digest(&data[UPLOAD_BLOCK_SIZE..]))
-        );
-        assert_eq!(spooled.content_md5, hex::encode(Md5::digest(&data)));
-        assert_eq!(
-            spooled.slice_md5,
-            hex::encode(Md5::digest(&data[..256 * 1024]))
+            hex::encode(Md5::digest(&data[DEFAULT_SLICE_SIZE..]))
         );
         let temp_path = spooled.temp.path.clone();
         assert!(temp_path.exists());
@@ -1192,6 +1699,7 @@ mod tests {
         Query(query): Query<HashMap<String, String>>,
     ) -> impl IntoResponse {
         assert_open_headers(&headers);
+        assert_eq!(query.get("openapi").map(String::as_str), Some("xpansdk"));
         assert_eq!(
             query.get("client_id").map(String::as_str),
             Some(DEFAULT_CLIENT_ID)
@@ -1226,6 +1734,7 @@ mod tests {
     ) -> impl IntoResponse {
         assert!(headers.get(COOKIE).is_none());
         assert_eq!(headers.get(USER_AGENT).unwrap(), "pan.baidu.com");
+        assert_eq!(query.get("openapi").map(String::as_str), Some("xpansdk"));
         assert_eq!(
             query.get("client_id").map(String::as_str),
             Some(DEFAULT_CLIENT_ID)
@@ -1253,6 +1762,7 @@ mod tests {
     ) -> impl IntoResponse {
         assert_open_headers(&headers);
         assert_eq!(query.get("method").map(String::as_str), Some("list"));
+        assert_eq!(query.get("openapi").map(String::as_str), Some("xpansdk"));
         let token = query.get("access_token").map(String::as_str);
         if token == Some("expired-token") {
             return Json(json!({"errno": 111}));
@@ -1271,28 +1781,66 @@ mod tests {
     }
 
     async fn xpan_post(
+        State(state): State<MockState>,
         headers: HeaderMap,
         Query(query): Query<HashMap<String, String>>,
         AxumForm(form): AxumForm<HashMap<String, String>>,
-    ) -> impl IntoResponse {
+    ) -> axum::response::Response {
         assert_open_headers(&headers);
+        assert_eq!(query.get("openapi").map(String::as_str), Some("xpansdk"));
         assert_eq!(
             query.get("access_token").map(String::as_str),
             Some("renewed-token")
         );
         match query.get("method").map(String::as_str) {
             Some("precreate") => {
+                // 官方 SDK 表单：不带 content-md5 / slice-md5，rtype=2
                 assert_eq!(form.get("path").map(String::as_str), Some("/safe/volume"));
                 assert_eq!(form.get("size").map(String::as_str), Some("4"));
+                assert_eq!(form.get("isdir").map(String::as_str), Some("0"));
+                assert_eq!(form.get("autoinit").map(String::as_str), Some("1"));
+                assert_eq!(form.get("rtype").map(String::as_str), Some("2"));
+                assert!(!form.contains_key("content-md5"), "官方 SDK 无 content-md5");
+                assert!(!form.contains_key("slice-md5"), "官方 SDK 无 slice-md5");
                 assert_eq!(
-                    form.get("content-md5").map(String::as_str),
-                    Some("8d777f385d3dfec8815d20f7496026dc")
+                    form.get("block_list").map(String::as_str),
+                    Some(r#"["8d777f385d3dfec8815d20f7496026dc"]"#)
                 );
                 Json(
                     json!({"errno": 0, "return_type": 1, "uploadid": "upload-1", "block_list": [0]}),
                 )
+                .into_response()
             }
-            Some("create") | Some("filemanager") => Json(json!({"errno": 0})),
+            Some("create") => {
+                // 上传收口的 create（isdir=0）走 SDK 语义；mkdir（isdir=1）不在本断言范围
+                if form.get("isdir").map(String::as_str) == Some("0") {
+                    // 注入瞬时 500（空响应体，复刻 bfe 偶发故障）驱动重试路径
+                    if state
+                        .create_failures
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok()
+                    {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    assert_eq!(form.get("rtype").map(String::as_str), Some("2"));
+                    assert_eq!(form.get("uploadid").map(String::as_str), Some("upload-1"));
+                    assert_eq!(
+                        form.get("block_list").map(String::as_str),
+                        Some(r#"["8d777f385d3dfec8815d20f7496026dc"]"#)
+                    );
+                }
+                Json(json!({"errno": 0})).into_response()
+            }
+            Some("filemanager") => {
+                // 官方 Python SDK 演示形态：filelist 为对象数组
+                if query.get("opera").map(String::as_str) == Some("delete") {
+                    assert_eq!(
+                        form.get("filelist").map(String::as_str),
+                        Some(r#"[{"path":"/safe/renamed"}]"#)
+                    );
+                }
+                Json(json!({"errno": 0})).into_response()
+            }
             other => panic!("unexpected xpan operation: {other:?}"),
         }
     }
@@ -1306,8 +1854,38 @@ mod tests {
             query.get("access_token").map(String::as_str),
             Some("renewed-token")
         );
+        // 对齐 OpenList：superfile2 带 type=tmpfile，不带 openapi 标识
+        assert_eq!(query.get("method").map(String::as_str), Some("upload"));
+        assert_eq!(query.get("type").map(String::as_str), Some("tmpfile"));
+        assert!(!query.contains_key("openapi"), "OpenList 形态无 openapi");
+        assert_eq!(query.get("path").map(String::as_str), Some("/safe/volume"));
         assert_eq!(query.get("uploadid").map(String::as_str), Some("upload-1"));
-        Json(json!({"errno": 0, "md5": "8d777f385d3dfec8815d20f7496026dc"}))
+        assert_eq!(query.get("partseq").map(String::as_str), Some("0"));
+        // 官方成功响应：md5 + request_id（无 errno）
+        Json(json!({"md5": "8d777f385d3dfec8815d20f7496026dc", "request_id": 1}))
+    }
+
+    async fn uinfo(Query(query): Query<HashMap<String, String>>) -> impl IntoResponse {
+        assert_eq!(query.get("method").map(String::as_str), Some("uinfo"));
+        Json(json!({"errno": 0, "vip_type": 0}))
+    }
+
+    async fn locate_upload(
+        State(state): State<MockState>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        assert_eq!(
+            query.get("method").map(String::as_str),
+            Some("locateupload")
+        );
+        assert_eq!(query.get("appid").map(String::as_str), Some("250528"));
+        assert_eq!(query.get("uploadid").map(String::as_str), Some("upload-1"));
+        assert_eq!(
+            query.get("upload_version").map(String::as_str),
+            Some("2.0")
+        );
+        // 返回 mock 自身作为动态上传域名 → superfile2 仍落回本 mock
+        Json(json!({"servers": [{"server": state.upload_server}]}))
     }
 
     async fn locatedownload(
@@ -1354,17 +1932,22 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let base = format!("http://{addr}");
         let locate_calls = Arc::new(AtomicUsize::new(0));
+        let create_failures = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
             .route("/oauth/token", get(oauth_token))
             .route("/oauth/device/code", get(oauth_device_code))
             .route("/device", get(oauth_device_approve))
             .route("/rest/2.0/xpan/file", get(xpan_get).post(xpan_post))
+            .route("/rest/2.0/xpan/nas", get(uinfo))
             .route("/rest/2.0/pcs/superfile2", post(upload_block))
+            .route("/rest/2.0/pcs/locateupload", get(locate_upload))
             .route("/rest/2.0/pcs/file", get(locatedownload))
             .route("/download", get(download))
             .with_state(MockState {
                 download_url: format!("{base}/download"),
+                upload_server: base.clone(),
                 locate_calls: Arc::clone(&locate_calls),
+                create_failures: Arc::clone(&create_failures),
             });
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
@@ -1397,13 +1980,31 @@ mod tests {
         fs.mkdir("new").await.unwrap();
         fs.rename("new", "renamed").await.unwrap();
         fs.delete("renamed").await.unwrap();
-        fs.put_sized(
+        // 注入 3 次 create 瞬时 500：请求级重试（3 次）耗尽后，由整卷兜底
+        // 重试第二轮走通；进度经高水位去重，重传的分块不得重复计数
+        create_failures.store(3, Ordering::SeqCst);
+        let confirmed = Arc::new(AtomicU64::new(0));
+        let confirmed_cb = Arc::clone(&confirmed);
+        fs.put_sized_tracked(
             "volume",
             4,
             stream::once(async { Ok(Bytes::from_static(b"data")) }).boxed(),
+            Arc::new(move |n| {
+                confirmed_cb.fetch_add(n, Ordering::SeqCst);
+            }),
         )
         .await
         .unwrap();
+        assert_eq!(
+            create_failures.load(Ordering::SeqCst),
+            0,
+            "注入的瞬时失败应全部被重试消化"
+        );
+        assert_eq!(
+            confirmed.load(Ordering::SeqCst),
+            4,
+            "整卷重试后进度不得重复计数"
+        );
 
         assert_eq!(locate_calls.load(Ordering::SeqCst), 0);
         let (first, second) =
