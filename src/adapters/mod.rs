@@ -1,4 +1,5 @@
 pub mod localfs;
+pub mod baidupan;
 pub mod webdav;
 
 use async_trait::async_trait;
@@ -24,6 +25,10 @@ pub type ByteStream = BoxStream<'static, std::io::Result<bytes::Bytes>>;
 /// 数据源适配器：纯粹的 I/O 驱动。路径为数据源根内的相对路径（"a/b/c"，根为 ""）。
 #[async_trait]
 pub trait Storage: Send + Sync {
+    /// 上游单次 Range 请求的硬上限；下载规划器会自动取全局 split 与它的较小值。
+    fn max_range_size(&self) -> Option<u64> {
+        None
+    }
     async fn list(&self, path: &str) -> ApiResult<Vec<Entry>>;
     async fn mkdir(&self, path: &str) -> ApiResult<()>;
     /// 递归删除文件或目录。
@@ -67,6 +72,10 @@ pub trait Storage: Send + Sync {
     }
     /// 流式写入对象（覆盖）。
     async fn put(&self, path: &str, body: ByteStream) -> ApiResult<()>;
+    /// 已知长度的流式写入。需要 multipart Content-Length 的上游可覆盖此方法。
+    async fn put_sized(&self, path: &str, _size: u64, body: ByteStream) -> ApiResult<()> {
+        self.put(path, body).await
+    }
 }
 
 /// 由数据源配置实例化适配器。
@@ -74,6 +83,7 @@ pub fn make(ds: &DataSource, http: reqwest::Client) -> ApiResult<Box<dyn Storage
     match ds.ds_type.as_str() {
         "localfs" => Ok(Box::new(localfs::LocalFs::from_config(&ds.config)?)),
         "webdav" => Ok(Box::new(webdav::WebdavFs::from_config(&ds.config, http)?)),
+        "baidupan" => Ok(Box::new(baidupan::BaiduPanFs::from_config(&ds.config, http)?)),
         other => Err(ApiError::BadRequest(format!("未知数据源类型: {other}"))),
     }
 }

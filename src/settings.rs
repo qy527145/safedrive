@@ -80,11 +80,23 @@ pub struct Settings {
     pub max_threads: usize,
     /// 单个分卷内的最大并发（hydraria max_per_volume）。
     pub max_per_volume: usize,
+    /// 是否启用所有数据源共享的持久密文块缓存。
+    #[serde(default = "default_cache_enabled")]
+    pub cache_enabled: bool,
+}
+
+fn default_cache_enabled() -> bool {
+    true
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { max_split: 5 * 1024 * 1024, max_threads: 16, max_per_volume: 4 }
+        Self {
+            max_split: 5 * 1024 * 1024,
+            max_threads: 16,
+            max_per_volume: 4,
+            cache_enabled: true,
+        }
     }
 }
 
@@ -168,6 +180,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.max_split, 5 * 1024 * 1024);
+        assert!(s.cache_enabled, "旧配置缺省时缓存默认开启");
     }
 
     #[test]

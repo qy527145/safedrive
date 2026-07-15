@@ -177,7 +177,7 @@ impl ChunkPrp {
     /// （外来文件或其他宽度域的名字）。
     pub fn index_of(&self, name: &str) -> Option<usize> {
         let n = name.len();
-        if n == 0 || n % 2 != 0 || n > 16 {
+        if n == 0 || !n.is_multiple_of(2) || n > 16 {
             return None;
         }
         let w = n / 2;

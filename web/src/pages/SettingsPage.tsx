@@ -1,20 +1,27 @@
 import { DownloadOutlined, ImportOutlined } from '@ant-design/icons';
-import { App, Button, Card, Form, Input, InputNumber, Space, Typography, Upload } from 'antd';
+import { App, Button, Card, Checkbox, Form, Input, InputNumber, Space, Statistic, Typography, Upload } from 'antd';
 import { useEffect, useState } from 'react';
-import { api, getToken, type TransferSettings } from '../api/client';
-import { parseSize, sizeToInput } from '../utils/format';
+import { api, getToken, type CacheStats, type TransferSettings } from '../api/client';
+import { formatBytes, parseSize, sizeToInput } from '../utils/format';
 
 /** 设置：全局传输参数 + 数据源根密钥的备份导出 / 导入合并。 */
 export default function SettingsPage() {
-  const { message } = App.useApp();
-  const [form] = Form.useForm<{ maxSplit: string; maxThreads: number; maxPerVolume: number }>();
+  const { message, modal } = App.useApp();
+  const [form] = Form.useForm<{
+    maxSplit: string;
+    maxThreads: number;
+    maxPerVolume: number;
+    cacheEnabled: boolean;
+  }>();
   const [saving, setSaving] = useState(false);
+  const [cacheStats, setCacheStats] = useState<CacheStats>();
 
   useEffect(() => {
     api
       .getSettings()
       .then((s) => form.setFieldsValue({ ...s, maxSplit: sizeToInput(s.maxSplit) }))
       .catch((e: unknown) => message.error(e instanceof Error ? e.message : String(e)));
+    void api.getCacheStats().then(setCacheStats).catch(() => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -24,6 +31,7 @@ export default function SettingsPage() {
       maxThreads: raw.maxThreads,
       maxPerVolume: raw.maxPerVolume,
       maxSplit: parseSize(raw.maxSplit) ?? 0,
+      cacheEnabled: raw.cacheEnabled,
     };
     setSaving(true);
     try {
@@ -98,10 +106,44 @@ export default function SettingsPage() {
           >
             <InputNumber min={1} max={64} style={{ width: '100%' }} />
           </Form.Item>
+          <Form.Item name="cacheEnabled" valuePropName="checked">
+            <Checkbox>启用全局持久密文块缓存</Checkbox>
+          </Form.Item>
           <Button type="primary" loading={saving} onClick={() => void saveSettings()}>
             保存
           </Button>
         </Form>
+      </Card>
+
+      <Card
+        title="全局下载缓存"
+        extra={
+          <Button
+            danger
+            onClick={() =>
+              modal.confirm({
+                title: '清空全部下载缓存？',
+                onOk: async () => {
+                  const result = await api.clearCache();
+                  message.success(`已清理 ${formatBytes(result.freed)}`);
+                  setCacheStats(await api.getCacheStats());
+                },
+              })
+            }
+          >
+            清空缓存
+          </Button>
+        }
+      >
+        <Space size="large" wrap>
+          <Statistic title="缓存文件" value={cacheStats?.entries ?? 0} />
+          <Statistic title="已缓存" value={formatBytes(cacheStats?.bytesCached ?? 0)} />
+          <Statistic title="命中" value={cacheStats?.hits ?? 0} />
+          <Statistic title="回源" value={cacheStats?.misses ?? 0} />
+        </Space>
+        <Typography.Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
+          缓存内容是云端密文，按 1 MiB 完整块持久化；分片重叠时只有真实覆盖整块才会标记命中。
+        </Typography.Paragraph>
       </Card>
 
       <Card title="策略备份（含根密码）">

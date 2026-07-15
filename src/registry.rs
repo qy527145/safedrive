@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
 
-/// 数据源记录。`config` 由类型决定（localfs: {root} / webdav: {url, username, password}）。
+/// 数据源记录。`config` 由类型决定（localfs / webdav / baidupan）。
 /// `strategy_id` 是客户端密码本中映射策略的不透明指针，服务端不知晓其内容。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

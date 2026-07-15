@@ -52,6 +52,8 @@ export default function DataPage() {
                     <div>
                       {d.type === 'localfs' ? (
                         <Tag color="geekblue">本地文件系统</Tag>
+                      ) : d.type === 'baidupan' ? (
+                        <Tag color="blue">百度网盘</Tag>
                       ) : (
                         <Tag color="cyan">WebDAV</Tag>
                       )}

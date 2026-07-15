@@ -4,24 +4,24 @@
 //! 线格式：
 //!
 //! ```text
-//! cjk14( [siv 4B] ‖ ChaCha20( [flags 1B][secret 16B][varint size][名字字节] ) )
+//! CJK-radix( [siv 4B] ‖ ChaCha20( [tagged-size varint][secret 16B][名字字节] ) )
 //! ```
 //!
 //! - **加密密钥锚在父目录**：nameKey/macKey 由**父目录的 FK** 派生
 //!   （根目录由数据源 FK_root）。持有目录 FK → list + 解全部条目名 →
 //!   读出各文件 pw 与子目录 FK → 递归下钻。跨目录移动 = 换父钥重编码
 //!   信封（一次 rename），secret 不变 → 内容零重加密。
-//! - **cjk14**：14-bit → CJK 统一表意区编码（0x4E00 起 16384 字符，
-//!   7 字节 ↔ 4 汉字；尾部余数用 0x8E01..0x8E06 单字标记）。输出无
+//! - **CJK radix**：以 CJK 扩展 A + 统一表意区共 27584 个汉字作进制，
+//!   每个存储字符承载约 14.75 bit；原始长度由 SIV 认证结果消歧。输出无
 //!   固定特征 —— 首字符即 SIV 随机高位。
 //! - **SIV 模式**：`siv = HMAC-SHA256(macKey, 明文负载)[..4]`，既是认证
 //!   标签又是名字加密密钥的派生盐 —— 同父钥同明文同密文（确定性），
 //!   不同明文 keystream 必不相同；解码后重算比对，解不开/密钥不符/
 //!   篡改都失败 → 识别为外来文件。
-//! - flags：bit0=目录，bit1=名字经纯 Rust 短文本编码压缩（压不小则存原文）；
-//!   `size` LEB128 varint（目录恒 0）—— 一次 list 即见名字与大小。
+//! - tagged-size 首字节携带目录/压缩两位及 size 的低 5 bit，后续按 7 bit
+//!   续写（目录 size 恒 0）—— flags 不再单独占字节，一次 list 即见名字与大小。
 //!
-//! 固定开销 21 字节（siv 4 + flags 1 + secret 16）≈ 12 汉字 + 名字本体。
+//! 固定开销 20 字节（siv 4 + secret 16）+ tagged-size ≈ 12 汉字 + 名字本体。
 //! 「测试视频.mp4」约 25 字。存储名 ≤255 字节（85 汉字）→ 纯中文原名
 //! 上限约 50 字（短文本压缩后）。
 
@@ -35,11 +35,13 @@ use super::{SECRET_LEN, name_cipher_key, name_mac_key, short_text};
 const SIV_LEN: usize = 4;
 const FLAG_DIR: u8 = 0b01;
 const FLAG_COMPRESSED: u8 = 0b10;
-/// cjk14 数据字符区：CJK 统一表意文字 0x4E00..0x8DFF（16384 = 2^14 个）。
-const CJK_BASE: u32 = 0x4E00;
-const CJK_SIZE: u32 = 1 << 14;
-/// 余数标记字符区：0x8E01..=0x8E06（仍是普通汉字，标记尾组字节数）。
-const MARK_BASE: u32 = 0x8E00;
+/// 两段均为稳定的 BMP 汉字：UTF-8 固定 3B、Unicode 字符计数固定为 1，
+/// 且不像兼容字符或 Hangul 那样存在常见的文件系统规范化分解。
+const CJK_EXT_A_BASE: u32 = 0x3400;
+const CJK_EXT_A_COUNT: u32 = 0x19c0; // U+3400..U+4DBF，共 6592
+const CJK_UNIFIED_BASE: u32 = 0x4e00;
+const CJK_UNIFIED_COUNT: u32 = 0x5200; // U+4E00..U+9FFF，共 20992
+const CJK_RADIX: u32 = CJK_EXT_A_COUNT + CJK_UNIFIED_COUNT;
 /// 常见文件系统的单文件名字节上限。
 pub const MAX_STORAGE_NAME: usize = 255;
 /// 明文名字节上限（解压缓冲上界，防异常输入撑爆）。
@@ -55,33 +57,46 @@ pub struct NameMeta {
     pub secret: [u8; SECRET_LEN],
 }
 
-fn write_varint(out: &mut Vec<u8>, mut v: u64) {
-    loop {
-        let b = (v & 0x7f) as u8;
-        v >>= 7;
-        if v == 0 {
-            out.push(b);
-            return;
+fn write_tagged_size(out: &mut Vec<u8>, mut size: u64, flags: u8) {
+    debug_assert!(flags < 4);
+    let mut first = (flags << 5) | (size as u8 & 0x1f);
+    size >>= 5;
+    if size != 0 {
+        first |= 0x80;
+    }
+    out.push(first);
+    while size != 0 {
+        let mut byte = size as u8 & 0x7f;
+        size >>= 7;
+        if size != 0 {
+            byte |= 0x80;
         }
-        out.push(b | 0x80);
+        out.push(byte);
     }
 }
 
-fn read_varint(data: &[u8], pos: &mut usize) -> Option<u64> {
-    let mut v: u64 = 0;
-    let mut shift = 0u32;
-    loop {
-        let b = *data.get(*pos)?;
+fn read_tagged_size(data: &[u8], pos: &mut usize) -> Option<(u64, u8)> {
+    let first = *data.get(*pos)?;
+    *pos += 1;
+    let flags = (first >> 5) & 0x03;
+    let mut size = (first & 0x1f) as u128;
+    let mut shift = 5u32;
+    let mut more = first & 0x80 != 0;
+    while more {
+        let byte = *data.get(*pos)?;
         *pos += 1;
-        if shift >= 64 {
+        let part = (byte & 0x7f) as u128;
+        more = byte & 0x80 != 0;
+        if !more && part == 0 {
+            return None; // 拒绝非最短 varint
+        }
+        size |= part.checked_shl(shift)?;
+        shift += 7;
+        if shift > 75 {
             return None;
         }
-        v |= ((b & 0x7f) as u64) << shift;
-        if b & 0x80 == 0 {
-            return Some(v);
-        }
-        shift += 7;
     }
+    Some((u64::try_from(size).ok()?, flags))
 }
 
 /// 名字加密 keystream：密钥由 siv 作盐派生，nonce 恒 0 ——
@@ -104,106 +119,128 @@ fn siv4(pw: &[u8], plain_payload: &[u8]) -> [u8; SIV_LEN] {
     short
 }
 
-// ---------------- cjk14 编码 ----------------
-// 7 字节（56 bit）↔ 4 个 14-bit 值 ↔ 4 个汉字；尾部不足 7 字节的 r 字节
-// 编码为 ceil(8r/14) 个字符，再追加一个标记字符（MARK_BASE + r）。
-// 每个汉字 UTF-8 占 3 字节：信息密度按字符算 14 bit/字，接近原始中文名。
+// ---------------- CJK 大进制编码 ----------------
+
+fn cjk_char(digit: u32) -> Option<char> {
+    let cp = if digit < CJK_EXT_A_COUNT {
+        CJK_EXT_A_BASE + digit
+    } else if digit < CJK_RADIX {
+        CJK_UNIFIED_BASE + digit - CJK_EXT_A_COUNT
+    } else {
+        return None;
+    };
+    char::from_u32(cp)
+}
+
+fn cjk_digit(ch: char) -> Option<u32> {
+    let cp = ch as u32;
+    if (CJK_EXT_A_BASE..CJK_EXT_A_BASE + CJK_EXT_A_COUNT).contains(&cp) {
+        Some(cp - CJK_EXT_A_BASE)
+    } else if (CJK_UNIFIED_BASE..CJK_UNIFIED_BASE + CJK_UNIFIED_COUNT).contains(&cp) {
+        Some(CJK_EXT_A_COUNT + cp - CJK_UNIFIED_BASE)
+    } else {
+        None
+    }
+}
+
+fn cjk_encoded_chars(raw_len: usize) -> usize {
+    if raw_len == 0 {
+        return 0;
+    }
+    ((raw_len as f64 * 8.0) / (CJK_RADIX as f64).log2()).ceil() as usize
+}
+
+fn cjk_leading_mask(digits: &[u32]) -> u32 {
+    digits.iter().fold(0u32, |acc, &digit| {
+        ((acc as u64 * 257 + digit as u64) % CJK_RADIX as u64) as u32
+    })
+}
 
 fn cjk_encode(raw: &[u8]) -> String {
-    fn ch(v: u32) -> char {
-        char::from_u32(CJK_BASE + v).expect("14bit 值必在 CJK 区内")
+    if raw.is_empty() {
+        return String::new();
     }
-    let mut out = String::with_capacity(raw.len() / 7 * 12 + 16);
-    let mut groups = raw.chunks_exact(7);
-    for g in groups.by_ref() {
-        let mut acc = 0u64;
-        for &b in g {
-            acc = acc << 8 | b as u64;
+    // 小端大进制数组：逐个吸收 base-256 输入字节。
+    let mut digits = vec![0u32];
+    for &byte in raw {
+        let mut carry = byte as u32;
+        for digit in &mut digits {
+            let value = *digit * 256 + carry;
+            *digit = value % CJK_RADIX;
+            carry = value / CJK_RADIX;
         }
-        for shift in [42u32, 28, 14, 0] {
-            out.push(ch(((acc >> shift) & 0x3FFF) as u32));
+        while carry > 0 {
+            digits.push(carry % CJK_RADIX);
+            carry /= CJK_RADIX;
         }
     }
-    let rem = groups.remainder();
-    let r = rem.len();
-    if r > 0 {
-        let c = (r * 8).div_ceil(14);
-        let mut acc = 0u64;
-        for &b in rem {
-            acc = acc << 8 | b as u64;
-        }
-        acc <<= (c * 14 - r * 8) as u32; // 低位补零
-        for i in (0..c).rev() {
-            out.push(ch(((acc >> (i as u32 * 14)) & 0x3FFF) as u32));
-        }
-        out.push(char::from_u32(MARK_BASE + r as u32).expect("标记字符必在 CJK 区内"));
+
+    // 固定宽度保留开头的零字节；同一字符宽度可能对应两个原始长度，
+    // 解码时枚举后由 SIV 认证选出唯一正确项。
+    let width = cjk_encoded_chars(raw.len());
+    debug_assert!(digits.len() <= width);
+    let mut fixed = vec![0u32; width - digits.len()];
+    fixed.extend(digits.iter().rev());
+    // 固定宽度大进制的最高位取值范围较窄；用后续随机密文数字可逆地
+    // 扰动首位，避免存储名第一个汉字集中在很小的字符区间。
+    let mask = cjk_leading_mask(&fixed[1..]);
+    fixed[0] = (fixed[0] + mask) % CJK_RADIX;
+
+    let mut out = String::with_capacity(width * 3);
+    for digit in fixed {
+        out.push(cjk_char(digit).expect("进制数字必在 CJK 字母表内"));
     }
     out
 }
 
-fn cjk_encoded_chars(raw_len: usize) -> usize {
-    let full = raw_len / 7 * 4;
-    let remainder = raw_len % 7;
-    full + if remainder == 0 { 0 } else { (remainder * 8).div_ceil(14) + 1 }
-}
+fn cjk_decode_candidates(s: &str) -> Option<Vec<Vec<u8>>> {
+    if s.is_empty() || s.len() > MAX_STORAGE_NAME {
+        return None;
+    }
+    let mut digits: Vec<u32> = s.chars().map(cjk_digit).collect::<Option<_>>()?;
+    let width = digits.len();
+    let mask = cjk_leading_mask(&digits[1..]);
+    digits[0] = (digits[0] + CJK_RADIX - mask) % CJK_RADIX;
 
-fn cjk_decode(s: &str) -> Option<Vec<u8>> {
-    let chars: Vec<u32> = s.chars().map(|c| c as u32).collect();
-    if chars.is_empty() {
-        return None;
-    }
-    let (data, r) = match *chars.last().unwrap() {
-        m if (MARK_BASE + 1..=MARK_BASE + 6).contains(&m) => {
-            (&chars[..chars.len() - 1], (m - MARK_BASE) as usize)
+    // 将大端 CJK 进制数还原为小端 base-256 数组。
+    let mut bytes_le = vec![0u8];
+    for digit in digits {
+        let mut carry = digit;
+        for byte in &mut bytes_le {
+            let value = *byte as u32 * CJK_RADIX + carry;
+            *byte = value as u8;
+            carry = value >> 8;
         }
-        _ => (&chars[..], 0),
-    };
-    let mut vals = Vec::with_capacity(data.len());
-    for &c in data {
-        if !(CJK_BASE..CJK_BASE + CJK_SIZE).contains(&c) {
-            return None;
-        }
-        vals.push((c - CJK_BASE) as u64);
-    }
-    let tail = if r == 0 { 0 } else { (r * 8).div_ceil(14) };
-    if vals.len() < tail || (vals.len() - tail) % 4 != 0 {
-        return None;
-    }
-    let full = (vals.len() - tail) / 4;
-    let mut out = Vec::with_capacity(full * 7 + r);
-    for g in vals[..full * 4].chunks_exact(4) {
-        let mut acc = 0u64;
-        for &v in g {
-            acc = acc << 14 | v;
-        }
-        for shift in [48u32, 40, 32, 24, 16, 8, 0] {
-            out.push((acc >> shift) as u8);
+        while carry > 0 {
+            bytes_le.push(carry as u8);
+            carry >>= 8;
         }
     }
-    if r > 0 {
-        let mut acc = 0u64;
-        for &v in &vals[full * 4..] {
-            acc = acc << 14 | v;
-        }
-        let pad = (tail * 14 - r * 8) as u32;
-        if acc & ((1u64 << pad) - 1) != 0 {
-            return None; // 填充位必须为零（规范编码唯一）
-        }
-        acc >>= pad;
-        for i in (0..r).rev() {
-            out.push((acc >> (i as u32 * 8)) as u8);
-        }
+    while bytes_le.last() == Some(&0) {
+        bytes_le.pop();
     }
-    Some(out)
+
+    let max_raw_len = SIV_LEN + 1 + SECRET_LEN + 10 + MAX_PLAIN_NAME;
+    let mut candidates = Vec::with_capacity(2);
+    for byte_len in 1..=max_raw_len {
+        if cjk_encoded_chars(byte_len) != width || bytes_le.len() > byte_len {
+            continue;
+        }
+        let mut raw = vec![0u8; byte_len - bytes_le.len()];
+        raw.extend(bytes_le.iter().rev());
+        candidates.push(raw);
+    }
+    (!candidates.is_empty()).then_some(candidates)
 }
 
 /// 编码：明文名 + 大小 + 目录标记 + 节点秘密 → 密文存储名（一串随机汉字）。
 /// `parent_key` 是父目录的 FK（根目录条目用数据源 FK_root）。超长返回 None。
 pub fn encode_name(parent_key: &[u8], meta: &NameMeta) -> Option<String> {
     let mut flags = if meta.is_dir { FLAG_DIR } else { 0 };
-    let mut size_bytes = Vec::with_capacity(10);
-    write_varint(&mut size_bytes, if meta.is_dir { 0 } else { meta.size });
-    let fixed_len = SIV_LEN + 1 + SECRET_LEN + size_bytes.len();
+    let size = if meta.is_dir { 0 } else { meta.size };
+    let mut tagged_size = Vec::with_capacity(10);
+    write_tagged_size(&mut tagged_size, size, flags);
+    let fixed_len = SIV_LEN + SECRET_LEN + tagged_size.len();
     let plain_name = meta.name.as_bytes();
     let name_bytes = match short_text::compress(&meta.name).filter(|compressed| {
         cjk_encoded_chars(fixed_len + compressed.len())
@@ -216,10 +253,11 @@ pub fn encode_name(parent_key: &[u8], meta: &NameMeta) -> Option<String> {
         None => plain_name.to_vec(),
     };
 
-    let mut payload = Vec::with_capacity(1 + SECRET_LEN + size_bytes.len() + name_bytes.len());
-    payload.push(flags);
+    tagged_size.clear();
+    write_tagged_size(&mut tagged_size, size, flags);
+    let mut payload = Vec::with_capacity(tagged_size.len() + SECRET_LEN + name_bytes.len());
+    payload.extend_from_slice(&tagged_size);
     payload.extend_from_slice(&meta.secret);
-    payload.extend_from_slice(&size_bytes);
     payload.extend_from_slice(&name_bytes);
 
     let siv = siv4(parent_key, &payload);
@@ -236,7 +274,12 @@ pub fn encode_name(parent_key: &[u8], meta: &NameMeta) -> Option<String> {
 /// 解码：密文存储名 → 明文元数据（含节点秘密）。
 /// 格式不符 / SIV 校验失败 → None（外来文件）。
 pub fn decode_name(parent_key: &[u8], enc: &str) -> Option<NameMeta> {
-    let raw = cjk_decode(enc)?;
+    cjk_decode_candidates(enc)?
+        .into_iter()
+        .find_map(|raw| decode_raw_name(parent_key, &raw))
+}
+
+fn decode_raw_name(parent_key: &[u8], raw: &[u8]) -> Option<NameMeta> {
     if raw.len() < SIV_LEN + 1 + SECRET_LEN + 1 {
         return None;
     }
@@ -247,14 +290,17 @@ pub fn decode_name(parent_key: &[u8], enc: &str) -> Option<NameMeta> {
         return None;
     }
 
-    let flags = payload[0];
+    let mut pos = 0;
+    let (size, flags) = read_tagged_size(&payload, &mut pos)?;
     if flags & !(FLAG_DIR | FLAG_COMPRESSED) != 0 {
         return None; // 未知 flag（未来版本或随机碰撞）
     }
+    if pos.checked_add(SECRET_LEN)? >= payload.len() {
+        return None;
+    }
     let mut secret = [0u8; SECRET_LEN];
-    secret.copy_from_slice(&payload[1..1 + SECRET_LEN]);
-    let mut pos = 1 + SECRET_LEN;
-    let size = read_varint(&payload, &mut pos)?;
+    secret.copy_from_slice(&payload[pos..pos + SECRET_LEN]);
+    pos += SECRET_LEN;
     let name_bytes = &payload[pos..];
     let name = if flags & FLAG_COMPRESSED != 0 {
         short_text::decompress(name_bytes, MAX_PLAIN_NAME)?
@@ -278,20 +324,39 @@ mod tests {
     }
 
     #[test]
-    fn cjk14_roundtrip_all_remainders() {
-        // 覆盖所有尾组长度 1..=6（实际 raw 恒 ≥ SIV+18 字节，空输入无需支持）
-        for n in 1..=40usize {
-            let raw: Vec<u8> = (0..n).map(|i| (i * 37 + 11) as u8).collect();
-            let enc = cjk_encode(&raw);
-            assert!(enc.chars().all(|c| {
-                let v = c as u32;
-                (CJK_BASE..CJK_BASE + CJK_SIZE).contains(&v)
-                    || (MARK_BASE + 1..=MARK_BASE + 6).contains(&v)
-            }));
-            assert_eq!(cjk_decode(&enc).as_deref(), Some(&raw[..]), "len={n}");
+    fn cjk_radix_roundtrip_lengths_and_leading_zeros() {
+        for n in 1..=150usize {
+            for raw in [
+                (0..n).map(|i| (i * 37 + 11) as u8).collect::<Vec<_>>(),
+                vec![0; n],
+                vec![0xff; n],
+            ] {
+                let enc = cjk_encode(&raw);
+                assert!(enc.chars().all(|c| cjk_digit(c).is_some()));
+                assert_eq!(enc.chars().count(), cjk_encoded_chars(n));
+                assert!(
+                    cjk_decode_candidates(&enc).unwrap().iter().any(|v| v == &raw),
+                    "len={n}"
+                );
+            }
         }
-        assert!(cjk_decode("").is_none());
-        assert!(cjk_decode("abc").is_none());
+        assert!(cjk_decode_candidates("").is_none());
+        assert!(cjk_decode_candidates("abc").is_none());
+    }
+
+    #[test]
+    fn tagged_size_roundtrip_boundaries() {
+        for size in [0, 1, 31, 32, 4_294_967_296, u64::MAX] {
+            for flags in 0..4u8 {
+                let mut encoded = Vec::new();
+                write_tagged_size(&mut encoded, size, flags);
+                let mut pos = 0;
+                assert_eq!(read_tagged_size(&encoded, &mut pos), Some((size, flags)));
+                assert_eq!(pos, encoded.len());
+            }
+        }
+        let mut pos = 0;
+        assert!(read_tagged_size(&[0x80, 0], &mut pos).is_none());
     }
 
     #[test]
@@ -351,8 +416,8 @@ mod tests {
         let a = encode_name(&fk, &m).unwrap();
         let b = encode_name(&fk, &m).unwrap();
         assert_eq!(a, b, "SIV 模式：同父钥同明文同密文");
-        assert!(a.chars().all(|c| ('\u{4E00}'..='\u{8E06}').contains(&c)), "{a}");
-        // 21B 开销 + varint 3B + 短文本压缩约 15B ≈ 39B → ⌈39*8/14⌉+1 ≈ 24 字
+        assert!(a.chars().all(|c| cjk_digit(c).is_some()), "{a}");
+        // CJK 大进制每个字符约承载 14.75 bit。
         assert!(a.chars().count() <= 26, "过长: {} 字 ({a})", a.chars().count());
 
         let firsts: std::collections::HashSet<char> = (0..40)
@@ -363,12 +428,11 @@ mod tests {
     }
 
     #[test]
-    fn compression_never_expands_the_storage_name() {
+    fn compression_uses_final_storage_length() {
         let fk = gen_secret();
         let short = encode_name(&fk, &meta("电影", 0, true)).unwrap();
-        // 不压缩时总长恰为 28B = 4 组 cjk14 = 16 字；虽然短文本编码
-        // 可把名字从 6B 压到 5B，但会触发 cjk14 尾标记，实际反而是 17 字。
-        assert_eq!(short.chars().count(), 16);
+        // 文件名词典与更密的 CJK 进制共同缩短最终名称。
+        assert!(short.chars().count() < 16);
         assert_eq!(decode_name(&fk, &short).unwrap().name, "电影");
     }
 
@@ -425,6 +489,11 @@ mod length_report {
             ("Annual Report FY2026 Final v3.pdf", 1_048_576),
             ("IMG_20260713_182233.jpg", 4_194_304),
             ("电影", 0),
+            ("日本語のファイル名.mkv", 42),
+            ("русский файл.txt", 42),
+            ("🎬 movie night 🍿.mp4", 42),
+            ("读书笔记 - Designing Data-Intensive Applications.md", 42),
+            ("加密数据源管理服务的超长中文文件名压缩能力测试加密数据源管理服务", 42),
         ] {
             let m = NameMeta { name: name.into(), size, is_dir: size == 0, secret: gen_secret() };
             let enc = encode_name(&fk, &m).unwrap();

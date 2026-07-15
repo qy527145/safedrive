@@ -38,10 +38,10 @@ impl Strategy {
         if self.name.trim().is_empty() {
             return Err(ApiError::BadRequest("策略名称不能为空".into()));
         }
-        if let Some(v) = self.volume_size {
-            if v < MIN_VOLUME_SIZE {
-                return Err(ApiError::BadRequest("分卷大小至少 64KiB".into()));
-            }
+        if let Some(v) = self.volume_size
+            && v < MIN_VOLUME_SIZE
+        {
+            return Err(ApiError::BadRequest("分卷大小至少 64KiB".into()));
         }
         if self.password.trim().is_empty() {
             return Err(ApiError::BadRequest("根密码不能为空".into()));

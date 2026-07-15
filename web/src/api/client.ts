@@ -6,7 +6,7 @@
 export interface DsRecord {
   id: string;
   name: string;
-  type: 'localfs' | 'webdav';
+  type: 'localfs' | 'webdav' | 'baidupan';
   config: Record<string, string>;
   strategyId: string;
   createdAt: number;
@@ -26,6 +26,15 @@ export interface TransferSettings {
   maxThreads: number;
   /** 单分卷并发 */
   maxPerVolume: number;
+  /** 全局持久密文块缓存 */
+  cacheEnabled: boolean;
+}
+
+export interface CacheStats {
+  entries: number;
+  bytesCached: number;
+  hits: number;
+  misses: number;
 }
 
 export interface Strategy {
@@ -132,6 +141,8 @@ export const api = {
   getSettings: () => request<TransferSettings>('/api/settings'),
   updateSettings: (body: TransferSettings) =>
     request<TransferSettings>('/api/settings', { method: 'PUT', body: JSON.stringify(body) }),
+  getCacheStats: () => request<CacheStats>('/api/cache'),
+  clearCache: () => request<{ ok: boolean; freed: number }>('/api/cache', { method: 'DELETE' }),
   createStrategy: (body: StrategyInput) =>
     request<Strategy>('/api/strategies', { method: 'POST', body: JSON.stringify(body) }),
   updateStrategy: (id: string, body: StrategyInput) =>

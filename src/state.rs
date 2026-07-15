@@ -20,6 +20,8 @@ pub struct Inner {
     pub settings: SettingsStore,
     /// 纯内存路径缓存（云端为准）。根密钥由策略根密码派生，无本地密钥文件。
     pub cache: PathCache,
+    /// 全数据源共享的持久密文块缓存。
+    pub content_cache: Arc<crate::cache::CacheStore>,
     /// 登录会话 token（内存态，重启后失效）。
     pub sessions: RwLock<HashSet<String>>,
     /// 正在上传中的 "dsId:明文路径"（内存态）——同路径并发上传串行化。
@@ -43,6 +45,7 @@ impl AppState {
         let registry = Registry::load(data_dir.join("datasources.json"))?;
         let strategies = Strategies::load(data_dir.join("strategies.json"))?;
         let settings = SettingsStore::load(data_dir.join("settings.json"))?;
+        let content_cache = Arc::new(crate::cache::CacheStore::new(data_dir.join("cache"))?);
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()?;
@@ -51,6 +54,7 @@ impl AppState {
             strategies,
             settings,
             cache: PathCache::default(),
+            content_cache,
             sessions: RwLock::new(HashSet::new()),
             uploading: Mutex::new(HashSet::new()),
             mkdir_locks: Mutex::new(HashMap::new()),

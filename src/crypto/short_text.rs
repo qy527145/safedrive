@@ -1,21 +1,94 @@
 //! 文件名专用的纯 Rust 短文本压缩。
 //!
-//! 格式按 Unicode 标量编码，自动选择拉丁或 CJK 码表，并用一个很小的
-//! 回溯窗口压缩重复片段。它不参与保密；调用方只在结果比 UTF-8 原文短时使用。
+//! 格式按 Unicode 标量编码，自动选择拉丁、CJK、西里尔或 emoji 码表，
+//! 并用静态文件名词典和小回溯窗口压缩重复片段。它不参与保密；调用方
+//! 会按最终存储名字符数决定是否采用压缩结果。
 
 const COMMON: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz._- ()";
 const CJK_BASE: u32 = 0x4e00;
 const CJK_COUNT: u32 = 1 << 15;
 const KANA_BASE: u32 = 0x3040;
 const KANA_COUNT: u32 = 0xc0;
+const CYRILLIC_BASE: u32 = 0x0400;
+const CYRILLIC_COUNT: u32 = 0x140;
+const EMOJI_BASE: u32 = 0x1f300;
+const EMOJI_COUNT: u32 = 0x800;
 const WINDOW: usize = 64;
 const MIN_MATCH: usize = 2;
 const MAX_MATCH: usize = 17;
+const DICTIONARY: &[&str] = &[
+    ".txt",
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".mp3",
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".zip",
+    ".rar",
+    ".7z",
+    ".tar",
+    ".gz",
+    ".md",
+    "IMG_",
+    "VID_",
+    "DSC_",
+    "Screenshot",
+    "Screen Shot",
+    "Report",
+    "Final",
+    "Draft",
+    "Copy",
+    "Backup",
+    "Document",
+    "Download",
+    "Photo",
+    "Video",
+    "Audio",
+    "Image",
+    "Archive",
+    "Application",
+    "Data",
+    "文件",
+    "照片",
+    "视频",
+    "电影",
+    "报告",
+    "备份",
+    "下载",
+    "文档",
+];
 
 #[derive(Clone, Copy)]
 enum Mode {
     Latin,
     Cjk,
+    Cyrillic,
+    Emoji,
+}
+
+impl Mode {
+    const ALL: [Self; 4] = [Self::Latin, Self::Cjk, Self::Cyrillic, Self::Emoji];
+
+    fn code(self) -> u32 {
+        match self {
+            Self::Latin => 0,
+            Self::Cjk => 1,
+            Self::Cyrillic => 2,
+            Self::Emoji => 3,
+        }
+    }
 }
 
 struct BitWriter {
@@ -92,7 +165,11 @@ fn scalar_bits(ch: char, mode: Mode) -> usize {
         Mode::Cjk if common_index(ch).is_some() => 7,
         Mode::Cjk if ch.is_ascii() => 10,
         Mode::Cjk if (KANA_BASE..KANA_BASE + KANA_COUNT).contains(&cp) => 12,
-        _ => 27,
+        Mode::Cyrillic if (CYRILLIC_BASE..CYRILLIC_BASE + CYRILLIC_COUNT).contains(&cp) => 10,
+        Mode::Emoji if (EMOJI_BASE..EMOJI_BASE + EMOJI_COUNT).contains(&cp) => 12,
+        Mode::Cyrillic | Mode::Emoji if common_index(ch).is_some() => 7,
+        Mode::Cyrillic | Mode::Emoji if ch.is_ascii() => 10,
+        _ => 28,
     }
 }
 
@@ -129,14 +206,28 @@ fn write_scalar(out: &mut BitWriter, ch: char, mode: Mode) {
             out.push(0b1110, 4);
             out.push(cp - KANA_BASE, 8);
         }
+        Mode::Cyrillic if (CYRILLIC_BASE..CYRILLIC_BASE + CYRILLIC_COUNT).contains(&cp) => {
+            out.push(cp - CYRILLIC_BASE, 10);
+        }
+        Mode::Emoji if (EMOJI_BASE..EMOJI_BASE + EMOJI_COUNT).contains(&cp) => {
+            out.push(cp - EMOJI_BASE, 12);
+        }
+        Mode::Cyrillic | Mode::Emoji if common_index(ch).is_some() => {
+            out.push(0b10, 2);
+            out.push(common_index(ch).unwrap(), 5);
+        }
+        Mode::Cyrillic | Mode::Emoji if ch.is_ascii() => {
+            out.push(0b110, 3);
+            out.push(cp, 7);
+        }
         _ => {
-            out.push(0b111100, 6);
+            out.push(0b1111000, 7);
             out.push(cp, 21);
         }
     }
 }
 
-fn best_match(chars: &[char], pos: usize, mode: Mode) -> Option<(usize, usize)> {
+fn best_match(chars: &[char], pos: usize, mode: Mode) -> Option<(usize, usize, usize)> {
     let mut best = None;
     let mut best_saving = 0usize;
     for offset in 1..=WINDOW.min(pos) {
@@ -153,8 +244,27 @@ fn best_match(chars: &[char], pos: usize, mode: Mode) -> Option<(usize, usize)> 
             let saving = literal_bits.saturating_sub(16);
             if saving > best_saving {
                 best_saving = saving;
-                best = Some((offset, candidate_len));
+                best = Some((offset, candidate_len, saving));
             }
+        }
+    }
+    best
+}
+
+fn best_dictionary(chars: &[char], pos: usize, mode: Mode) -> Option<(usize, usize, usize)> {
+    debug_assert!(DICTIONARY.len() <= 64);
+    let mut best = None;
+    let mut best_saving = 0usize;
+    for (index, token) in DICTIONARY.iter().enumerate() {
+        let token_chars: Vec<char> = token.chars().collect();
+        if !chars[pos..].starts_with(&token_chars) {
+            continue;
+        }
+        let literal_bits: usize = token_chars.iter().map(|&ch| scalar_bits(ch, mode)).sum();
+        let saving = literal_bits.saturating_sub(13);
+        if saving > best_saving {
+            best_saving = saving;
+            best = Some((index, token_chars.len(), saving));
         }
     }
     best
@@ -162,10 +272,18 @@ fn best_match(chars: &[char], pos: usize, mode: Mode) -> Option<(usize, usize)> 
 
 fn encode_mode(chars: &[char], mode: Mode) -> Vec<u8> {
     let mut out = BitWriter::new();
-    out.push(matches!(mode, Mode::Cjk) as u32, 1);
+    out.push(mode.code(), 2);
     let mut pos = 0;
     while pos < chars.len() {
-        if let Some((offset, len)) = best_match(chars, pos, mode) {
+        let backref = best_match(chars, pos, mode);
+        let dictionary = best_dictionary(chars, pos, mode);
+        if let Some((index, len, _)) = dictionary.filter(|&(_, _, saving)| {
+            backref.is_none_or(|(_, _, back_saving)| saving >= back_saving)
+        }) {
+            out.push(0b1111001, 7);
+            out.push(index as u32, 6);
+            pos += len;
+        } else if let Some((offset, len, _)) = backref {
             out.push(0b111101, 6);
             out.push((offset - 1) as u32, 6);
             out.push((len - MIN_MATCH) as u32, 4);
@@ -185,9 +303,11 @@ pub fn compress(s: &str) -> Option<Vec<u8>> {
         return None;
     }
     let chars: Vec<char> = s.chars().collect();
-    let latin = encode_mode(&chars, Mode::Latin);
-    let cjk = encode_mode(&chars, Mode::Cjk);
-    let best = if latin.len() <= cjk.len() { latin } else { cjk };
+    let best = Mode::ALL
+        .into_iter()
+        .map(|mode| encode_mode(&chars, mode))
+        .min_by_key(Vec::len)
+        .expect("至少有一种短文本编码模式");
     (best.len() < s.len()).then_some(best)
 }
 
@@ -203,10 +323,12 @@ fn push_checked(out: &mut String, chars: &mut Vec<char>, ch: char, max_out: usiz
 /// 解压文件名；格式异常或 UTF-8 输出超过 `max_out` 字节时返回 `None`。
 pub fn decompress(data: &[u8], max_out: usize) -> Option<String> {
     let mut bits = BitReader::new(data);
-    let mode = if bits.read(1)? == 0 {
-        Mode::Latin
-    } else {
-        Mode::Cjk
+    let mode = match bits.read(2)? {
+        0 => Mode::Latin,
+        1 => Mode::Cjk,
+        2 => Mode::Cyrillic,
+        3 => Mode::Emoji,
+        _ => unreachable!(),
     };
     let mut out = String::new();
     let mut chars = Vec::new();
@@ -216,6 +338,14 @@ pub fn decompress(data: &[u8], max_out: usize) -> Option<String> {
             match mode {
                 Mode::Latin => *COMMON.get(bits.read(5)? as usize)? as u32,
                 Mode::Cjk => CJK_BASE + bits.read(15)?,
+                Mode::Cyrillic => {
+                    let i = bits.read(9)?;
+                    if i >= CYRILLIC_COUNT {
+                        return None;
+                    }
+                    CYRILLIC_BASE + i
+                }
+                Mode::Emoji => EMOJI_BASE + bits.read(11)?,
             }
         } else if bits.read(1)? == 0 {
             match mode {
@@ -226,7 +356,9 @@ pub fn decompress(data: &[u8], max_out: usize) -> Option<String> {
                     }
                     'A' as u32 + i
                 }
-                Mode::Cjk => *COMMON.get(bits.read(5)? as usize)? as u32,
+                Mode::Cjk | Mode::Cyrillic | Mode::Emoji => {
+                    *COMMON.get(bits.read(5)? as usize)? as u32
+                }
             }
         } else if bits.read(1)? == 0 {
             match mode {
@@ -237,7 +369,7 @@ pub fn decompress(data: &[u8], max_out: usize) -> Option<String> {
                     }
                     '0' as u32 + i
                 }
-                Mode::Cjk => bits.read(7)?,
+                Mode::Cjk | Mode::Cyrillic | Mode::Emoji => bits.read(7)?,
             }
         } else if bits.read(1)? == 0 {
             match mode {
@@ -249,10 +381,19 @@ pub fn decompress(data: &[u8], max_out: usize) -> Option<String> {
                     }
                     KANA_BASE + i
                 }
+                Mode::Cyrillic | Mode::Emoji => return None,
             }
         } else if bits.read(1)? == 0 {
             if bits.read(1)? == 0 {
-                bits.read(21)?
+                if bits.read(1)? == 0 {
+                    bits.read(21)?
+                } else {
+                    let token = *DICTIONARY.get(bits.read(6)? as usize)?;
+                    for ch in token.chars() {
+                        push_checked(&mut out, &mut chars, ch, max_out)?;
+                    }
+                    continue;
+                }
             } else {
                 let offset = bits.read(6)? as usize + 1;
                 let len = bits.read(4)? as usize + MIN_MATCH;
@@ -304,7 +445,10 @@ mod tests {
     fn short_or_incompressible_returns_none() {
         assert!(compress("").is_none());
         assert!(compress("a").is_none());
-        assert!(compress("🎬").is_none());
+        assert_eq!(
+            decompress(&compress("🎬").unwrap(), 4).as_deref(),
+            Some("🎬")
+        );
     }
 
     #[test]
@@ -321,7 +465,7 @@ mod tests {
     #[test]
     fn every_supported_category_roundtrips() {
         let source = "abc XYZ 019 !~ 测试 龍 日本語 カナ русский 🎬\u{10ffff}";
-        for mode in [Mode::Latin, Mode::Cjk] {
+        for mode in Mode::ALL {
             let encoded = encode_mode(&source.chars().collect::<Vec<_>>(), mode);
             assert_eq!(decompress(&encoded, 1024).as_deref(), Some(source));
         }

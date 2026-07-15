@@ -47,6 +47,16 @@ fn validate(state: &AppState, body: &DsBody) -> ApiResult<()> {
                 return Err(ApiError::BadRequest("webdav 需要 http(s) url".into()));
             }
         }
+        "baidupan" => {
+            let cookie = body.config.get("cookie").and_then(|v| v.as_str()).unwrap_or("");
+            if !cookie.split(';').any(|part| part.trim().starts_with("BDUSS=")) {
+                return Err(ApiError::BadRequest("百度网盘需要包含 BDUSS 的 cookie".into()));
+            }
+            let root = body.config.get("root").and_then(|v| v.as_str()).unwrap_or("");
+            if root.contains("..") || root.contains('\\') {
+                return Err(ApiError::BadRequest("百度网盘根目录非法".into()));
+            }
+        }
         other => return Err(ApiError::BadRequest(format!("未知数据源类型: {other}"))),
     }
     Ok(())
@@ -103,6 +113,15 @@ async fn remove(State(state): State<AppState>, Path(id): Path<String>) -> ApiRes
 /// 测试连接：列根目录。
 async fn test(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<serde_json::Value>> {
     let adapter = state.adapter(&id)?;
-    let entries = adapter.list("").await?;
+    let entries = match adapter.list("").await {
+        Ok(entries) => entries,
+        Err(ApiError::NotFound(_))
+            if state.registry.get(&id).is_some_and(|ds| ds.ds_type == "baidupan") =>
+        {
+            adapter.mkdir("").await?;
+            adapter.list("").await?
+        }
+        Err(e) => return Err(e),
+    };
     Ok(Json(json!({ "ok": true, "entries": entries.len() })))
 }

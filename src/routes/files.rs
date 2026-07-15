@@ -95,12 +95,12 @@ async fn find_child(
         if !e.is_dir {
             continue; // 受管条目必然是存储端目录
         }
-        if let Some(meta) = decode_multi(parent_keys, &e.name) {
-            if meta.name == seg {
-                match &found {
-                    Some((nc, _)) if *nc <= e.name => {}
-                    _ => found = Some((e.name, meta)),
-                }
+        if let Some(meta) = decode_multi(parent_keys, &e.name)
+            && meta.name == seg
+        {
+            match &found {
+                Some((nc, _)) if *nc <= e.name => {}
+                _ => found = Some((e.name, meta)),
             }
         }
     }
@@ -661,10 +661,10 @@ async fn upload(
 
     if let Err(e) = result {
         // 失败/取消：尽力清掉半成品（清不掉也只是留下可再删的密文垃圾）
-        if let Err(del_err) = storage.delete(&enc_folder).await {
-            if !matches!(del_err, ApiError::NotFound(_)) {
-                tracing::warn!("上传失败后清理 {enc_folder} 也失败: {del_err}");
-            }
+        if let Err(del_err) = storage.delete(&enc_folder).await
+            && !matches!(del_err, ApiError::NotFound(_))
+        {
+            tracing::warn!("上传失败后清理 {enc_folder} 也失败: {del_err}");
         }
         return Err(e);
     }
@@ -769,7 +769,19 @@ async fn stream(
         return builder.body(Body::empty()).map_err(|e| ApiError::Internal(anyhow::anyhow!(e)));
     }
 
-    let rx = engine::stream_range(
+    let content_cache = if transfer.cache_enabled {
+        let key = crate::cache::CacheStore::key(&ds, &enc_folder);
+        match state.content_cache.open(&key, total) {
+            Ok(cache) => Some(cache),
+            Err(e) => {
+                tracing::warn!("打开全局密文缓存失败，本次直接回源: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let rx = engine::stream_range_cached(
         storage,
         enc_folder,
         node.secret,
@@ -782,6 +794,7 @@ async fn stream(
             max_threads: transfer.max_threads,
             max_per_volume: transfer.max_per_volume,
         },
+        content_cache,
     );
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
     builder.body(body).map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))

@@ -215,8 +215,9 @@ impl Drop for ReleaseGuard {
     }
 }
 
-/// 按合并区间 [start, end] 流式产出解密后的明文字节。
-pub fn stream_range(
+/// 按合并区间 [start, end] 流式产出解密后的明文字节，可选持久密文缓存。
+#[allow(clippy::too_many_arguments)]
+pub fn stream_range_cached(
     storage: Arc<dyn Storage>,
     enc_folder: String,
     pw: [u8; crate::crypto::SECRET_LEN],
@@ -225,8 +226,12 @@ pub fn stream_range(
     end: u64,
     open_ended: bool,
     params: &StreamParams,
+    cache: Option<Arc<crate::cache::CacheEntry>>,
 ) -> mpsc::Receiver<io::Result<Bytes>> {
-    let plan = plan_chunks(&layout, start, end, params.max_split, open_ended);
+    let max_split = storage
+        .max_range_size()
+        .map_or(params.max_split, |limit| params.max_split.min(limit));
+    let plan = plan_chunks(&layout, start, end, max_split, open_ended);
     let max_threads = params.max_threads.max(1);
     let max_per_volume = params.max_per_volume.max(1);
     let total_chunks = plan.len();
@@ -234,15 +239,14 @@ pub fn stream_range(
 
     tracing::debug!(
         "stream_range [{start},{end}] chunks={total_chunks} split={} threads={max_threads} per_vol={max_per_volume} open_ended={open_ended}",
-        params.max_split,
+        max_split,
     );
 
     // 每 chunk 一条通道，缓冲足以吸收整个 chunk —— fetcher 不必等
     // serializer 消费即可跑完并释放并发额度（hydraria 的教训：缓冲不足
     // 会让预取的下一卷首块把上游带宽压成 0）。
     let item_estimate = 16 * 1024u64;
-    let chan_buffer =
-        ((params.max_split / item_estimate) as usize).clamp(8, 512);
+    let chan_buffer = ((max_split / item_estimate) as usize).clamp(8, 512);
     let mut senders: Vec<Option<mpsc::Sender<io::Result<Bytes>>>> =
         Vec::with_capacity(total_chunks);
     let mut receivers: Vec<mpsc::Receiver<io::Result<Bytes>>> =
@@ -257,25 +261,35 @@ pub fn stream_range(
     let (release_tx, mut release_rx) = mpsc::unbounded_channel::<usize>();
     let cancel = Arc::new(Notify::new());
 
-    // 调度器：按计划顺序在额度允许时孵化 fetcher。计划本身按合并偏移
-    // 有序，队头受限时后面的 chunk 几乎必然同卷，所以队头阻塞即正确。
+    // 调度器：优先按计划顺序并遵守单卷额度；额度用尽后扫描后续分卷，
+    // 若没有其它分卷可用则软化单卷上限，保证总线程不会无故闲置。
     let sched_plan = plan.clone();
     let sched_cancel = Arc::clone(&cancel);
     let sched_storage = Arc::clone(&storage);
     let sched_layout = Arc::clone(&layout);
+    let sched_cache = cache;
     tokio::spawn(async move {
-        let mut next = 0usize;
+        let mut spawned = vec![false; total_chunks];
+        let mut spawned_count = 0usize;
         let mut inflight = 0usize;
         let mut inflight_vol = vec![0usize; vol_count];
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(total_chunks);
         loop {
-            while next < total_chunks
-                && inflight < max_threads
-                && inflight_vol[sched_plan[next].vol] < max_per_volume
-            {
-                let c = sched_plan[next].clone();
-                let tx = senders[next].take().expect("每个 chunk 只孵化一次");
+            while spawned_count < total_chunks && inflight < max_threads {
+                // 与 hydraria 一致：先选最低序号且未达到单卷上限的块；
+                // 若请求只覆盖一个分卷，则软化单卷上限以用满总线程预算。
+                let pick = (0..total_chunks)
+                    .find(|&idx| {
+                        !spawned[idx]
+                            && inflight_vol[sched_plan[idx].vol] < max_per_volume
+                    })
+                    .or_else(|| (0..total_chunks).find(|&idx| !spawned[idx]));
+                let Some(idx) = pick else { break };
+                let c = sched_plan[idx].clone();
+                let tx = senders[idx].take().expect("每个 chunk 只孵化一次");
                 let guard = ReleaseGuard { tx: release_tx.clone(), vol: c.vol };
+                spawned[idx] = true;
+                spawned_count += 1;
                 inflight += 1;
                 inflight_vol[c.vol] += 1;
                 let vol_name = sched_layout.volumes[c.vol].name.clone();
@@ -285,13 +299,13 @@ pub fn stream_range(
                     format!("{enc_folder}/{vol_name}")
                 };
                 let st = Arc::clone(&sched_storage);
+                let chunk_cache = sched_cache.clone();
                 handles.push(tokio::spawn(async move {
                     let _guard = guard;
-                    fetch_chunk(st, obj_path, pw, c, tx).await;
+                    fetch_chunk(st, obj_path, pw, c, tx, chunk_cache).await;
                 }));
-                next += 1;
             }
-            if next >= total_chunks && inflight == 0 {
+            if spawned_count >= total_chunks && inflight == 0 {
                 break;
             }
             tokio::select! {
@@ -360,14 +374,25 @@ async fn fetch_chunk(
     pw: [u8; crate::crypto::SECRET_LEN],
     c: PlannedChunk,
     tx: mpsc::Sender<io::Result<Bytes>>,
+    cache: Option<Arc<crate::cache::CacheEntry>>,
 ) {
-    let mut stream = match storage.get_range(&obj_path, c.vol_off, c.vol_off + c.len - 1).await {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = tx.send(Err(io::Error::other(e.to_string()))).await;
-            return;
+    let merged_end = c.merged_start + c.len - 1;
+    if let Some(cache) = &cache
+        && cache.has_range(c.merged_start, merged_end)
+    {
+        match cache.read_range(c.merged_start, merged_end) {
+            Ok(encrypted) => {
+                let mut buf = encrypted.to_vec();
+                crate::crypto::apply_content_keystream(&pw, c.merged_start, &mut buf);
+                let _ = tx.send(Ok(Bytes::from(buf))).await;
+                return;
+            }
+            Err(e) => tracing::warn!("读取密文缓存失败，回源: {e}"),
         }
-    };
+    }
+    if let Some(cache) = &cache {
+        cache.record_miss();
+    }
     // 每 chunk 建一次 cipher，seek 到合并偏移后连续吐 keystream。
     let (key, nonce) = content_cipher_params(&pw);
     let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
@@ -376,34 +401,65 @@ async fn fetch_chunk(
         return;
     }
     let mut remaining = c.len;
-    while let Some(item) = stream.next().await {
-        let item = match item {
-            Ok(b) => b,
+    let mut attempts = 0usize;
+    let mut last_error = String::new();
+    while remaining > 0 && attempts < 4 {
+        attempts += 1;
+        let done = c.len - remaining;
+        let range_start = c.vol_off + done;
+        let range_end = c.vol_off + c.len - 1;
+        let mut stream = match storage.get_range(&obj_path, range_start, range_end).await {
+            Ok(stream) => stream,
             Err(e) => {
-                let _ = tx.send(Err(e)).await;
-                return;
+                last_error = e.to_string();
+                tokio::task::yield_now().await;
+                continue;
             }
         };
-        if item.is_empty() {
-            continue;
+        let before = remaining;
+        while let Some(item) = stream.next().await {
+            let item = match item {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    last_error = e.to_string();
+                    break;
+                }
+            };
+            if item.is_empty() {
+                continue;
+            }
+            // 上游多给的字节直接截掉（区间读语义以我们的计划为准）。
+            let take = (item.len() as u64).min(remaining) as usize;
+            let cache_offset = c.merged_start + (c.len - remaining);
+            if let Some(cache) = &cache
+                && let Err(e) = cache.write_range(cache_offset, &item[..take])
+            {
+                tracing::warn!("写入密文缓存失败（不影响本次下载）: {e}");
+            }
+            let mut buf = item[..take].to_vec();
+            cipher.apply_keystream(&mut buf);
+            remaining -= take as u64;
+            if tx.send(Ok(Bytes::from(buf))).await.is_err() {
+                return; // serializer 已放弃
+            }
+            if remaining == 0 {
+                return;
+            }
         }
-        // 上游多给的字节直接截掉（区间读语义以我们的计划为准）
-        let take = (item.len() as u64).min(remaining) as usize;
-        let mut buf = item[..take].to_vec();
-        cipher.apply_keystream(&mut buf);
-        remaining -= take as u64;
-        if tx.send(Ok(Bytes::from(buf))).await.is_err() {
-            return; // serializer 已放弃
+        if remaining == before && last_error.is_empty() {
+            last_error = format!("上游未返回 range {range_start}-{range_end}");
         }
-        if remaining == 0 {
-            return;
-        }
+        tracing::debug!(
+            "分片重试 {attempts}/4: path={obj_path} 已完成={} 剩余={remaining} err={last_error}",
+            c.len - remaining,
+        );
+        tokio::task::yield_now().await;
     }
-    if remaining > 0 {
-        let _ = tx
-            .send(Err(io::Error::other(format!("上游少给 {remaining} 字节"))))
-            .await;
-    }
+    let _ = tx
+        .send(Err(io::Error::other(format!(
+            "上游重试 {attempts} 次后仍少 {remaining} 字节: {last_error}"
+        ))))
+        .await;
 }
 
 // ---------------- 上传：流式加密 + 分卷切写 ----------------
@@ -504,6 +560,7 @@ where
 
         while !b.is_empty() {
             if current.is_none() {
+                let cap = vol_cap(vol_idx);
                 let name = names
                     .get(vol_idx)
                     .ok_or_else(|| ApiError::BadRequest("分卷数超出计划".into()))?;
@@ -515,7 +572,7 @@ where
                 let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(8);
                 let st = Arc::clone(&storage);
                 let handle = tokio::spawn(async move {
-                    st.put(&obj_path, ReceiverStream::new(rx).boxed()).await
+                    st.put_sized(&obj_path, cap, ReceiverStream::new(rx).boxed()).await
                 });
                 current = Some((tx, handle));
                 sent_in_vol = 0;
@@ -564,8 +621,41 @@ where
 mod tests {
     use super::*;
     use crate::adapters::localfs::LocalFs;
+    use crate::adapters::{ByteStream, Entry};
     use crate::crypto::{chunk_count, gen_chunk_names, gen_secret};
     use futures_util::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FlakyRangeStorage {
+        encrypted: Bytes,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for FlakyRangeStorage {
+        async fn list(&self, _: &str) -> ApiResult<Vec<Entry>> { unreachable!() }
+        async fn mkdir(&self, _: &str) -> ApiResult<()> { unreachable!() }
+        async fn delete(&self, _: &str) -> ApiResult<()> { unreachable!() }
+        async fn rename(&self, _: &str, _: &str) -> ApiResult<()> { unreachable!() }
+        async fn get(&self, _: &str) -> ApiResult<(Option<u64>, ByteStream)> { unreachable!() }
+
+        async fn get_range(&self, _: &str, start: u64, end: u64) -> ApiResult<ByteStream> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let bytes = self.encrypted.slice(start as usize..=end as usize);
+            if call == 0 {
+                let half = bytes.len() / 2;
+                Ok(stream::iter(vec![
+                    Ok(bytes.slice(..half)),
+                    Err(io::Error::other("模拟中途断流")),
+                ])
+                .boxed())
+            } else {
+                Ok(stream::iter(vec![Ok(bytes)]).boxed())
+            }
+        }
+
+        async fn put(&self, _: &str, _: ByteStream) -> ApiResult<()> { unreachable!() }
+    }
 
     fn layout(sizes: &[u64]) -> FileLayout {
         let mut offset = 0;
@@ -694,9 +784,11 @@ mod tests {
 
         let params =
             StreamParams { max_split: 100_000, max_threads: 8, max_per_volume: 2 };
+        let cache_store = crate::cache::CacheStore::new(dir.path().join(".cache")).unwrap();
+        let cache = cache_store.open("roundtrip", total).unwrap();
 
-        // 全量
-        let mut rx = stream_range(
+        // 全量回源并填充缓存
+        let mut rx = stream_range_cached(
             Arc::clone(&storage),
             "ENCFOLDER".into(),
             pw,
@@ -705,16 +797,19 @@ mod tests {
             total - 1,
             false,
             &params,
+            Some(Arc::clone(&cache)),
         );
         let mut out = Vec::new();
         while let Some(item) = rx.recv().await {
             out.extend_from_slice(&item.unwrap());
         }
         assert_eq!(out, plain, "全量下载解密一致");
+        assert_eq!(cache_store.stats().bytes_cached, total);
+        storage.delete("ENCFOLDER").await.unwrap();
 
-        // 跨卷任意区间（模拟 seek）
+        // 删除上游后，跨卷任意区间仍必须从全局密文缓存正确解密。
         for (s, e) in [(0u64, 0u64), (262_143, 262_144), (100_000, 550_000), (699_999, 699_999)] {
-            let mut rx = stream_range(
+            let mut rx = stream_range_cached(
                 Arc::clone(&storage),
                 "ENCFOLDER".into(),
                 pw,
@@ -723,6 +818,7 @@ mod tests {
                 e,
                 true,
                 &params,
+                Some(Arc::clone(&cache)),
             );
             let mut out = Vec::new();
             while let Some(item) = rx.recv().await {
@@ -769,6 +865,34 @@ mod tests {
         let l = load_layout(storage.as_ref(), "E", &pw).await.unwrap();
         assert_eq!(l.total, 0);
         assert!(l.volumes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_chunk_resumes_after_midstream_failure() {
+        let pw = gen_secret();
+        let plain = Bytes::from((0..100_000u32).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+        let mut encrypted = plain.to_vec();
+        crate::crypto::apply_content_keystream(&pw, 0, &mut encrypted);
+        let storage = Arc::new(FlakyRangeStorage {
+            encrypted: Bytes::from(encrypted),
+            calls: AtomicUsize::new(0),
+        });
+        let (tx, mut rx) = mpsc::channel(16);
+        fetch_chunk(
+            storage.clone(),
+            "v".into(),
+            pw,
+            PlannedChunk { merged_start: 0, len: plain.len() as u64, vol: 0, vol_off: 0 },
+            tx,
+            None,
+        )
+        .await;
+        let mut out = Vec::new();
+        while let Some(item) = rx.recv().await {
+            out.extend_from_slice(&item.unwrap());
+        }
+        assert_eq!(out, plain);
+        assert_eq!(storage.calls.load(Ordering::SeqCst), 2);
     }
 
 }

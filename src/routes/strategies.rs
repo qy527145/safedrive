@@ -18,6 +18,7 @@ pub fn routes() -> Router<AppState> {
         .route("/strategies", get(list).post(create))
         .route("/strategies/{id}", put(update).delete(remove))
         .route("/settings", get(settings_get).put(settings_put))
+        .route("/cache", get(cache_stats).delete(cache_clear))
         .route("/vault/export", get(vault_export))
         .route("/vault/import", axum::routing::post(vault_import))
 }
@@ -31,6 +32,17 @@ async fn settings_put(
     Json(body): Json<crate::settings::Settings>,
 ) -> ApiResult<Json<crate::settings::Settings>> {
     Ok(Json(state.settings.set(body)?))
+}
+
+async fn cache_stats(State(state): State<AppState>) -> Json<crate::cache::CacheStats> {
+    Json(state.content_cache.stats())
+}
+
+async fn cache_clear(
+    State(state): State<AppState>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let freed = state.content_cache.clear_all()?;
+    Ok(Json(json!({ "ok": true, "freed": freed })))
 }
 
 #[derive(Deserialize)]

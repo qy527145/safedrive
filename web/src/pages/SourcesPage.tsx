@@ -6,12 +6,14 @@ import { formatTime } from '../utils/format';
 
 interface FormValues {
   name: string;
-  type: 'localfs' | 'webdav';
+  type: 'localfs' | 'webdav' | 'baidupan';
   strategyId: string;
   root?: string;
   url?: string;
   username?: string;
   password?: string;
+  cookie?: string;
+  userAgent?: string;
 }
 
 /** 数据源管理：基础信息（由类型决定）+ 绑定数据映射策略。 */
@@ -23,7 +25,7 @@ export default function SourcesPage() {
   const [editing, setEditing] = useState<DsRecord | null>(null);
   const [saving, setSaving] = useState(false);
   const [form] = Form.useForm<FormValues>();
-  const [dsType, setDsType] = useState<'localfs' | 'webdav'>('localfs');
+  const [dsType, setDsType] = useState<'localfs' | 'webdav' | 'baidupan'>('localfs');
 
   useEffect(() => {
     void sources.refresh().catch((e: unknown) => message.error(String(e)));
@@ -55,6 +57,8 @@ export default function SourcesPage() {
       url: d.config.url,
       username: d.config.username,
       password: d.config.password,
+      cookie: d.config.cookie,
+      userAgent: d.config.userAgent,
     });
     setDsType(d.type);
     setOpen(true);
@@ -65,7 +69,9 @@ export default function SourcesPage() {
     const config: Record<string, string> =
       v.type === 'localfs'
         ? { root: v.root ?? '' }
-        : { url: v.url ?? '', username: v.username ?? '', password: v.password ?? '' };
+        : v.type === 'webdav'
+          ? { url: v.url ?? '', username: v.username ?? '', password: v.password ?? '' }
+          : { root: v.root ?? '/safedrive', cookie: v.cookie ?? '', userAgent: v.userAgent ?? '' };
     const body = { name: v.name, type: v.type, config, strategyId: v.strategyId };
     setSaving(true);
     try {
@@ -130,14 +136,20 @@ export default function SourcesPage() {
             title: '类型',
             dataIndex: 'type',
             render: (t: string) =>
-              t === 'localfs' ? <Tag color="geekblue">本地文件系统</Tag> : <Tag color="cyan">WebDAV</Tag>,
+              t === 'localfs' ? (
+                <Tag color="geekblue">本地文件系统</Tag>
+              ) : t === 'webdav' ? (
+                <Tag color="cyan">WebDAV</Tag>
+              ) : (
+                <Tag color="blue">百度网盘</Tag>
+              ),
           },
           {
             title: '位置',
             key: 'loc',
             render: (_, d) => (
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                {d.type === 'localfs' ? d.config.root : d.config.url}
+                {d.type === 'webdav' ? d.config.url : d.config.root}
               </Typography.Text>
             ),
           },
@@ -187,10 +199,11 @@ export default function SourcesPage() {
           <Form.Item name="type" label="类型" rules={[{ required: true }]}>
             <Select
               disabled={!!editing}
-              onChange={(v: 'localfs' | 'webdav') => setDsType(v)}
+              onChange={(v: 'localfs' | 'webdav' | 'baidupan') => setDsType(v)}
               options={[
                 { label: '本地文件系统（服务器磁盘目录）', value: 'localfs' },
                 { label: 'WebDAV', value: 'webdav' },
+                { label: '百度网盘（Cookie）', value: 'baidupan' },
               ]}
             />
           </Form.Item>
@@ -220,6 +233,33 @@ export default function SourcesPage() {
               </Form.Item>
               <Form.Item name="password" label="密码（保存在服务端配置中）">
                 <Input.Password autoComplete="new-password" />
+              </Form.Item>
+            </>
+          )}
+          {dsType === 'baidupan' && (
+            <>
+              <Form.Item
+                name="root"
+                label="网盘根目录"
+                initialValue="/safedrive"
+                rules={[{ required: true, message: '请输入网盘根目录' }]}
+                extra="连接测试时若目录不存在会自动创建；建议使用独立目录"
+              >
+                <Input placeholder="/safedrive" />
+              </Form.Item>
+              <Form.Item
+                name="cookie"
+                label="百度网盘 Cookie"
+                rules={[
+                  { required: true, message: '请输入 Cookie' },
+                  { pattern: /(?:^|;\s*)BDUSS=/, message: 'Cookie 必须包含 BDUSS' },
+                ]}
+                extra="从 pan.baidu.com 已登录请求中复制完整 Cookie；凭证将保存在服务端配置中"
+              >
+                <Input.TextArea autoComplete="off" rows={4} placeholder="BDUSS=...; STOKEN=...; BAIDUID=..." />
+              </Form.Item>
+              <Form.Item name="userAgent" label="下载 User-Agent（留空使用 Android 网盘 UA）">
+                <Input autoComplete="off" placeholder="netdisk;P2SP;2.2.61.31;android" />
               </Form.Item>
             </>
           )}

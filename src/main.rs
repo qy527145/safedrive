@@ -1,6 +1,7 @@
 mod adapters;
 mod assets;
 mod auth;
+mod cache;
 mod crypto;
 mod engine;
 mod error;
