@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ApiError, ApiResult};
 
 /// 数据源记录。`config` 由类型决定（localfs / webdav / baidupan）。
-/// `strategy_id` 是客户端密码本中映射策略的不透明指针，服务端不知晓其内容。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataSource {
@@ -15,8 +14,53 @@ pub struct DataSource {
     #[serde(rename = "type")]
     pub ds_type: String,
     pub config: serde_json::Value,
-    pub strategy_id: String,
+    /// 加密模式只能在创建时决定；更新接口会拒绝翻转该值。
+    #[serde(default = "default_encryption_enabled")]
+    pub encryption_enabled: bool,
+    /// 数据源自己的根密码。未加密数据源为空字符串。
+    #[serde(default)]
+    pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_password: Option<String>,
+    #[serde(default = "default_volume_enabled")]
+    pub volume_enabled: bool,
+    #[serde(default = "default_volume_size")]
+    pub volume_size: u64,
+    #[serde(default = "default_volume_strategy")]
+    pub volume_strategy: String,
+    #[serde(default = "default_volume_name_format")]
+    pub volume_name_format: String,
+    /// 数据源级缓存开关；还会受全局缓存总开关约束。
+    #[serde(default = "default_cache_enabled")]
+    pub cache_enabled: bool,
     pub created_at: u64,
+}
+
+pub const DEFAULT_VOLUME_SIZE: u64 = 300 * 1024 * 1024;
+pub const MIN_VOLUME_SIZE: u64 = 64 * 1024;
+pub fn gen_password() -> String {
+    use base64::Engine;
+    let mut raw = [0u8; 18];
+    getrandom::fill(&mut raw).expect("系统随机数不可用");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+}
+fn default_encryption_enabled() -> bool {
+    true
+}
+fn default_volume_enabled() -> bool {
+    true
+}
+fn default_volume_size() -> u64 {
+    DEFAULT_VOLUME_SIZE
+}
+fn default_volume_strategy() -> String {
+    "random".into()
+}
+fn default_volume_name_format() -> String {
+    "{s}_{i}.bin".into()
+}
+fn default_cache_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -70,10 +114,12 @@ impl Registry {
             .iter_mut()
             .find(|d| d.id == id)
             .ok_or_else(|| ApiError::NotFound(format!("数据源不存在: {id}")))?;
-        *slot = DataSource {
+        let mut replacement = DataSource {
             id: id.to_string(),
             ..ds
         };
+        preserve_live_baidu_tokens(slot, &mut replacement);
+        *slot = replacement;
         let saved = slot.clone();
         self.save(&guard)?;
         Ok(saved)
@@ -85,6 +131,7 @@ impl Registry {
         id: &str,
         access_token: &str,
         refresh_token: &str,
+        access_token_expires_at: u64,
     ) -> ApiResult<()> {
         let mut guard = self.inner.lock().unwrap();
         let datasource = guard
@@ -100,6 +147,10 @@ impl Registry {
             .ok_or_else(|| ApiError::BadRequest("百度网盘配置不是对象".into()))?;
         config.insert("accessToken".into(), access_token.into());
         config.insert("refreshToken".into(), refresh_token.into());
+        config.insert(
+            "accessTokenExpiresAt".into(),
+            access_token_expires_at.into(),
+        );
         self.save(&guard)
     }
 
@@ -133,6 +184,27 @@ impl Registry {
     }
 }
 
+fn preserve_live_baidu_tokens(current: &DataSource, replacement: &mut DataSource) {
+    if current.ds_type != "baidupan" || replacement.ds_type != "baidupan" {
+        return;
+    }
+    let identity_fields = ["bduss", "clientId", "clientSecret"];
+    let same_identity = identity_fields
+        .iter()
+        .all(|field| current.config.get(field) == replacement.config.get(field));
+    if !same_identity {
+        return;
+    }
+    let Some(target) = replacement.config.as_object_mut() else {
+        return;
+    };
+    for field in ["accessToken", "refreshToken", "accessTokenExpiresAt"] {
+        if let Some(value) = current.config.get(field) {
+            target.insert(field.into(), value.clone());
+        }
+    }
+}
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -150,7 +222,14 @@ mod tests {
             name: format!("ds-{id}"),
             ds_type: "localfs".into(),
             config: serde_json::json!({"root": "/tmp/x"}),
-            strategy_id: "s1".into(),
+            encryption_enabled: true,
+            password: "test-password".into(),
+            prev_password: None,
+            volume_enabled: true,
+            volume_size: DEFAULT_VOLUME_SIZE,
+            volume_strategy: "random".into(),
+            volume_name_format: "{s}_{i}.bin".into(),
+            cache_enabled: true,
             created_at: 1,
         }
     }
@@ -194,12 +273,45 @@ mod tests {
         });
         registry.create(source).unwrap();
         registry
-            .update_baidu_tokens("baidu", "new-access", "new-refresh")
+            .update_baidu_tokens("baidu", "new-access", "new-refresh", 1234)
             .unwrap();
 
         let reloaded = Registry::load(path).unwrap();
         let config = reloaded.get("baidu").unwrap().config;
         assert_eq!(config["accessToken"], "new-access");
         assert_eq!(config["refreshToken"], "new-refresh");
+        assert_eq!(config["accessTokenExpiresAt"], 1234);
+    }
+
+    #[test]
+    fn datasource_update_does_not_overwrite_fresh_baidu_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("datasources.json");
+        let registry = Registry::load(path.clone()).unwrap();
+        let mut source = ds("baidu");
+        source.ds_type = "baidupan".into();
+        source.config = serde_json::json!({
+            "bduss": "same-account",
+            "clientId": "same-client",
+            "clientSecret": "same-secret",
+            "accessToken": "old-access",
+            "refreshToken": "old-refresh",
+            "accessTokenExpiresAt": 100
+        });
+        registry.create(source.clone()).unwrap();
+        registry
+            .update_baidu_tokens("baidu", "new-access", "new-refresh", 1234)
+            .unwrap();
+
+        // Simulate a settings form that was opened before the refresh completed.
+        source.name = "renamed".into();
+        registry.update("baidu", source).unwrap();
+
+        let reloaded = Registry::load(path).unwrap();
+        let updated = reloaded.get("baidu").unwrap();
+        assert_eq!(updated.name, "renamed");
+        assert_eq!(updated.config["accessToken"], "new-access");
+        assert_eq!(updated.config["refreshToken"], "new-refresh");
+        assert_eq!(updated.config["accessTokenExpiresAt"], 1234);
     }
 }

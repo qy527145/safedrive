@@ -41,8 +41,7 @@ pub fn gen_secret() -> [u8; SECRET_LEN] {
     s
 }
 
-/// 策略根密码 → 信封链根密钥 FK_root（确定性：同密码同密钥，
-/// 多数据源共享策略即共享入口）。
+/// 数据源根密码 → 信封链根密钥 FK_root（确定性：同密码同密钥）。
 pub fn derive_root_key(password: &[u8]) -> [u8; SECRET_LEN] {
     let mut fk = [0u8; SECRET_LEN];
     derive(password, &[], "sd.root.key", &mut fk);
@@ -181,7 +180,10 @@ impl ChunkPrp {
             return None;
         }
         let w = n / 2;
-        if !name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        if !name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
             return None;
         }
         let v = u64::from_str_radix(name, 16).ok()?;
@@ -191,8 +193,13 @@ impl ChunkPrp {
 }
 
 /// 该文件按 volume_size 需要多少个分卷。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn chunk_count(size: u64, volume_size: u64) -> usize {
-    if size == 0 { 1 } else { size.div_ceil(volume_size) as usize }
+    if size == 0 {
+        1
+    } else {
+        size.div_ceil(volume_size) as usize
+    }
 }
 
 /// 前 count 个分卷名（索引 i 即第 i 卷）。
@@ -222,10 +229,20 @@ mod tests {
         assert_eq!(back, plain);
 
         // 任意偏移随机访问解密（模拟 seek）
-        for (start, len) in [(0usize, 1usize), (63, 2), (64, 64), (12345, 7000), (99_999, 1)] {
+        for (start, len) in [
+            (0usize, 1usize),
+            (63, 2),
+            (64, 64),
+            (12345, 7000),
+            (99_999, 1),
+        ] {
             let mut piece = ct[start..start + len].to_vec();
             apply_content_keystream(&pw, start as u64, &mut piece);
-            assert_eq!(piece, &plain[start..start + len], "offset={start} len={len}");
+            assert_eq!(
+                piece,
+                &plain[start..start + len],
+                "offset={start} len={len}"
+            );
         }
     }
 
@@ -273,9 +290,18 @@ mod tests {
         // 跨宽度域：形状、往返、确定性
         for i in [0usize, 255, 256, 65_535, 65_536, 4_000_000] {
             let name = prp.name_of(i);
-            let expect_len = if i < 256 { 2 } else if i < 65_536 { 4 } else { 6 };
+            let expect_len = if i < 256 {
+                2
+            } else if i < 65_536 {
+                4
+            } else {
+                6
+            };
             assert_eq!(name.len(), expect_len, "卷 {i}: {name}");
-            assert!(name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            );
             assert_eq!(prp.index_of(&name), Some(i));
             assert_eq!(ChunkPrp::new(&pw).name_of(i), name, "同密码可再生成");
         }
@@ -292,7 +318,10 @@ mod tests {
         // 不同密码 → 不同置换
         assert_ne!(gen_chunk_names(&gen_secret(), 10), gen_chunk_names(&pw, 10));
         // gen_chunk_names 与逐个 name_of 一致
-        assert_eq!(gen_chunk_names(&pw, 5), (0..5).map(|i| prp.name_of(i)).collect::<Vec<_>>());
+        assert_eq!(
+            gen_chunk_names(&pw, 5),
+            (0..5).map(|i| prp.name_of(i)).collect::<Vec<_>>()
+        );
     }
 
     #[test]

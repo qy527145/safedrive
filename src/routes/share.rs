@@ -70,7 +70,11 @@ async fn share_export(
         .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("无法解码 {path} 的密文名")))?;
     Ok(Json(SharePack {
         sdshare: 1,
-        kind: if node.dir { "dir".into() } else { "file".into() },
+        kind: if node.dir {
+            "dir".into()
+        } else {
+            "file".into()
+        },
         name: meta.name,
         size: (!node.dir).then_some(meta.size),
         secret: B64.encode(node.secret),
@@ -155,10 +159,15 @@ async fn share_import(
     } else {
         match on_conflict {
             "skip" => {
-                return Ok(Json(json!({ "ok": true, "skipped": true, "name": body.pack.name })));
+                return Ok(Json(
+                    json!({ "ok": true, "skipped": true, "name": body.pack.name }),
+                ));
             }
             "error" => {
-                return Err(ApiError::BadRequest(format!("已存在同名条目: {}", body.pack.name)));
+                return Err(ApiError::BadRequest(format!(
+                    "已存在同名条目: {}",
+                    body.pack.name
+                )));
             }
             _ => next_free_name(&body.pack.name, &taken)
                 .ok_or_else(|| ApiError::BadRequest("无法生成不冲突的名字".into()))?,
@@ -177,13 +186,23 @@ async fn share_import(
     let dst_enc = super::files::join_enc(&parent.enc_path, &new_nc);
     storage.rename(&src_enc, &dst_enc).await?;
 
-    let child_path = if dir.is_empty() { final_name.clone() } else { format!("{dir}/{final_name}") };
+    let child_path = if dir.is_empty() {
+        final_name.clone()
+    } else {
+        format!("{dir}/{final_name}")
+    };
     state.cache.put(
         &ds,
         &child_path,
-        crate::vault::CachedNode { secret, nc: new_nc, dir: is_dir },
+        crate::vault::CachedNode {
+            secret,
+            nc: new_nc,
+            dir: is_dir,
+        },
     );
-    Ok(Json(json!({ "ok": true, "name": final_name, "renamed": final_name != body.pack.name })))
+    Ok(Json(
+        json!({ "ok": true, "name": final_name, "renamed": final_name != body.pack.name }),
+    ))
 }
 
 /// Finder 式后缀：「报告.pdf」→「报告 (1).pdf」；目录「电影」→「电影 (1)」。

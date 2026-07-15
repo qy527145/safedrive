@@ -1,7 +1,7 @@
 pub mod ds;
 pub mod files;
 pub mod share;
-mod strategies;
+mod system;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::{get, post};
@@ -18,10 +18,13 @@ pub fn router(state: AppState) -> Router {
 
     let protected = Router::new()
         .merge(ds::routes())
-        .merge(strategies::routes())
+        .merge(system::routes())
         .merge(files::api_routes())
         .merge(share::routes())
-        .layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
 
     Router::new()
         .nest("/api", open.merge(protected))

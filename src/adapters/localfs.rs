@@ -20,7 +20,9 @@ impl LocalFs {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ApiError::BadRequest("localfs 配置缺少 root".into()))?;
-        Ok(Self { root: PathBuf::from(root) })
+        Ok(Self {
+            root: PathBuf::from(root),
+        })
     }
 
     /// 相对路径（已经过 sanitize）→ 囚笼内绝对路径。
@@ -40,7 +42,9 @@ impl Storage for LocalFs {
         let mut rd = tokio::fs::read_dir(&dir).await?;
         let mut entries = Vec::new();
         while let Some(item) = rd.next_entry().await? {
-            let Ok(meta) = item.metadata().await else { continue };
+            let Ok(meta) = item.metadata().await else {
+                continue;
+            };
             let name = item.file_name().to_string_lossy().into_owned();
             // 跳过写入中的临时文件
             if name.starts_with(".sd-tmp-") {
@@ -185,7 +189,9 @@ mod tests {
         let fs = adapter(dir.path());
 
         fs.mkdir("enc-folder").await.unwrap();
-        fs.put("enc-folder/0001.bin", body_of(b"cipher-bytes")).await.unwrap();
+        fs.put("enc-folder/0001.bin", body_of(b"cipher-bytes"))
+            .await
+            .unwrap();
 
         let entries = fs.list("enc-folder").await.unwrap();
         assert_eq!(entries.len(), 1);

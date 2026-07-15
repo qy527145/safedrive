@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+use futures_util::stream::FuturesUnordered;
 use futures_util::{Stream, StreamExt};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
@@ -60,6 +61,7 @@ pub async fn load_layout(
     let prp = ChunkPrp::new(pw);
     let mut indexed: Vec<(usize, String, u64)> = entries
         .into_iter()
+        .into_iter()
         .filter(|e| !e.is_dir)
         .filter_map(|e| prp.index_of(&e.name).map(|i| (i, e.name, e.size)))
         .collect();
@@ -78,7 +80,10 @@ pub async fn load_layout(
         volumes.push(VolumeMeta { name, size, offset });
         offset += size;
     }
-    Ok(FileLayout { volumes, total: offset })
+    Ok(FileLayout {
+        volumes,
+        total: offset,
+    })
 }
 
 // ---------------- Range 解析 ----------------
@@ -122,7 +127,13 @@ pub fn parse_range(header: Option<&str>, total: u64) -> (RangeSpec, bool) {
             if s >= total || s > e {
                 return (RangeSpec::Unsatisfiable, false);
             }
-            (RangeSpec::Slice { start: s, end: e.min(total - 1) }, false)
+            (
+                RangeSpec::Slice {
+                    start: s,
+                    end: e.min(total - 1),
+                },
+                false,
+            )
         }
         (false, true) => {
             let Ok(s) = a.parse::<u64>() else {
@@ -131,7 +142,13 @@ pub fn parse_range(header: Option<&str>, total: u64) -> (RangeSpec, bool) {
             if s >= total {
                 return (RangeSpec::Unsatisfiable, false);
             }
-            (RangeSpec::Slice { start: s, end: total - 1 }, true)
+            (
+                RangeSpec::Slice {
+                    start: s,
+                    end: total - 1,
+                },
+                true,
+            )
         }
         (true, false) => {
             let Ok(n) = b.parse::<u64>() else {
@@ -141,7 +158,13 @@ pub fn parse_range(header: Option<&str>, total: u64) -> (RangeSpec, bool) {
                 return (RangeSpec::Unsatisfiable, false);
             }
             let start = total.saturating_sub(n);
-            (RangeSpec::Slice { start, end: total - 1 }, false)
+            (
+                RangeSpec::Slice {
+                    start,
+                    end: total - 1,
+                },
+                false,
+            )
         }
         (true, true) => (RangeSpec::Full, true),
     }
@@ -170,9 +193,12 @@ pub fn plan_chunks(
     max_split: u64,
     open_ended: bool,
 ) -> Vec<PlannedChunk> {
-    let split = max_split.max(1); // 下限由策略校验保证，这里只防 0
-    let head: usize =
-        if open_ended && split > HEAD_SMALL_SPLIT { HEAD_SMALL_COUNT } else { 0 };
+    let split = max_split.max(1); // 下限由设置校验保证，这里只防 0
+    let head: usize = if open_ended && split > HEAD_SMALL_SPLIT {
+        HEAD_SMALL_COUNT
+    } else {
+        0
+    };
     let mut plan = Vec::new();
     let mut cur = start;
     let mut vol_idx = 0usize;
@@ -182,7 +208,11 @@ pub fn plan_chunks(
             vol_idx += 1;
             continue;
         }
-        let this_split = if plan.len() < head { HEAD_SMALL_SPLIT } else { split };
+        let this_split = if plan.len() < head {
+            HEAD_SMALL_SPLIT
+        } else {
+            split
+        };
         let vol_last = v.offset + v.size - 1;
         let chunk_end = (cur + this_split - 1).min(vol_last).min(end);
         plan.push(PlannedChunk {
@@ -218,6 +248,7 @@ impl Drop for ReleaseGuard {
 
 /// 按合并区间 [start, end] 流式产出解密后的明文字节，可选持久密文缓存。
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn stream_range_cached(
     storage: Arc<dyn Storage>,
     enc_folder: String,
@@ -228,6 +259,53 @@ pub fn stream_range_cached(
     open_ended: bool,
     params: &StreamParams,
     cache: Option<Arc<crate::cache::CacheEntry>>,
+) -> mpsc::Receiver<io::Result<Bytes>> {
+    stream_range_cached_mode(
+        storage, enc_folder, pw, true, layout, start, end, open_ended, params, cache, None,
+    )
+}
+
+/// 未加密自定义卷名使用定宽 `{i}`，因此按文件名字典序即可恢复卷序。
+pub async fn load_layout_ordered(storage: &dyn Storage, folder: &str) -> ApiResult<FileLayout> {
+    let mut entries: Vec<_> = storage
+        .list(folder)
+        .await?
+        .into_iter()
+        .filter(|entry| !entry.is_dir)
+        .collect();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut offset = 0u64;
+    let volumes = entries
+        .into_iter()
+        .map(|entry| {
+            let volume = VolumeMeta {
+                name: entry.name,
+                size: entry.size,
+                offset,
+            };
+            offset += entry.size;
+            volume
+        })
+        .collect();
+    Ok(FileLayout {
+        volumes,
+        total: offset,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn stream_range_cached_mode(
+    storage: Arc<dyn Storage>,
+    enc_folder: String,
+    pw: [u8; crate::crypto::SECRET_LEN],
+    encrypted: bool,
+    layout: Arc<FileLayout>,
+    start: u64,
+    end: u64,
+    open_ended: bool,
+    params: &StreamParams,
+    cache: Option<Arc<crate::cache::CacheEntry>>,
+    network_progress: Option<crate::adapters::ProgressFn>,
 ) -> mpsc::Receiver<io::Result<Bytes>> {
     let max_split = storage
         .max_range_size()
@@ -250,8 +328,7 @@ pub fn stream_range_cached(
     let chan_buffer = ((max_split / item_estimate) as usize).clamp(8, 512);
     let mut senders: Vec<Option<mpsc::Sender<io::Result<Bytes>>>> =
         Vec::with_capacity(total_chunks);
-    let mut receivers: Vec<mpsc::Receiver<io::Result<Bytes>>> =
-        Vec::with_capacity(total_chunks);
+    let mut receivers: Vec<mpsc::Receiver<io::Result<Bytes>>> = Vec::with_capacity(total_chunks);
     for _ in 0..total_chunks {
         let (tx, rx) = mpsc::channel(chan_buffer);
         senders.push(Some(tx));
@@ -269,6 +346,7 @@ pub fn stream_range_cached(
     let sched_storage = Arc::clone(&storage);
     let sched_layout = Arc::clone(&layout);
     let sched_cache = cache;
+    let sched_progress = network_progress;
     tokio::spawn(async move {
         let mut spawned = vec![false; total_chunks];
         let mut spawned_count = 0usize;
@@ -281,14 +359,16 @@ pub fn stream_range_cached(
                 // 若请求只覆盖一个分卷，则软化单卷上限以用满总线程预算。
                 let pick = (0..total_chunks)
                     .find(|&idx| {
-                        !spawned[idx]
-                            && inflight_vol[sched_plan[idx].vol] < max_per_volume
+                        !spawned[idx] && inflight_vol[sched_plan[idx].vol] < max_per_volume
                     })
                     .or_else(|| (0..total_chunks).find(|&idx| !spawned[idx]));
                 let Some(idx) = pick else { break };
                 let c = sched_plan[idx].clone();
                 let tx = senders[idx].take().expect("每个 chunk 只孵化一次");
-                let guard = ReleaseGuard { tx: release_tx.clone(), vol: c.vol };
+                let guard = ReleaseGuard {
+                    tx: release_tx.clone(),
+                    vol: c.vol,
+                };
                 spawned[idx] = true;
                 spawned_count += 1;
                 inflight += 1;
@@ -301,9 +381,10 @@ pub fn stream_range_cached(
                 };
                 let st = Arc::clone(&sched_storage);
                 let chunk_cache = sched_cache.clone();
+                let progress = sched_progress.clone();
                 handles.push(tokio::spawn(async move {
                     let _guard = guard;
-                    fetch_chunk(st, obj_path, pw, c, tx, chunk_cache).await;
+                    fetch_chunk(st, obj_path, pw, encrypted, c, tx, chunk_cache, progress).await;
                 }));
             }
             if spawned_count >= total_chunks && inflight == 0 {
@@ -373,18 +454,22 @@ async fn fetch_chunk(
     storage: Arc<dyn Storage>,
     obj_path: String,
     pw: [u8; crate::crypto::SECRET_LEN],
+    encrypted: bool,
     c: PlannedChunk,
     tx: mpsc::Sender<io::Result<Bytes>>,
     cache: Option<Arc<crate::cache::CacheEntry>>,
+    network_progress: Option<crate::adapters::ProgressFn>,
 ) {
     let merged_end = c.merged_start + c.len - 1;
     if let Some(cache) = &cache
         && cache.has_range(c.merged_start, merged_end)
     {
         match cache.read_range(c.merged_start, merged_end) {
-            Ok(encrypted) => {
-                let mut buf = encrypted.to_vec();
-                crate::crypto::apply_content_keystream(&pw, c.merged_start, &mut buf);
+            Ok(cached_bytes) => {
+                let mut buf = cached_bytes.to_vec();
+                if encrypted {
+                    crate::crypto::apply_content_keystream(&pw, c.merged_start, &mut buf);
+                }
                 let _ = tx.send(Ok(Bytes::from(buf))).await;
                 return;
             }
@@ -397,7 +482,7 @@ async fn fetch_chunk(
     // 每 chunk 建一次 cipher，seek 到合并偏移后连续吐 keystream。
     let (key, nonce) = content_cipher_params(&pw);
     let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
-    if cipher.try_seek(c.merged_start).is_err() {
+    if encrypted && cipher.try_seek(c.merged_start).is_err() {
         let _ = tx.send(Err(io::Error::other("keystream 偏移越界"))).await;
         return;
     }
@@ -431,6 +516,9 @@ async fn fetch_chunk(
             }
             // 上游多给的字节直接截掉（区间读语义以我们的计划为准）。
             let take = (item.len() as u64).min(remaining) as usize;
+            if let Some(progress) = &network_progress {
+                progress(take as u64);
+            }
             let cache_offset = c.merged_start + (c.len - remaining);
             if let Some(cache) = &cache
                 && let Err(e) = cache.write_range(cache_offset, &item[..take])
@@ -438,7 +526,9 @@ async fn fetch_chunk(
                 tracing::warn!("写入密文缓存失败（不影响本次下载）: {e}");
             }
             let mut buf = item[..take].to_vec();
-            cipher.apply_keystream(&mut buf);
+            if encrypted {
+                cipher.apply_keystream(&mut buf);
+            }
             remaining -= take as u64;
             if tx.send(Ok(Bytes::from(buf))).await.is_err() {
                 return; // serializer 已放弃
@@ -468,28 +558,44 @@ async fn fetch_chunk(
 /// 上传双维度进度：`encrypted` 是本地已加密并切入分卷的字节（受通道
 /// 缓冲与 pending 上传数影响，会领先于真实上传）；`uploaded` 是存储端
 /// 已确认接收的字节（由适配器上报，见 `Storage::put_sized_tracked`）。
-#[derive(Debug)]
 pub struct UploadProgress {
     pub total: u64,
     pub encrypted: AtomicU64,
     pub uploaded: AtomicU64,
+    network: Option<Arc<crate::transfer::TransferTracker>>,
 }
 
 impl UploadProgress {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(total: u64) -> Self {
-        Self { total, encrypted: AtomicU64::new(0), uploaded: AtomicU64::new(0) }
+        Self {
+            total,
+            encrypted: AtomicU64::new(0),
+            uploaded: AtomicU64::new(0),
+            network: None,
+        }
+    }
+    pub fn tracked(total: u64, network: Arc<crate::transfer::TransferTracker>) -> Self {
+        Self {
+            total,
+            encrypted: AtomicU64::new(0),
+            uploaded: AtomicU64::new(0),
+            network: Some(network),
+        }
     }
 }
 
 /// 已封口但仍在等待存储端响应的最大分卷数。允许少量重叠可隐藏 WebDAV
 /// 每次 PUT 的响应延迟，同时限制临时任务与连接占用。
-const MAX_PENDING_UPLOADS: usize = 2;
+const MAX_PENDING_UPLOADS: usize = 4;
 type UploadTask = (mpsc::Sender<io::Result<Bytes>>, JoinHandle<ApiResult<()>>);
+type PendingUploads = FuturesUnordered<JoinHandle<ApiResult<()>>>;
 
 /// 把明文流加密并按分卷写入 `enc_folder/names[i]`。
 /// `names` 必须来自 `gen_chunk_names(pw, chunk_count(total, volume_size))`。
 /// 实际字节数与 `total` 不符即报错（调用方负责清理）。
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn upload_stream<S>(
     storage: Arc<dyn Storage>,
     enc_folder: &str,
@@ -497,51 +603,86 @@ pub async fn upload_stream<S>(
     total: u64,
     volume_size: u64,
     names: &[String],
+    body: S,
+    progress: Arc<UploadProgress>,
+) -> ApiResult<()>
+where
+    S: Stream<Item = io::Result<Bytes>> + Unpin,
+{
+    let sizes = (0..names.len())
+        .map(|idx| {
+            let start = idx as u64 * volume_size;
+            volume_size.min(total.saturating_sub(start))
+        })
+        .collect::<Vec<_>>();
+    upload_stream_planned(
+        storage, enc_folder, pw, true, total, &sizes, names, body, progress,
+    )
+    .await
+}
+
+/// 按显式卷大小计划上传；`encrypted=false` 时原样写入，供未加密数据源使用。
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_stream_planned<S>(
+    storage: Arc<dyn Storage>,
+    enc_folder: &str,
+    pw: &[u8],
+    encrypted: bool,
+    total: u64,
+    volume_sizes: &[u64],
+    names: &[String],
     mut body: S,
     progress: Arc<UploadProgress>,
 ) -> ApiResult<()>
 where
     S: Stream<Item = io::Result<Bytes>> + Unpin,
 {
+    if names.len() != volume_sizes.len() || volume_sizes.iter().sum::<u64>() != total {
+        return Err(ApiError::BadRequest("分卷计划与文件大小不一致".into()));
+    }
+    if total == 0 {
+        if let Some(name) = names.first() {
+            let path = if enc_folder.is_empty() {
+                name.clone()
+            } else {
+                format!("{enc_folder}/{name}")
+            };
+            return storage
+                .put_sized(&path, 0, futures_util::stream::empty().boxed())
+                .await;
+        }
+        return Ok(());
+    }
     let (key, nonce) = content_cipher_params(pw);
     let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
 
-    let vol_cap = |idx: usize| -> u64 {
-        let start = idx as u64 * volume_size;
-        volume_size.min(total - start)
-    };
+    let vol_cap = |idx: usize| -> u64 { volume_sizes[idx] };
 
     let mut vol_idx = 0usize;
     let mut sent_in_vol = 0u64;
     let mut received = 0u64;
     let mut current: Option<UploadTask> = None;
-    let mut pending = std::collections::VecDeque::<JoinHandle<ApiResult<()>>>::new();
+    let mut pending = PendingUploads::new();
 
-    async fn close_current(
-        cur: &mut Option<UploadTask>,
-        pending: &mut std::collections::VecDeque<JoinHandle<ApiResult<()>>>,
-    ) {
-        let Some((tx, handle)) = cur.take() else { return };
+    async fn close_current(cur: &mut Option<UploadTask>, pending: &mut PendingUploads) {
+        let Some((tx, handle)) = cur.take() else {
+            return;
+        };
         drop(tx); // 关闭写端 → put 的输入流结束
-        pending.push_back(handle);
+        pending.push(handle);
     }
 
-    async fn wait_one(
-        pending: &mut std::collections::VecDeque<JoinHandle<ApiResult<()>>>,
-    ) -> ApiResult<()> {
-        let Some(handle) = pending.pop_front() else { return Ok(()) };
-        handle
-            .await
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("上传任务 panic: {e}")))?
+    async fn wait_one(pending: &mut PendingUploads) -> ApiResult<()> {
+        let Some(handle) = pending.next().await else {
+            return Ok(());
+        };
+        handle.map_err(|e| ApiError::Internal(anyhow::anyhow!("上传任务 panic: {e}")))?
     }
 
-    async fn wait_all(
-        pending: &mut std::collections::VecDeque<JoinHandle<ApiResult<()>>>,
-    ) -> ApiResult<()> {
+    async fn wait_all(pending: &mut PendingUploads) -> ApiResult<()> {
         let mut first_error = None;
-        while let Some(handle) = pending.pop_front() {
+        while let Some(handle) = pending.next().await {
             let result = handle
-                .await
                 .map_err(|e| ApiError::Internal(anyhow::anyhow!("上传任务 panic: {e}")))
                 .and_then(|result| result);
             if first_error.is_none() {
@@ -574,8 +715,12 @@ where
         let mut buf = item
             .try_into_mut()
             .unwrap_or_else(|shared| bytes::BytesMut::from(shared.as_ref()));
-        cipher.apply_keystream(&mut buf);
-        progress.encrypted.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        if encrypted {
+            cipher.apply_keystream(&mut buf);
+        }
+        progress
+            .encrypted
+            .fetch_add(buf.len() as u64, Ordering::Relaxed);
         let mut b = buf.freeze();
 
         while !b.is_empty() {
@@ -592,8 +737,12 @@ where
                 let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(8);
                 let st = Arc::clone(&storage);
                 let uploaded = Arc::clone(&progress);
-                let on_upload: crate::adapters::ProgressFn =
-                    Arc::new(move |n| { uploaded.uploaded.fetch_add(n, Ordering::Relaxed); });
+                let on_upload: crate::adapters::ProgressFn = Arc::new(move |n| {
+                    uploaded.uploaded.fetch_add(n, Ordering::Relaxed);
+                    if let Some(network) = &uploaded.network {
+                        network.upload(n);
+                    }
+                });
                 let handle = tokio::spawn(async move {
                     st.put_sized_tracked(&obj_path, cap, ReceiverStream::new(rx).boxed(), on_upload)
                         .await
@@ -655,13 +804,53 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct SlowFirstFinalizeStorage;
+
+    #[async_trait::async_trait]
+    impl Storage for SlowFirstFinalizeStorage {
+        async fn list(&self, _: &str) -> ApiResult<Vec<Entry>> {
+            unreachable!()
+        }
+        async fn mkdir(&self, _: &str) -> ApiResult<()> {
+            unreachable!()
+        }
+        async fn delete(&self, _: &str) -> ApiResult<()> {
+            unreachable!()
+        }
+        async fn rename(&self, _: &str, _: &str) -> ApiResult<()> {
+            unreachable!()
+        }
+        async fn get(&self, _: &str) -> ApiResult<(Option<u64>, ByteStream)> {
+            unreachable!()
+        }
+        async fn put(&self, path: &str, mut body: ByteStream) -> ApiResult<()> {
+            while let Some(item) = body.next().await {
+                item?;
+            }
+            if path.ends_with("/v0") {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Ok(())
+        }
+    }
+
     #[async_trait::async_trait]
     impl Storage for FlakyRangeStorage {
-        async fn list(&self, _: &str) -> ApiResult<Vec<Entry>> { unreachable!() }
-        async fn mkdir(&self, _: &str) -> ApiResult<()> { unreachable!() }
-        async fn delete(&self, _: &str) -> ApiResult<()> { unreachable!() }
-        async fn rename(&self, _: &str, _: &str) -> ApiResult<()> { unreachable!() }
-        async fn get(&self, _: &str) -> ApiResult<(Option<u64>, ByteStream)> { unreachable!() }
+        async fn list(&self, _: &str) -> ApiResult<Vec<Entry>> {
+            unreachable!()
+        }
+        async fn mkdir(&self, _: &str) -> ApiResult<()> {
+            unreachable!()
+        }
+        async fn delete(&self, _: &str) -> ApiResult<()> {
+            unreachable!()
+        }
+        async fn rename(&self, _: &str, _: &str) -> ApiResult<()> {
+            unreachable!()
+        }
+        async fn get(&self, _: &str) -> ApiResult<(Option<u64>, ByteStream)> {
+            unreachable!()
+        }
 
         async fn get_range(&self, _: &str, start: u64, end: u64) -> ApiResult<ByteStream> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -678,7 +867,9 @@ mod tests {
             }
         }
 
-        async fn put(&self, _: &str, _: ByteStream) -> ApiResult<()> { unreachable!() }
+        async fn put(&self, _: &str, _: ByteStream) -> ApiResult<()> {
+            unreachable!()
+        }
     }
 
     fn layout(sizes: &[u64]) -> FileLayout {
@@ -687,12 +878,19 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, &size)| {
-                let v = VolumeMeta { name: format!("vol{i:02}.bin"), size, offset };
+                let v = VolumeMeta {
+                    name: format!("vol{i:02}.bin"),
+                    size,
+                    offset,
+                };
                 offset += size;
                 v
             })
             .collect();
-        FileLayout { volumes, total: offset }
+        FileLayout {
+            volumes,
+            total: offset,
+        }
     }
 
     #[test]
@@ -716,10 +914,19 @@ mod tests {
             (RangeSpec::Slice { start: 0, end: 99 }, false),
             "end 截断"
         );
-        assert_eq!(parse_range(Some("bytes=100-"), 100), (RangeSpec::Unsatisfiable, false));
-        assert_eq!(parse_range(Some("bytes=5-2"), 100), (RangeSpec::Unsatisfiable, false));
+        assert_eq!(
+            parse_range(Some("bytes=100-"), 100),
+            (RangeSpec::Unsatisfiable, false)
+        );
+        assert_eq!(
+            parse_range(Some("bytes=5-2"), 100),
+            (RangeSpec::Unsatisfiable, false)
+        );
         assert_eq!(parse_range(Some("bytes=abc"), 100), (RangeSpec::Full, true));
-        assert_eq!(parse_range(Some("bytes=0-1,5-6"), 100), (RangeSpec::Full, true));
+        assert_eq!(
+            parse_range(Some("bytes=0-1,5-6"), 100),
+            (RangeSpec::Full, true)
+        );
     }
 
     #[test]
@@ -759,8 +966,56 @@ mod tests {
         let l = layout(&[1000, 1000, 500]);
         let plan = plan_chunks(&l, 1500, 2200, 10_000, false);
         assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0], PlannedChunk { merged_start: 1500, len: 500, vol: 1, vol_off: 500 });
-        assert_eq!(plan[1], PlannedChunk { merged_start: 2000, len: 201, vol: 2, vol_off: 0 });
+        assert_eq!(
+            plan[0],
+            PlannedChunk {
+                merged_start: 1500,
+                len: 500,
+                vol: 1,
+                vol_off: 500
+            }
+        );
+        assert_eq!(
+            plan[1],
+            PlannedChunk {
+                merged_start: 2000,
+                len: 201,
+                vol: 2,
+                vol_off: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_waits_for_any_finished_volume_not_oldest() {
+        let storage: Arc<dyn Storage> = Arc::new(SlowFirstFinalizeStorage);
+        let progress = Arc::new(UploadProgress::new(5));
+        let sizes = vec![1; MAX_PENDING_UPLOADS + 1];
+        let names = (0..sizes.len())
+            .map(|index| format!("v{index}"))
+            .collect::<Vec<_>>();
+        let task_progress = Arc::clone(&progress);
+        let task = tokio::spawn(async move {
+            upload_stream_planned(
+                storage,
+                "folder",
+                &[0; crate::crypto::SECRET_LEN],
+                false,
+                5,
+                &sizes,
+                &names,
+                stream::iter([Ok(Bytes::from_static(b"12345"))]),
+                task_progress,
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            progress.encrypted.load(Ordering::Relaxed),
+            5,
+            "后续卷已完成时，不应被最早卷的收尾响应阻塞前置处理"
+        );
+        task.await.unwrap().unwrap();
     }
 
     /// 端到端：上传（加密+分卷）→ 存储形态断言 → 全量/区间下载解密一致。
@@ -780,7 +1035,10 @@ mod tests {
 
         storage.mkdir("ENCFOLDER").await.unwrap();
         let body = stream::iter(
-            plain.chunks(17_000).map(|c| Ok(Bytes::copy_from_slice(c))).collect::<Vec<_>>(),
+            plain
+                .chunks(17_000)
+                .map(|c| Ok(Bytes::copy_from_slice(c)))
+                .collect::<Vec<_>>(),
         );
         let progress = Arc::new(UploadProgress::new(total));
         upload_stream(
@@ -796,7 +1054,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(progress.encrypted.load(Ordering::Relaxed), total);
-        assert_eq!(progress.uploaded.load(Ordering::Relaxed), total, "localfs 直写：消费即上传");
+        assert_eq!(
+            progress.uploaded.load(Ordering::Relaxed),
+            total,
+            "localfs 直写：消费即上传"
+        );
 
         // 存储形态：3 个随机名分卷，大小 = 明文分段大小（流密码无膨胀），内容 ≠ 明文
         let entries = storage.list("ENCFOLDER").await.unwrap();
@@ -812,14 +1074,24 @@ mod tests {
         assert_ne!(&raw[..], &plain[..raw.len()], "磁盘上必须是密文");
 
         // 布局
-        let l = Arc::new(load_layout(storage.as_ref(), "ENCFOLDER", &pw).await.unwrap());
+        let l = Arc::new(
+            load_layout(storage.as_ref(), "ENCFOLDER", &pw)
+                .await
+                .unwrap(),
+        );
         // 布局顺序 = 派生顺序
-        assert_eq!(l.volumes.iter().map(|v| v.name.clone()).collect::<Vec<_>>(), names);
+        assert_eq!(
+            l.volumes.iter().map(|v| v.name.clone()).collect::<Vec<_>>(),
+            names
+        );
         assert_eq!(l.total, total);
         assert_eq!(l.volumes.len(), 3);
 
-        let params =
-            StreamParams { max_split: 100_000, max_threads: 8, max_per_volume: 2 };
+        let params = StreamParams {
+            max_split: 100_000,
+            max_threads: 8,
+            max_per_volume: 2,
+        };
         let cache_store = crate::cache::CacheStore::new(dir.path().join(".cache")).unwrap();
         let cache = cache_store.open("roundtrip", total).unwrap();
 
@@ -844,7 +1116,12 @@ mod tests {
         storage.delete("ENCFOLDER").await.unwrap();
 
         // 删除上游后，跨卷任意区间仍必须从全局密文缓存正确解密。
-        for (s, e) in [(0u64, 0u64), (262_143, 262_144), (100_000, 550_000), (699_999, 699_999)] {
+        for (s, e) in [
+            (0u64, 0u64),
+            (262_143, 262_144),
+            (100_000, 550_000),
+            (699_999, 699_999),
+        ] {
             let mut rx = stream_range_cached(
                 Arc::clone(&storage),
                 "ENCFOLDER".into(),
@@ -879,16 +1156,34 @@ mod tests {
         let body = stream::iter(vec![Ok(Bytes::from_static(b"short"))]);
         let progress = || Arc::new(UploadProgress::new(100));
         assert!(
-            upload_stream(Arc::clone(&storage), "F", &pw, 100, 1024, &names, body, progress())
-                .await
-                .is_err()
+            upload_stream(
+                Arc::clone(&storage),
+                "F",
+                &pw,
+                100,
+                1024,
+                &names,
+                body,
+                progress()
+            )
+            .await
+            .is_err()
         );
         // 多给
         let body = stream::iter(vec![Ok(Bytes::from(vec![0u8; 200]))]);
         assert!(
-            upload_stream(Arc::clone(&storage), "F", &pw, 100, 1024, &names, body, progress())
-                .await
-                .is_err()
+            upload_stream(
+                Arc::clone(&storage),
+                "F",
+                &pw,
+                100,
+                1024,
+                &names,
+                body,
+                progress()
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -934,8 +1229,15 @@ mod tests {
             storage.clone(),
             "v".into(),
             pw,
-            PlannedChunk { merged_start: 0, len: plain.len() as u64, vol: 0, vol_off: 0 },
+            true,
+            PlannedChunk {
+                merged_start: 0,
+                len: plain.len() as u64,
+                vol: 0,
+                vol_off: 0,
+            },
             tx,
+            None,
             None,
         )
         .await;
@@ -946,5 +1248,4 @@ mod tests {
         assert_eq!(out, plain);
         assert_eq!(storage.calls.load(Ordering::SeqCst), 2);
     }
-
 }

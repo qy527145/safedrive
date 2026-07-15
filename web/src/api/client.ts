@@ -7,16 +7,15 @@ export interface DsRecord {
   id: string;
   name: string;
   type: 'localfs' | 'webdav' | 'baidupan';
-  config: Record<string, string>;
-  strategyId: string;
+  config: DsConfig;
+  encryptionEnabled: boolean;
+  password: string;
+  volumeEnabled: boolean;
+  volumeSize: number;
+  volumeStrategy: 'fixed' | 'random';
+  volumeNameFormat: string;
+  cacheEnabled: boolean;
   createdAt: number;
-}
-
-/** 创建/更新策略的请求体（password 缺省 = 服务端自动生成/保留原值）。 */
-export interface StrategyInput {
-  name: string;
-  volumeSize: number | null;
-  password?: string;
 }
 
 export interface TransferSettings {
@@ -37,16 +36,6 @@ export interface CacheStats {
   misses: number;
 }
 
-export interface Strategy {
-  id: string;
-  name: string;
-  /** 上传分卷大小（字节）；null = 不分卷（整文件一个分卷） */
-  volumeSize: number | null;
-  /** 根密码：该策略下所有数据源的信封链入口（分享文件树时告知对方） */
-  password: string;
-  createdAt: number;
-}
-
 export interface FsEntry {
   name: string;
   isDir: boolean;
@@ -54,6 +43,36 @@ export interface FsEntry {
   mtime: number;
   /** true = 无法解密的外来条目（仅可删除） */
   foreign: boolean;
+  cache?: FileCacheStatus;
+  downloadSpeed: number;
+}
+export interface DsConfig {
+  [key: string]: string | number | undefined;
+  root?: string;
+  url?: string;
+  username?: string;
+  password?: string;
+  bduss?: string;
+  userAgent?: string;
+  clientId?: string;
+  clientSecret?: string;
+  accessToken?: string;
+  refreshToken?: string;
+  accessTokenExpiresAt?: number;
+}
+export type DsInput = Omit<DsRecord, 'id' | 'createdAt' | 'password'> & { password?: string };
+
+export interface FileCacheStatus {
+  cached: boolean;
+  bytesCached: number;
+  totalSize: number;
+  complete: boolean;
+}
+
+export interface TransferSnapshot {
+  uploadSpeed: number;
+  downloadSpeed: number;
+  fileDownloadSpeeds: Record<string, number>;
 }
 
 export class ApiError extends Error {
@@ -128,27 +147,20 @@ export const api = {
 
   // ---- 数据源 ----
   listDs: () => request<DsRecord[]>('/api/ds'),
-  createDs: (body: Omit<DsRecord, 'id' | 'createdAt'>) =>
+  createDs: (body: DsInput) =>
     request<DsRecord>('/api/ds', { method: 'POST', body: JSON.stringify(body) }),
-  updateDs: (id: string, body: Omit<DsRecord, 'id' | 'createdAt'>) =>
+  updateDs: (id: string, body: DsInput) =>
     request<DsRecord>(`/api/ds/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
   deleteDs: (id: string) => request<{ ok: boolean }>(`/api/ds/${id}`, { method: 'DELETE' }),
   testDs: (id: string) =>
     request<{ ok: boolean; entries: number }>(`/api/ds/${id}/test`, { method: 'POST' }),
 
-  // ---- 策略 ----
-  listStrategies: () => request<Strategy[]>('/api/strategies'),
   getSettings: () => request<TransferSettings>('/api/settings'),
   updateSettings: (body: TransferSettings) =>
     request<TransferSettings>('/api/settings', { method: 'PUT', body: JSON.stringify(body) }),
   getCacheStats: () => request<CacheStats>('/api/cache'),
   clearCache: () => request<{ ok: boolean; freed: number }>('/api/cache', { method: 'DELETE' }),
-  createStrategy: (body: StrategyInput) =>
-    request<Strategy>('/api/strategies', { method: 'POST', body: JSON.stringify(body) }),
-  updateStrategy: (id: string, body: StrategyInput) =>
-    request<Strategy>(`/api/strategies/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
-  deleteStrategy: (id: string) =>
-    request<{ ok: boolean }>(`/api/strategies/${id}`, { method: 'DELETE' }),
+  transferStatus: () => request<TransferSnapshot>('/api/transfers'),
 
   // ---- 文件（明文路径） ----
   listFiles: (ds: string, path: string) =>
@@ -175,13 +187,14 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ path, name }),
     }),
-
-  // ---- 根密钥备份 ----
-  vaultImport: (data: string) =>
-    request<{ ok: boolean; added: number }>('/api/vault/import', {
-      method: 'POST',
-      body: data,
-    }),
+  fileCacheStatus: (ds: string, path: string) =>
+    request<FileCacheStatus>(`/api/files/${ds}/cache?path=${encodeURIComponent(path)}`),
+  clearFileCache: (ds: string, path: string) =>
+    request<{ ok: boolean; freed: number }>(
+      `/api/files/${ds}/cache?path=${encodeURIComponent(path)}`, { method: 'DELETE' }),
+  warmFileCache: (ds: string, path: string) =>
+    request<{ ok: boolean; complete: boolean }>(
+      `/api/files/${ds}/cache?path=${encodeURIComponent(path)}`, { method: 'POST' }),
 
   // ---- 上传双维度进度（encrypted = 本地已加密，uploaded = 远端已确认） ----
   uploadProgress: (id: string) =>

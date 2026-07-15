@@ -9,7 +9,7 @@ mod registry;
 mod routes;
 mod settings;
 mod state;
-mod strategies;
+mod transfer;
 mod vault;
 
 use clap::Parser;
@@ -23,7 +23,7 @@ struct Cli {
     /// 监听地址
     #[arg(long, default_value = "127.0.0.1:5266")]
     bind: String,
-    /// 数据目录（数据源注册表、策略、密码本），默认 ~/.safedrive
+    /// 数据目录（数据源注册表、缓存与设置），默认 ~/.safedrive
     #[arg(long)]
     data_dir: Option<std::path::PathBuf>,
     /// 管理密码；不设置则免登录（仅建议本机使用）
@@ -34,9 +34,11 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let data_dir = cli
-        .data_dir
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| ".".into()).join(".safedrive"));
+    let data_dir = cli.data_dir.unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| ".".into())
+            .join(".safedrive")
+    });
     std::fs::create_dir_all(&data_dir)?;
 
     // 日志双写：stdout + <data_dir>/logs/safedrive.log.YYYY-MM-DD（按天滚动）。
@@ -53,11 +55,17 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "safedrive=info,tower_http=warn".into()),
         )
         .with(tracing_subscriber::fmt::layer())
-        .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(file_writer))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(file_writer),
+        )
         .init();
 
     if cli.admin_password.is_none() {
-        tracing::warn!("未设置 --admin-password / SAFEDRIVE_ADMIN_PASSWORD，API 免登录（仅建议本机使用）");
+        tracing::warn!(
+            "未设置 --admin-password / SAFEDRIVE_ADMIN_PASSWORD，API 免登录（仅建议本机使用）"
+        );
     }
 
     let state = state::AppState::new(data_dir, cli.admin_password)?;

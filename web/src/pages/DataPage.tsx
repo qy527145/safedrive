@@ -1,51 +1,42 @@
 import { DatabaseOutlined, FolderOpenOutlined } from '@ant-design/icons';
-import { App, Button, Card, Col, Empty, Row, Tag, Typography } from 'antd';
-import { useEffect, useState } from 'react';
+import { App, Button, Card, Col, Empty, Row, Skeleton, Tag, Typography } from 'antd';
+import { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, type Strategy } from '../api/client';
 import { useSources } from '../stores/sources';
 
 /** 数据管理首页：数据源入口卡片。 */
 export default function DataPage() {
   const { message } = App.useApp();
   const sources = useSources();
-  const [strategies, setStrategies] = useState<Strategy[]>([]);
   const navigate = useNavigate();
 
   useEffect(() => {
     void sources.refresh().catch((e: unknown) => message.error(String(e)));
-    void api.listStrategies().then(setStrategies).catch(() => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  if (sources.loaded && sources.list.length === 0) {
+  if (!sources.loaded) return <><PageHeading /><Row gutter={[16,16]}>{[0,1,2].map((key) => <Col key={key} xs={24} sm={12} lg={8}><Card><Skeleton active avatar paragraph={{rows:2}} /></Card></Col>)}</Row></>;
+  if (sources.list.length === 0) {
     return (
-      <Empty description="还没有数据源">
+      <><PageHeading /><Card><Empty description="还没有数据源">
         <Button type="primary" onClick={() => navigate('/sources')}>
           去添加数据源
         </Button>
-      </Empty>
+      </Empty></Card></>
     );
   }
 
   return (
-    <Row gutter={[16, 16]}>
+    <><PageHeading /><Row gutter={[18, 18]}>
       {sources.list.map((d) => {
-        const strategy = strategies.find((s) => s.id === d.strategyId);
         return (
           <Col key={d.id} xs={24} sm={12} lg={8} xl={6}>
-            <Card
+            <Card className="source-card"
               hoverable
-              onClick={() => {
-                if (!strategy) {
-                  message.error('该数据源绑定的策略已不存在，请先在「数据源管理」重新绑定');
-                  return;
-                }
-                navigate(`/browse/${d.id}`);
-              }}
+              onClick={() => navigate(`/browse/${d.id}`)}
             >
               <Card.Meta
-                avatar={<DatabaseOutlined style={{ fontSize: 28, color: '#2f54eb' }} />}
+                avatar={<span className="source-icon"><DatabaseOutlined /></span>}
                 title={d.name}
                 description={
                   <>
@@ -57,14 +48,13 @@ export default function DataPage() {
                       ) : (
                         <Tag color="cyan">WebDAV</Tag>
                       )}
-                      {strategy ? (
-                        <Tag color="purple">{strategy.name}</Tag>
-                      ) : (
-                        <Tag color="error">策略缺失</Tag>
-                      )}
+                      <Tag color={d.encryptionEnabled ? 'green' : 'default'}>
+                        {d.encryptionEnabled ? '已加密' : '未加密'}
+                      </Tag>
+                      <Tag>{d.volumeEnabled ? '已分卷' : '不分卷'}</Tag>
                     </div>
                     <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                      <FolderOpenOutlined /> 点击进入加密文件浏览器
+                      <FolderOpenOutlined /> 点击进入文件浏览器
                     </Typography.Text>
                   </>
                 }
@@ -73,6 +63,11 @@ export default function DataPage() {
           </Col>
         );
       })}
-    </Row>
+    </Row></>
   );
+}
+
+function PageHeading() {
+  return <div className="page-heading"><div><span className="page-kicker">STORAGE MATRIX</span>
+    <h1>数据空间</h1><p>从一个统一入口访问本地、WebDAV 与网盘中的受保护数据。</p></div></div>;
 }

@@ -1,7 +1,6 @@
 //! 纯内存路径缓存：明文路径 → (nc, secret, dir)。
 //!
-//! v5.1 起没有任何本地密钥文件 —— 信封链根密钥由**策略根密码**派生
-//! （strategies.json 即唯一秘密），其余密钥全部藏在云端加密名里。
+//! 信封链根密钥由数据源根密码派生，其余密钥全部藏在云端加密名里。
 //! 本缓存只是免去每次请求从根 list+解名下钻的性能设施：不落盘、
 //! 可随时重建、不一致时以云端为准（resolve 叶子现场核实）。
 
@@ -47,7 +46,7 @@ impl PathCache {
         inner.retain(|k, _| *k != exact && !k.starts_with(&prefix));
     }
 
-    /// 数据源删除/换绑策略后清空其全部缓存。
+    /// 数据源删除或更改根配置后清空其全部缓存。
     pub fn evict_datasource(&self, ds: &str) {
         let mut inner = self.inner.write().unwrap();
         let prefix = format!("{ds}:");
@@ -63,7 +62,11 @@ mod tests {
     #[test]
     fn cache_ops_and_eviction() {
         let c = PathCache::default();
-        let n = |nc: &str, d: bool| CachedNode { secret: gen_secret(), nc: nc.into(), dir: d };
+        let n = |nc: &str, d: bool| CachedNode {
+            secret: gen_secret(),
+            nc: nc.into(),
+            dir: d,
+        };
 
         c.put("ds", "a", n("N1", true));
         c.put("ds", "a/b", n("N2", false));

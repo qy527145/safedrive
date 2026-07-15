@@ -47,7 +47,13 @@ impl WebdavFs {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        Ok(Self { base, base_path, username, password, http })
+        Ok(Self {
+            base,
+            base_path,
+            username,
+            password,
+            http,
+        })
     }
 
     fn url_for(&self, rel: &str) -> String {
@@ -87,13 +93,17 @@ impl WebdavFs {
         } else {
             body.chars().take(4096).collect()
         };
-        tracing::error!("WebDAV {what}失败: {status} url={url} 响应头: {headers} 原始响应: {body_log}");
+        tracing::error!(
+            "WebDAV {what}失败: {status} url={url} 响应头: {headers} 原始响应: {body_log}"
+        );
         let snippet: String = if body.trim().is_empty() {
             "(空响应体，详见日志文件)".to_string()
         } else {
             body.chars().take(200).collect()
         };
-        Err(ApiError::Upstream(format!("{what} 失败 ({status}): {snippet}")))
+        Err(ApiError::Upstream(format!(
+            "{what} 失败 ({status}): {snippet}"
+        )))
     }
 }
 
@@ -136,7 +146,12 @@ impl Storage for WebdavFs {
             if name.is_empty() {
                 continue;
             }
-            entries.push(Entry { name, is_dir: item.is_dir, size: item.size, mtime: item.mtime });
+            entries.push(Entry {
+                name,
+                is_dir: item.is_dir,
+                size: item.size,
+                mtime: item.mtime,
+            });
         }
         Ok(entries)
     }
@@ -188,10 +203,7 @@ impl Storage for WebdavFs {
             .map_err(|e| ApiError::Upstream(format!("GET 请求失败: {e}")))?;
         let resp = Self::expect_ok(resp, "下载对象").await?;
         let size = resp.content_length();
-        let stream = resp
-            .bytes_stream()
-            .map_err(std::io::Error::other)
-            .boxed();
+        let stream = resp.bytes_stream().map_err(std::io::Error::other).boxed();
         Ok((size, stream))
     }
 
@@ -237,13 +249,18 @@ struct DavItem {
 
 /// 去掉首尾斜杠、连续斜杠，统一比较形态。
 fn normalize_path(p: &str) -> String {
-    p.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("/")
+    p.split('/')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// href 可能是绝对 URL 或绝对路径，统一取 percent-decode 后的路径。
 fn href_to_path(href: &str) -> String {
     let raw = if href.starts_with("http://") || href.starts_with("https://") {
-        reqwest::Url::parse(href).map(|u| u.path().to_string()).unwrap_or_else(|_| href.to_string())
+        reqwest::Url::parse(href)
+            .map(|u| u.path().to_string())
+            .unwrap_or_else(|_| href.to_string())
     } else {
         href.to_string()
     };
@@ -270,7 +287,12 @@ fn parse_multistatus(xml: &str) -> Result<Vec<DavItem>, quick_xml::Error> {
                 let name = local.as_ref();
                 match name {
                     b"response" => {
-                        cur = Some(DavItem { path: String::new(), is_dir: false, size: 0, mtime: 0 });
+                        cur = Some(DavItem {
+                            path: String::new(),
+                            is_dir: false,
+                            size: 0,
+                            mtime: 0,
+                        });
                     }
                     b"href" => text_target = Some("href"),
                     b"getcontentlength" => text_target = Some("size"),

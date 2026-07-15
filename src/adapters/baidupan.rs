@@ -90,7 +90,16 @@ fn upload_slots_for(key: u64, threads: usize) -> Arc<tokio::sync::Semaphore> {
     Arc::clone(&entry.1)
 }
 
-pub type TokenPersister = Arc<dyn Fn(&str, &str) -> ApiResult<()> + Send + Sync>;
+pub type TokenPersister = Arc<dyn Fn(&str, &str, u64) -> ApiResult<()> + Send + Sync>;
+
+const TOKEN_REFRESH_SKEW_SECS: u64 = 60;
+const DEFAULT_ACCESS_TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
+fn unix_time_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
 
 #[derive(Clone)]
 struct CachedLinks {
@@ -101,7 +110,7 @@ struct CachedLinks {
 struct OAuthTokens {
     access_token: String,
     refresh_token: String,
-    expires_at: Option<Instant>,
+    access_expires_at: Option<u64>,
 }
 
 struct TempUpload {
@@ -267,7 +276,9 @@ impl BaiduPanFs {
                     .unwrap_or("")
                     .trim()
                     .to_owned(),
-                expires_at: None,
+                access_expires_at: config
+                    .get("accessTokenExpiresAt")
+                    .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok())),
             }),
             persist_tokens,
             download_cookie,
@@ -310,15 +321,12 @@ impl BaiduPanFs {
         let url = log_url(resp.url());
         // 失败时响应体可能为空（如 superfile2 偶发 500），响应头是仅剩线索
         let headers = super::log_headers(resp.headers());
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    "百度网盘{what}读取响应失败: HTTP {status} 请求: {url} 响应头: {headers} err: {e}"
-                );
-                ApiError::Upstream(format!("读取百度网盘{what}响应失败: {e}"))
-            })?;
+        let text = resp.text().await.map_err(|e| {
+            tracing::error!(
+                "百度网盘{what}读取响应失败: HTTP {status} 请求: {url} 响应头: {headers} err: {e}"
+            );
+            ApiError::Upstream(format!("读取百度网盘{what}响应失败: {e}"))
+        })?;
         if !status.is_success() {
             tracing::error!(
                 "百度网盘{what}失败: HTTP {status} 请求: {url} 响应头: {headers} 原始响应: {}",
@@ -372,12 +380,13 @@ impl BaiduPanFs {
     }
 
     async fn access_token(&self) -> ApiResult<String> {
+        let refresh_before = unix_time_secs().saturating_add(TOKEN_REFRESH_SKEW_SECS);
         let needs_refresh = {
             let tokens = self.tokens.lock().await;
             tokens.access_token.is_empty()
                 || tokens
-                    .expires_at
-                    .is_some_and(|expires| expires <= Instant::now())
+                    .access_expires_at
+                    .is_none_or(|expires| expires <= refresh_before)
         };
         if needs_refresh {
             self.refresh_access_token(None).await
@@ -394,6 +403,7 @@ impl BaiduPanFs {
         {
             return Ok(tokens.access_token.clone());
         }
+        let now = unix_time_secs();
         let value = if tokens.refresh_token.is_empty() {
             let mut code_url = self.oauth_device_code_api.clone();
             code_url
@@ -510,7 +520,11 @@ impl BaiduPanFs {
             // 失败响应只含 error/error_description，无凭据，可整体落日志
             tracing::error!(
                 "百度 OAuth 令牌请求被拒: grant_type={} 原始响应: {}",
-                if tokens.refresh_token.is_empty() { "device_token" } else { "refresh_token" },
+                if tokens.refresh_token.is_empty() {
+                    "device_token"
+                } else {
+                    "refresh_token"
+                },
                 truncate_chars(&value.to_string(), LOG_BODY_MAX),
             );
             return Err(ApiError::Upstream(format!(
@@ -529,19 +543,19 @@ impl BaiduPanFs {
             .filter(|s| !s.is_empty())
             .unwrap_or(&tokens.refresh_token)
             .to_owned();
-        if let Some(persist) = &self.persist_tokens {
-            persist(&access, &refresh)?;
-        }
-        let expires = value
+        let access_ttl = value
             .get("expires_in")
             .and_then(Value::as_u64)
-            .unwrap_or(30 * 24 * 60 * 60)
-            .saturating_sub(60);
+            .unwrap_or(DEFAULT_ACCESS_TOKEN_TTL_SECS);
+        let access_expires_at = now.saturating_add(access_ttl);
+        if let Some(persist) = &self.persist_tokens {
+            persist(&access, &refresh, access_expires_at)?;
+        }
         tokens.access_token = access.clone();
         tokens.refresh_token = refresh;
-        tokens.expires_at = Some(Instant::now() + Duration::from_secs(expires));
+        tokens.access_expires_at = Some(access_expires_at);
         tracing::info!(
-            "百度开放平台 access_token 已更新: {} (有效期 {expires}s)",
+            "百度开放平台令牌已更新: {} (有效期 {access_ttl}s)",
             mask_secret(&access),
         );
         Ok(access)
@@ -593,8 +607,11 @@ impl BaiduPanFs {
                         query_log(),
                         form_log(),
                     );
-                    last_err = Some(ApiError::Upstream(format!("百度网盘{what}请求失败: {masked}")));
-                    tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS * attempt as u64)).await;
+                    last_err = Some(ApiError::Upstream(format!(
+                        "百度网盘{what}请求失败: {masked}"
+                    )));
+                    tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS * attempt as u64))
+                        .await;
                     continue;
                 }
             };
@@ -611,7 +628,8 @@ impl BaiduPanFs {
                         return Err(e);
                     }
                     last_err = Some(e);
-                    tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS * attempt as u64)).await;
+                    tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS * attempt as u64))
+                        .await;
                     continue;
                 }
             };
@@ -631,8 +649,7 @@ impl BaiduPanFs {
             }
             return Ok(value);
         }
-        Err(last_err
-            .unwrap_or_else(|| ApiError::Upstream(format!("百度网盘{what}失败: 重试耗尽"))))
+        Err(last_err.unwrap_or_else(|| ApiError::Upstream(format!("百度网盘{what}失败: 重试耗尽"))))
     }
 
     async fn locatedownload(&self, remote_path: &str) -> ApiResult<Vec<String>> {
@@ -866,7 +883,14 @@ impl BaiduPanFs {
             return cached;
         }
         let vip = match self
-            .xpan_request(Method::GET, "xpan/nas", &[("method", "uinfo".into())], None, "查询账号信息", &[])
+            .xpan_request(
+                Method::GET,
+                "xpan/nas",
+                &[("method", "uinfo".into())],
+                None,
+                "查询账号信息",
+                &[],
+            )
             .await
         {
             Ok(value) => value.get("vip_type").and_then(Value::as_i64).unwrap_or(0),
@@ -919,9 +943,12 @@ impl BaiduPanFs {
             pick("servers").or_else(|| pick("bak_servers"))
         }
         .await;
-        match server
-            .and_then(|server| Url::parse(&server).ok()?.join("/rest/2.0/pcs/superfile2").ok())
-        {
+        match server.and_then(|server| {
+            Url::parse(&server)
+                .ok()?
+                .join("/rest/2.0/pcs/superfile2")
+                .ok()
+        }) {
             Some(url) => {
                 tracing::info!(
                     "百度网盘 locateupload 选定上传域名: {}",
@@ -968,7 +995,10 @@ impl BaiduPanFs {
             .send()
             .await
             .map_err(|e| {
-                ApiError::Upstream(format!("百度网盘上传第 {part_seq} 块失败: {}", mask_err(&e)))
+                ApiError::Upstream(format!(
+                    "百度网盘上传第 {part_seq} 块失败: {}",
+                    mask_err(&e)
+                ))
             })?;
         Self::response_json(resp, "上传文件块").await
     }
@@ -989,11 +1019,20 @@ impl BaiduPanFs {
         for attempt in 1..=3usize {
             let result = {
                 // 账号级并发槽：限制同账号跨文件/跨分卷的 superfile2 总并发
-                let _permit = self.upload_slots.acquire().await.map_err(|_| {
-                    ApiError::Internal(anyhow::anyhow!("上传并发槽已关闭"))
-                })?;
-                self.upload_block_once(upload_url, remote, upload_id, part_seq, block.clone(), &token)
+                let _permit = self
+                    .upload_slots
+                    .acquire()
                     .await
+                    .map_err(|_| ApiError::Internal(anyhow::anyhow!("上传并发槽已关闭")))?;
+                self.upload_block_once(
+                    upload_url,
+                    remote,
+                    upload_id,
+                    part_seq,
+                    block.clone(),
+                    &token,
+                )
+                .await
             };
             let value = match result {
                 Ok(value) => value,
@@ -1002,7 +1041,8 @@ impl BaiduPanFs {
                         "百度网盘上传分块第 {attempt}/3 次失败: path={remote} uploadid={upload_id} partseq={part_seq} len={block_len} err: {e}"
                     );
                     last_err = Some(e);
-                    tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS * attempt as u64)).await;
+                    tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS * attempt as u64))
+                        .await;
                     continue;
                 }
             };
@@ -1096,7 +1136,10 @@ impl BaiduPanFs {
                         "百度网盘分卷上传第 {attempt}/3 次失败，稍后整卷重试: path={remote} err: {e}"
                     );
                     last_err = Some(e);
-                    tokio::time::sleep(Duration::from_millis(VOLUME_RETRY_BACKOFF_MS * attempt as u64)).await;
+                    tokio::time::sleep(Duration::from_millis(
+                        VOLUME_RETRY_BACKOFF_MS * attempt as u64,
+                    ))
+                    .await;
                 }
                 Err(e) => return Err(e),
             }
@@ -1194,8 +1237,7 @@ impl BaiduPanFs {
                             "百度返回非法上传分片序号: {part_seq}"
                         )));
                     }
-                    let block =
-                        Self::read_upload_block(&path, part_seq, size, slice_size).await?;
+                    let block = Self::read_upload_block(&path, part_seq, size, slice_size).await?;
                     let len = block.len() as u64;
                     self.upload_block(&upload_url, &remote, &upload_id, part_seq, block)
                         .await?;
@@ -1590,7 +1632,10 @@ mod tests {
     fn mask_credentials_hides_all_secret_query_values() {
         let raw = "error sending request for url (https://pan.baidu.com/rest/2.0/xpan/file?access_token=126.a7b45358db9a19f7022eec804c56a140.YGiVySf2.i0ZBMw&openapi=xpansdk&method=create)";
         let masked = mask_credentials(raw);
-        assert!(!masked.contains("a7b45358db9a19f7022eec804c56a140"), "{masked}");
+        assert!(
+            !masked.contains("a7b45358db9a19f7022eec804c56a140"),
+            "{masked}"
+        );
         assert!(
             masked.contains("access_token=126.a7b4…i0ZBMw(已脱敏"),
             "首尾保留便于辨认 token: {masked}"
@@ -1601,6 +1646,20 @@ mod tests {
         assert!(!masked.contains("verysecretvalue"), "{masked}");
         assert!(!masked.contains("secret-device-code"), "{masked}");
         assert!(masked.contains("client_id=abc"), "{masked}");
+    }
+
+    #[tokio::test]
+    async fn persisted_access_token_expiry_survives_restart() {
+        let mut value = config("http://127.0.0.1:1");
+        let object = value.as_object_mut().unwrap();
+        object.insert("accessToken".into(), "persisted-access".into());
+        object.insert("refreshToken".into(), "persisted-refresh".into());
+        object.insert(
+            "accessTokenExpiresAt".into(),
+            (unix_time_secs() + 3600).into(),
+        );
+        let fs = BaiduPanFs::from_config_with_persister(&value, Client::new(), None).unwrap();
+        assert_eq!(fs.access_token().await.unwrap(), "persisted-access");
     }
 
     #[test]
@@ -1880,10 +1939,7 @@ mod tests {
         );
         assert_eq!(query.get("appid").map(String::as_str), Some("250528"));
         assert_eq!(query.get("uploadid").map(String::as_str), Some("upload-1"));
-        assert_eq!(
-            query.get("upload_version").map(String::as_str),
-            Some("2.0")
-        );
+        assert_eq!(query.get("upload_version").map(String::as_str), Some("2.0"));
         // 返回 mock 自身作为动态上传域名 → superfile2 仍落回本 mock
         Json(json!({"servers": [{"server": state.upload_server}]}))
     }
@@ -1953,8 +2009,9 @@ mod tests {
 
         let persisted = Arc::new(StdMutex::new(None));
         let persisted_for_callback = Arc::clone(&persisted);
-        let persister: TokenPersister = Arc::new(move |access, refresh| {
-            *persisted_for_callback.lock().unwrap() = Some((access.to_owned(), refresh.to_owned()));
+        let persister: TokenPersister = Arc::new(move |access, refresh, access_expires| {
+            *persisted_for_callback.lock().unwrap() =
+                Some((access.to_owned(), refresh.to_owned(), access_expires));
             Ok(())
         });
         let fs =
@@ -1963,20 +2020,24 @@ mod tests {
         let entries = fs.list("").await.unwrap();
         assert_eq!(entries[0].name, "cipher-dir");
         assert_eq!(entries[0].mtime, 123_000);
+        let first = persisted.lock().unwrap().clone().unwrap();
         assert_eq!(
-            *persisted.lock().unwrap(),
-            Some(("fresh-token".into(), "refresh-new".into()))
+            (&first.0, &first.1),
+            (&"fresh-token".to_string(), &"refresh-new".to_string())
         );
+        assert!(first.2 >= unix_time_secs() + 3599);
         {
             let mut tokens = fs.tokens.lock().await;
             tokens.access_token = "expired-token".into();
-            tokens.expires_at = None;
+            tokens.access_expires_at = None;
         }
         fs.list("").await.unwrap();
+        let second = persisted.lock().unwrap().clone().unwrap();
         assert_eq!(
-            *persisted.lock().unwrap(),
-            Some(("renewed-token".into(), "refresh-new-2".into()))
+            (&second.0, &second.1),
+            (&"renewed-token".to_string(), &"refresh-new-2".to_string())
         );
+        assert!(second.2 >= unix_time_secs() + 3599);
         fs.mkdir("new").await.unwrap();
         fs.rename("new", "renamed").await.unwrap();
         fs.delete("renamed").await.unwrap();

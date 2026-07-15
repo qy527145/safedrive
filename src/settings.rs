@@ -1,5 +1,5 @@
 //! 全局传输设置：下载分片大小 / 总并发 / 单分卷并发。
-//! 与策略解耦 —— 这些是服务器资源参数，不随数据映射方式变化。
+//! 服务器级资源参数，不随单个数据源的映射方式变化。
 
 use std::path::PathBuf;
 use std::sync::RwLock;
@@ -61,9 +61,10 @@ where
     use serde::de::Error;
     match serde_json::Value::deserialize(deserializer)? {
         serde_json::Value::Null => Ok(None),
-        serde_json::Value::Number(n) => {
-            n.as_u64().map(Some).ok_or_else(|| Error::custom("非法数字"))
-        }
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| Error::custom("非法数字")),
         serde_json::Value::String(s) => parse_size(&s).map(Some).map_err(Error::custom),
         _ => Err(Error::custom("大小需为数字、字符串（如 300M）或 null")),
     }
@@ -134,7 +135,10 @@ impl SettingsStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::default(),
             Err(e) => return Err(e.into()),
         };
-        Ok(Self { path, inner: RwLock::new(settings) })
+        Ok(Self {
+            path,
+            inner: RwLock::new(settings),
+        })
     }
 
     pub fn get(&self) -> Settings {
@@ -145,7 +149,10 @@ impl SettingsStore {
         s.validate()?;
         let mut guard = self.inner.write().unwrap();
         *guard = s.clone();
-        let file = SettingsFile { version: 1, settings: s.clone() };
+        let file = SettingsFile {
+            version: 1,
+            settings: s.clone(),
+        };
         let data = serde_json::to_vec_pretty(&file).map_err(|e| anyhow::anyhow!(e))?;
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, &data)?;
@@ -162,7 +169,10 @@ mod tests {
     fn parse_size_units() {
         assert_eq!(parse_size("300M").unwrap(), 300 * 1024 * 1024);
         assert_eq!(parse_size("300 MB").unwrap(), 300 * 1024 * 1024);
-        assert_eq!(parse_size("1.5G").unwrap(), (1.5 * 1024.0 * 1024.0 * 1024.0) as u64);
+        assert_eq!(
+            parse_size("1.5G").unwrap(),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
         assert_eq!(parse_size("512k").unwrap(), 512 * 1024);
         assert_eq!(parse_size("64KB").unwrap(), 64 * 1024);
         assert_eq!(parse_size("1048576").unwrap(), 1048576);
@@ -175,10 +185,8 @@ mod tests {
 
     #[test]
     fn settings_accepts_string_sizes() {
-        let s: Settings = serde_json::from_str(
-            r#"{"maxSplit":"5M","maxThreads":16,"maxPerVolume":4}"#,
-        )
-        .unwrap();
+        let s: Settings =
+            serde_json::from_str(r#"{"maxSplit":"5M","maxThreads":16,"maxPerVolume":4}"#).unwrap();
         assert_eq!(s.max_split, 5 * 1024 * 1024);
         assert!(s.cache_enabled, "旧配置缺省时缓存默认开启");
     }

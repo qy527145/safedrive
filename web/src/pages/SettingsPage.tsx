@@ -1,7 +1,6 @@
-import { DownloadOutlined, ImportOutlined } from '@ant-design/icons';
-import { App, Button, Card, Checkbox, Form, Input, InputNumber, Space, Statistic, Typography, Upload } from 'antd';
+import { App, Button, Card, Checkbox, Form, Input, InputNumber, Space, Statistic, Typography } from 'antd';
 import { useEffect, useState } from 'react';
-import { api, getToken, type CacheStats, type TransferSettings } from '../api/client';
+import { api, type CacheStats, type TransferSettings } from '../api/client';
 import { formatBytes, parseSize, sizeToInput } from '../utils/format';
 
 /** 设置：全局传输参数 + 数据源根密钥的备份导出 / 导入合并。 */
@@ -44,32 +43,13 @@ export default function SettingsPage() {
     }
   };
 
-  const exportVault = async () => {
-    // 带上 token 走同源下载（服务端返回 attachment）
-    const resp = await fetch('/api/vault/export', {
-      headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {},
-    });
-    if (!resp.ok) {
-      message.error(`导出失败 (${resp.status})`);
-      return;
-    }
-    const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    const d = new Date();
-    const stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
-    a.href = url;
-    a.download = `safedrive-strategies-${stamp}.json`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 10_000);
-    message.success('已导出。注意：该文件含明文根密码，请妥善保管！');
-  };
-
-  return (
-    <Space direction="vertical" size="large" style={{ width: '100%', maxWidth: 720 }}>
+  return (<>
+    <div className="page-heading"><div><span className="page-kicker">SYSTEM CONTROL</span><h1>系统设置</h1>
+      <p>调整传输并发、缓存策略与服务端数据处理行为。</p></div></div>
+    <Space className="settings-grid" direction="vertical" size="large">
       <Card title="传输设置">
         <Typography.Paragraph type="secondary">
-          全局下载参数（对所有数据源生效）；上传分卷大小属于各映射策略。
+          全局下载并发参数对所有数据源生效；加密、分卷和数据源级缓存请在“数据源管理”中配置。
         </Typography.Paragraph>
         <Form form={form} layout="vertical" name="transfer" style={{ maxWidth: 420 }}>
           <Form.Item
@@ -146,47 +126,13 @@ export default function SettingsPage() {
         </Typography.Paragraph>
       </Card>
 
-      <Card title="策略备份（含根密码）">
-        <Typography.Paragraph type="secondary">
-          根密码在策略中（服务端 strategies.json）；各文件/目录的密钥加密后
-          藏在云端文件名里，云端数据 + 根密码即可完整恢复。
-          <Typography.Text strong type="danger">
-            根密码丢失 = 该策略下云端数据永久无法解密
-          </Typography.Text>
-          。创建策略后请立即导出备份（文件为明文，请妥善保管）。
-        </Typography.Paragraph>
-        <Space>
-          <Button type="primary" icon={<DownloadOutlined />} onClick={() => void exportVault()}>
-            导出策略备份
-          </Button>
-          <Upload
-            accept=".json"
-            showUploadList={false}
-            beforeUpload={async (file) => {
-              try {
-                const text = await file.text();
-                JSON.parse(text); // 只做基本格式校验，结构由服务端验证
-                const r = await api.vaultImport(text);
-                message.success(`导入合并完成，新增 ${r.added} 条（冲突保留本地）`);
-              } catch (e) {
-                message.error(e instanceof Error ? e.message : '不是有效的密码本文件');
-              }
-              return false;
-            }}
-          >
-            <Button icon={<ImportOutlined />}>导入并合并</Button>
-          </Upload>
-        </Space>
-      </Card>
-
       <Card title="加密方案">
         <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
           信封链（cryptree）：每个文件/目录持独立随机密钥，加密后藏在自身的
-          云端名称里，由父目录密钥解开，层层下钻。文件在云端是一个加密名文件夹 +
+          云端名称里，由父目录密钥解开，层层下钻。启用加密时文件在云端是一个加密名文件夹 +
           若干密文分卷（ChaCha20，密文长=明文长，任意偏移可寻址）。加解密全部在
           服务端完成，云端始终只见密文；分享一个目录只需交出该目录的密钥。
         </Typography.Paragraph>
       </Card>
-    </Space>
-  );
+    </Space></>);
 }

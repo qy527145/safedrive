@@ -16,7 +16,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const BASE = 'http://127.0.0.1:52670';
 const DAV_PORT = 52671;
-const BIN = join(dirname(fileURLToPath(import.meta.url)), '../../../target/release/safedrive');
+const BIN = process.env.SAFEDRIVE_BIN ?? join(dirname(fileURLToPath(import.meta.url)), '../../../target/release/safedrive');
 
 let server: ChildProcess;
 let davServer: { start: (cb: () => void) => void; stop: (cb: () => void) => void };
@@ -49,7 +49,7 @@ function testData(n: number): Uint8Array {
   return out;
 }
 
-describe.skipIf(!process.env.E2E)('WebDAV 适配器：真实服务加密全流程', () => {
+describe.skipIf(!process.env.E2E && process.env.npm_lifecycle_event !== 'test:e2e')('WebDAV 适配器：真实服务加密全流程', () => {
   beforeAll(async () => {
     davRoot = mkdtempSync(join(tmpdir(), 'sd-dav-'));
     dataDir = mkdtempSync(join(tmpdir(), 'sd-data2-'));
@@ -81,11 +81,6 @@ describe.skipIf(!process.env.E2E)('WebDAV 适配器：真实服务加密全流�
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ maxSplit: 64 * 1024, maxThreads: 6, maxPerVolume: 2 }),
     });
-    const strategy = await apiJson<{ id: string }>('/api/strategies', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'e2e-dav', volumeSize: 128 * 1024 }),
-    });
     const ds = await apiJson<{ id: string }>('/api/ds', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -93,7 +88,13 @@ describe.skipIf(!process.env.E2E)('WebDAV 适配器：真实服务加密全流�
         name: 'e2e-dav',
         type: 'webdav',
         config: { url: `http://127.0.0.1:${DAV_PORT}`, username: '', password: '' },
-        strategyId: strategy.id,
+        encryptionEnabled: true,
+        password: 'e2e-password',
+        volumeEnabled: true,
+        volumeSize: 128 * 1024,
+        volumeStrategy: 'fixed',
+        volumeNameFormat: '{s}_{i}.bin',
+        cacheEnabled: true,
       }),
     });
     dsId = ds.id;

@@ -21,11 +21,12 @@ export default function LoginPage() {
   };
 
   return (
-    <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f0f2f5' }}>
-      <Card style={{ width: 380 }}>
-        <Typography.Title level={4}>🔐 SafeDrive · 服务端登录</Typography.Title>
+    <div className="login-shell">
+      <Card className="login-card">
+        <span className="page-kicker">SECURE CONSOLE</span>
+        <Typography.Title level={3} style={{marginTop:8}}>SafeDrive</Typography.Title>
         <Typography.Paragraph type="secondary">
-          此密码仅用于访问服务端 API，与密码本主密码无关。
+          输入管理密码以进入零信任存储控制台。
         </Typography.Paragraph>
         {error && <Alert type="error" message={error} style={{ marginBottom: 16 }} />}
         <Form onFinish={onFinish}>

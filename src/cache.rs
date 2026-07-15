@@ -75,6 +75,15 @@ pub struct CacheStats {
     pub misses: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileCacheStatus {
+    pub cached: bool,
+    pub bytes_cached: u64,
+    pub total_size: u64,
+    pub complete: bool,
+}
+
 pub struct CacheEntry {
     root: PathBuf,
     meta: CacheMeta,
@@ -198,11 +207,14 @@ impl CacheStore {
     }
 
     pub fn key(datasource: &str, encrypted_path: &str) -> String {
+        let mut datasource_hash = Sha256::new();
+        datasource_hash.update(datasource.as_bytes());
+        let prefix = hex::encode(&datasource_hash.finalize()[..8]);
         let mut hash = Sha256::new();
         hash.update(datasource.as_bytes());
         hash.update([0]);
         hash.update(encrypted_path.as_bytes());
-        hex::encode(&hash.finalize()[..16])
+        format!("{prefix}-{}", hex::encode(&hash.finalize()[..16]))
     }
 
     pub fn open(&self, key: &str, total_size: u64) -> ApiResult<Arc<CacheEntry>> {
@@ -308,6 +320,80 @@ impl CacheStore {
         stats
     }
 
+    pub fn status(&self, key: &str) -> FileCacheStatus {
+        if let Some(entry) = self.entries.read().unwrap().get(key) {
+            let bytes = entry.bytes_cached.load(Ordering::Relaxed);
+            return FileCacheStatus {
+                cached: bytes > 0,
+                bytes_cached: bytes,
+                total_size: entry.meta.total_size,
+                complete: bytes == entry.meta.total_size,
+            };
+        }
+        let root = self.root.join(key);
+        let meta = std::fs::read(root.join("meta.json"))
+            .ok()
+            .and_then(|v| serde_json::from_slice::<CacheMeta>(&v).ok());
+        let bitmap = std::fs::read(root.join("bitmap.bin")).ok();
+        match (meta, bitmap) {
+            (Some(meta), Some(bitmap)) => {
+                let bytes = bytes_from_bitmap(&meta, &bitmap);
+                FileCacheStatus {
+                    cached: bytes > 0,
+                    bytes_cached: bytes,
+                    total_size: meta.total_size,
+                    complete: bytes == meta.total_size,
+                }
+            }
+            _ => FileCacheStatus {
+                cached: false,
+                bytes_cached: 0,
+                total_size: 0,
+                complete: false,
+            },
+        }
+    }
+
+    pub fn clear(&self, key: &str) -> ApiResult<u64> {
+        let bytes = self.status(key).bytes_cached;
+        self.entries.write().unwrap().remove(key);
+        let root = self.root.join(key);
+        if root.exists() {
+            std::fs::remove_dir_all(root)?;
+        }
+        Ok(bytes)
+    }
+
+    pub fn clear_datasource(&self, datasource: &str) -> ApiResult<u64> {
+        let probe = Self::key(datasource, "");
+        let prefix = probe
+            .split_once('-')
+            .map(|(prefix, _)| format!("{prefix}-"))
+            .expect("缓存键始终包含数据源前缀");
+        let loaded: Vec<String> = self
+            .entries
+            .read()
+            .unwrap()
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        let mut freed = 0;
+        for key in loaded {
+            freed += self.clear(&key)?;
+        }
+        if let Ok(children) = std::fs::read_dir(&self.root) {
+            for child in children.flatten() {
+                let name = child.file_name().to_string_lossy().into_owned();
+                if name.starts_with(&prefix) && child.path().is_dir() {
+                    freed += self.status(&name).bytes_cached;
+                    std::fs::remove_dir_all(child.path())?;
+                }
+            }
+        }
+        Ok(freed)
+    }
+
     pub fn clear_all(&self) -> ApiResult<u64> {
         let bytes = self.stats().bytes_cached;
         self.entries.write().unwrap().clear();
@@ -405,6 +491,27 @@ mod tests {
         assert_ne!(key, CacheStore::key("datasource-2", "encrypted/folder"));
         assert_ne!(key, CacheStore::key("datasource-1", "encrypted/other"));
         // 下载直链不参与 API，也不进入 key；直链刷新不会改变服务器侧缓存身份。
-        assert_eq!(key.len(), 32);
+        assert_eq!(key.len(), 49);
+    }
+
+    #[test]
+    fn datasource_cache_can_be_cleared_without_touching_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CacheStore::new(dir.path().join("cache")).unwrap();
+        let a = CacheStore::key("a", "file");
+        let b = CacheStore::key("b", "file");
+        store
+            .open(&a, BLOCK_SIZE)
+            .unwrap()
+            .write_range(0, &vec![1; BLOCK_SIZE as usize])
+            .unwrap();
+        store
+            .open(&b, BLOCK_SIZE)
+            .unwrap()
+            .write_range(0, &vec![2; BLOCK_SIZE as usize])
+            .unwrap();
+        assert_eq!(store.clear_datasource("a").unwrap(), BLOCK_SIZE);
+        assert!(!store.status(&a).cached);
+        assert!(store.status(&b).complete);
     }
 }

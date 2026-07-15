@@ -6,7 +6,6 @@ use crate::adapters::{self, Storage};
 use crate::error::{ApiError, ApiResult};
 use crate::registry::Registry;
 use crate::settings::SettingsStore;
-use crate::strategies::Strategies;
 use crate::vault::PathCache;
 
 /// 全局应用状态。加解密全部在服务端完成（信任模型：服务器可信、云存储不可信）。
@@ -15,13 +14,13 @@ pub struct AppState(Arc<Inner>);
 
 pub struct Inner {
     pub registry: Registry,
-    pub strategies: Strategies,
     /// 全局传输设置（下载分片/并发）。
     pub settings: SettingsStore,
-    /// 纯内存路径缓存（云端为准）。根密钥由策略根密码派生，无本地密钥文件。
+    /// 纯内存路径缓存（云端为准）。根密钥由数据源根密码派生。
     pub cache: PathCache,
     /// 全数据源共享的持久密文块缓存。
     pub content_cache: Arc<crate::cache::CacheStore>,
+    pub transfers: Arc<crate::transfer::TransferTracker>,
     /// 登录会话 token（内存态，重启后失效）。
     pub sessions: RwLock<HashSet<String>>,
     /// 正在上传中的 "dsId:明文路径"（内存态）——同路径并发上传串行化。
@@ -45,7 +44,6 @@ impl std::ops::Deref for AppState {
 impl AppState {
     pub fn new(data_dir: PathBuf, admin_password: Option<String>) -> anyhow::Result<Self> {
         let registry = Registry::load(data_dir.join("datasources.json"))?;
-        let strategies = Strategies::load(data_dir.join("strategies.json"))?;
         let settings = SettingsStore::load(data_dir.join("settings.json"))?;
         let content_cache = Arc::new(crate::cache::CacheStore::new(data_dir.join("cache"))?);
         let http = reqwest::Client::builder()
@@ -53,10 +51,10 @@ impl AppState {
             .build()?;
         Ok(Self(Arc::new(Inner {
             registry,
-            strategies,
             settings,
             cache: PathCache::default(),
             content_cache,
+            transfers: Arc::new(crate::transfer::TransferTracker::default()),
             sessions: RwLock::new(HashSet::new()),
             uploading: Mutex::new(HashSet::new()),
             upload_progress: Mutex::new(HashMap::new()),
@@ -97,11 +95,16 @@ impl AppState {
         }
         let state = self.clone();
         let id = datasource.id.clone();
-        Some(Arc::new(move |access_token, refresh_token| {
-            state
-                .registry
-                .update_baidu_tokens(&id, access_token, refresh_token)
-        }))
+        Some(Arc::new(
+            move |access_token, refresh_token, access_expires_at| {
+                state.registry.update_baidu_tokens(
+                    &id,
+                    access_token,
+                    refresh_token,
+                    access_expires_at,
+                )
+            },
+        ))
     }
 
     /// 数据源级目录创建锁（惰性创建）。
@@ -110,9 +113,13 @@ impl AppState {
         Arc::clone(locks.entry(ds.to_string()).or_default())
     }
 
-    /// 数据源的信封链根密钥（由其绑定策略的根密码派生）。
+    /// 数据源的信封链根密钥。
     pub fn root_key_of(&self, ds_id: &str) -> ApiResult<[u8; crate::crypto::SECRET_LEN]> {
-        Ok(self.strategy_of(ds_id)?.root_key())
+        let ds = self.datasource(ds_id)?;
+        if !ds.encryption_enabled {
+            return Err(ApiError::BadRequest("该数据源未启用加密".into()));
+        }
+        Ok(crate::crypto::derive_root_key(ds.password.as_bytes()))
     }
 
     /// 根密钥候选（主密钥 + 换密码过渡期的旧密钥，读路径回退用）。
@@ -120,17 +127,20 @@ impl AppState {
         &self,
         ds_id: &str,
     ) -> ApiResult<Vec<[u8; crate::crypto::SECRET_LEN]>> {
-        Ok(self.strategy_of(ds_id)?.root_key_candidates())
+        let ds = self.datasource(ds_id)?;
+        if !ds.encryption_enabled {
+            return Err(ApiError::BadRequest("该数据源未启用加密".into()));
+        }
+        let mut keys = vec![crate::crypto::derive_root_key(ds.password.as_bytes())];
+        if let Some(prev) = ds.prev_password {
+            keys.push(crate::crypto::derive_root_key(prev.as_bytes()));
+        }
+        Ok(keys)
     }
 
-    /// 数据源绑定的策略（缺失时报错）。
-    pub fn strategy_of(&self, ds_id: &str) -> ApiResult<crate::strategies::Strategy> {
-        let ds = self
-            .registry
+    pub fn datasource(&self, ds_id: &str) -> ApiResult<crate::registry::DataSource> {
+        self.registry
             .get(ds_id)
-            .ok_or_else(|| ApiError::NotFound(format!("数据源不存在: {ds_id}")))?;
-        self.strategies
-            .get(&ds.strategy_id)
-            .ok_or_else(|| ApiError::BadRequest("数据源绑定的策略已不存在".into()))
+            .ok_or_else(|| ApiError::NotFound(format!("数据源不存在: {ds_id}")))
     }
 }

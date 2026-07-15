@@ -32,6 +32,7 @@ import PreviewModal from '../components/PreviewModal';
 import { useSources } from '../stores/sources';
 import { taskProgress, taskUploaded, useTasks } from '../stores/tasks';
 import { formatBytes, formatTime, previewKind } from '../utils/format';
+import { useTransfers } from '../stores/transfers';
 
 /** 加密文件浏览器：与服务端只交换明文路径，加解密全部发生在服务端。 */
 export default function BrowserPage() {
@@ -100,15 +101,18 @@ export default function BrowserPage() {
             dsId,
             target,
             file,
-            (sent) => taskProgress(id, sent),
+            () => undefined,
             id,
           );
           signal.addEventListener('abort', cancel);
-          // XHR 进度只反映本地加密/分卷；真实上传进度轮询服务端
+          // 两个维度都以服务端为准：encrypted = 已加密并切入分卷，uploaded = 网盘已确认。
           const poll = window.setInterval(() => {
             api
               .uploadProgress(id)
-              .then((p) => taskUploaded(id, p.uploaded))
+              .then((p) => {
+                taskProgress(id, p.encrypted);
+                taskUploaded(id, p.uploaded);
+              })
               .catch(() => undefined);
           }, 500);
           try {
@@ -137,6 +141,18 @@ export default function BrowserPage() {
     const url = new URL(streamUrl(dsId, joinPath(item.name)), window.location.origin);
     await navigator.clipboard.writeText(url.toString());
     message.success('播放链接已复制（可直接粘贴到 VLC / IINA / 其他设备）');
+  };
+
+  const watchCache = (name: string) => {
+    const path = joinPath(name);
+    const poll = async () => {
+      try {
+        const cache = await api.fileCacheStatus(dsId, path);
+        setEntries((current) => current.map((entry) => entry.name === name ? {...entry, cache} : entry));
+        if (!cache.complete) window.setTimeout(() => void poll(), 1000);
+      } catch { /* 页面切换或文件删除后停止轮询 */ }
+    };
+    void poll();
   };
 
   // ---------- 删除 / 重命名 / 新建目录 ----------
@@ -331,6 +347,33 @@ export default function BrowserPage() {
             render: (v: number) => formatTime(v),
           },
           {
+            title: '实时下行',
+            width: 120,
+            render: (_, item) => item.isDir ? '-' : <LiveFileSpeed
+              identity={`${dsId}:${joinPath(item.name)}`} fallback={item.downloadSpeed ?? 0} />,
+          },
+          {
+            title: '缓存',
+            width: 170,
+            render: (_, item) => item.isDir || item.foreign ? '-' : (
+              <Space size="small">
+                <Tag color={item.cache?.complete ? 'success' : item.cache?.cached ? 'processing' : 'default'}>
+                  {item.cache?.complete ? '完整' : item.cache?.cached
+                    ? `${formatBytes(item.cache.bytesCached)}` : '未缓存'}
+                </Tag>
+                {!item.cache?.complete && ds?.cacheEnabled && <Button size="small" onClick={async () => {
+                  await api.warmFileCache(dsId, joinPath(item.name));
+                  message.success('已开始在服务端缓存，可观察实时下行速度');
+                  watchCache(item.name);
+                }}>缓存</Button>}
+                {item.cache?.cached && <Button size="small" danger onClick={async () => {
+                  const r = await api.clearFileCache(dsId, joinPath(item.name));
+                  message.success(`已清理 ${formatBytes(r.freed)}`); await refresh();
+                }}>清理</Button>}
+              </Space>
+            ),
+          },
+          {
             title: '操作',
             key: 'ops',
             width: 220,
@@ -395,4 +438,9 @@ export default function BrowserPage() {
       )}
     </Card>
   );
+}
+
+function LiveFileSpeed({ identity, fallback }: { identity: string; fallback: number }) {
+  const speed = useTransfers((state) => state.snapshot.fileDownloadSpeeds[identity] ?? fallback);
+  return <span className="mono-metric">{formatBytes(speed)}/s</span>;
 }

@@ -307,11 +307,21 @@ fn decode_raw_name(parent_key: &[u8], raw: &[u8]) -> Option<NameMeta> {
     } else {
         String::from_utf8(name_bytes.to_vec()).ok()?
     };
-    if name.is_empty() || name.len() > MAX_PLAIN_NAME || name.contains('/') || name == "." || name == ".." {
+    if name.is_empty()
+        || name.len() > MAX_PLAIN_NAME
+        || name.contains('/')
+        || name == "."
+        || name == ".."
+    {
         return None;
     }
     let is_dir = flags & FLAG_DIR != 0;
-    Some(NameMeta { name, size: if is_dir { 0 } else { size }, is_dir, secret })
+    Some(NameMeta {
+        name,
+        size: if is_dir { 0 } else { size },
+        is_dir,
+        secret,
+    })
 }
 
 #[cfg(test)]
@@ -320,7 +330,12 @@ mod tests {
     use crate::crypto::gen_secret;
 
     fn meta(name: &str, size: u64, is_dir: bool) -> NameMeta {
-        NameMeta { name: name.into(), size, is_dir, secret: gen_secret() }
+        NameMeta {
+            name: name.into(),
+            size,
+            is_dir,
+            secret: gen_secret(),
+        }
     }
 
     #[test]
@@ -335,7 +350,10 @@ mod tests {
                 assert!(enc.chars().all(|c| cjk_digit(c).is_some()));
                 assert_eq!(enc.chars().count(), cjk_encoded_chars(n));
                 assert!(
-                    cjk_decode_candidates(&enc).unwrap().iter().any(|v| v == &raw),
+                    cjk_decode_candidates(&enc)
+                        .unwrap()
+                        .iter()
+                        .any(|v| v == &raw),
                     "len={n}"
                 );
             }
@@ -418,11 +436,20 @@ mod tests {
         assert_eq!(a, b, "SIV 模式：同父钥同明文同密文");
         assert!(a.chars().all(|c| cjk_digit(c).is_some()), "{a}");
         // CJK 大进制每个字符约承载 14.75 bit。
-        assert!(a.chars().count() <= 26, "过长: {} 字 ({a})", a.chars().count());
+        assert!(
+            a.chars().count() <= 26,
+            "过长: {} 字 ({a})",
+            a.chars().count()
+        );
 
         let firsts: std::collections::HashSet<char> = (0..40)
-            .map(|i| encode_name(&fk, &meta(&format!("文件{i}.txt"), i, false)).unwrap()
-                .chars().next().unwrap())
+            .map(|i| {
+                encode_name(&fk, &meta(&format!("文件{i}.txt"), i, false))
+                    .unwrap()
+                    .chars()
+                    .next()
+                    .unwrap()
+            })
             .collect();
         assert!(firsts.len() > 30, "首字符应接近均匀分布: {firsts:?}");
     }
@@ -461,8 +488,16 @@ mod tests {
     fn long_cjk_names_fit_with_compression() {
         let fk = gen_secret();
         let name: String = "加密数据源管理服务的超长中文文件名压缩能力测试"
-            .chars().cycle().take(50).collect();
-        let m = NameMeta { name: name.clone(), size: 4 * 1024 * 1024 * 1024, is_dir: false, secret: gen_secret() };
+            .chars()
+            .cycle()
+            .take(50)
+            .collect();
+        let m = NameMeta {
+            name: name.clone(),
+            size: 4 * 1024 * 1024 * 1024,
+            is_dir: false,
+            secret: gen_secret(),
+        };
         let enc = encode_name(&fk, &m).unwrap();
         assert!(enc.len() <= MAX_STORAGE_NAME, "{}", enc.len());
         assert_eq!(decode_name(&fk, &enc).unwrap().name, name);
@@ -470,7 +505,18 @@ mod tests {
         let huge: String = (0..2000u32)
             .map(|i| char::from_u32(0x4E00 + (i % 20000)).unwrap())
             .collect();
-        assert!(encode_name(&fk, &NameMeta { name: huge, size: 0, is_dir: false, secret: gen_secret() }).is_none());
+        assert!(
+            encode_name(
+                &fk,
+                &NameMeta {
+                    name: huge,
+                    size: 0,
+                    is_dir: false,
+                    secret: gen_secret()
+                }
+            )
+            .is_none()
+        );
     }
 }
 
@@ -493,13 +539,23 @@ mod length_report {
             ("русский файл.txt", 42),
             ("🎬 movie night 🍿.mp4", 42),
             ("读书笔记 - Designing Data-Intensive Applications.md", 42),
-            ("加密数据源管理服务的超长中文文件名压缩能力测试加密数据源管理服务", 42),
+            (
+                "加密数据源管理服务的超长中文文件名压缩能力测试加密数据源管理服务",
+                42,
+            ),
         ] {
-            let m = NameMeta { name: name.into(), size, is_dir: size == 0, secret: gen_secret() };
+            let m = NameMeta {
+                name: name.into(),
+                size,
+                is_dir: size == 0,
+                secret: gen_secret(),
+            };
             let enc = encode_name(&fk, &m).unwrap();
             println!(
                 "{:>2} chars ({:>3}B)  {name} ({} chars)",
-                enc.chars().count(), enc.len(), name.chars().count(),
+                enc.chars().count(),
+                enc.len(),
+                name.chars().count(),
             );
         }
     }
