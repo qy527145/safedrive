@@ -89,6 +89,23 @@ body > #root { min-height: 100vh; }
 .source-card .ant-card-meta-title { font-size: 16px !important; }
 .source-icon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 10px;
   color: var(--sd-accent); font-size: 22px; background: rgba(110,168,255,.1); border: 1px solid rgba(110,168,255,.18); }
+.source-icon-sm { width: 30px; height: 30px; font-size: 15px; border-radius: 8px; }
+/* 文件浏览器卡片视图：自适应网格瓦片 */
+.file-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); gap: 12px;
+  min-height: 240px; align-content: start; }
+.file-tile { position: relative; display: flex; flex-direction: column; align-items: center; gap: 8px;
+  padding: 20px 12px 14px; border: 1px solid var(--sd-border); border-radius: 10px;
+  background: rgba(27, 32, 44, .5); cursor: pointer;
+  transition: border-color .16s ease, background .16s ease, transform .16s ease; }
+.file-tile:hover { border-color: #3a4964; background: var(--sd-panel-2); transform: translateY(-2px); }
+.file-tile.foreign { cursor: default; }
+.file-tile.foreign .file-tile-name { color: var(--sd-muted); }
+.file-tile-icon { font-size: 34px; line-height: 1; }
+.file-tile-name { max-width: 100%; font-size: 13px; line-height: 1.35; text-align: center; overflow: hidden;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-all; }
+.file-tile-meta { color: var(--sd-muted); font-size: 11px; }
+.file-tile-more { position: absolute; top: 6px; right: 6px; opacity: 0; transition: opacity .16s ease; }
+.file-tile:hover .file-tile-more, .file-tile-more.ant-dropdown-open { opacity: 1; }
 .mono-metric { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-variant-numeric: tabular-nums; }
 .settings-grid { display: grid !important; grid-template-columns: minmax(0, 1fr) minmax(340px, .78fr); gap: 18px !important;
   width: 100%; max-width: none !important; align-items: start; }

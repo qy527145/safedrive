@@ -6,9 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "test:e2e": "vitest run src/e2e",
+    "test": "vitest run src",
+    "test:e2e": "vitest run e2e",
     "test:ui": "playwright test"
   },
   "dependencies": {

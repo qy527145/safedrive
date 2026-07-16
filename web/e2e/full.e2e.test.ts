@@ -2,7 +2,7 @@
  * 端到端集成测试：真实 safedrive 二进制 + localfs 数据源。
  * 加解密全部在服务端 —— 本测试作为「前端」只用明文 API 与 /stream，
  * 再直接检查磁盘验证云端形态（加密名文件夹 + 随机 .bin 分卷）。
- * 默认跳过；运行：E2E=1 pnpm vitest run src/e2e/full.e2e.test.ts
+ * 默认跳过；运行：bun run test:e2e（或 E2E=1 bunx vitest run e2e/full.e2e.test.ts）
  * 前置：cargo build --release
  */
 
@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const BASE = 'http://127.0.0.1:52660';
-const BIN = process.env.SAFEDRIVE_BIN ?? join(dirname(fileURLToPath(import.meta.url)), '../../../target/release/safedrive');
+const BIN = process.env.SAFEDRIVE_BIN ?? join(dirname(fileURLToPath(import.meta.url)), '../../target/release/safedrive');
 
 let server: ChildProcess;
 let dataDir: string;

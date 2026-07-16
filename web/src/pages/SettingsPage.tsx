@@ -1,9 +1,9 @@
-import { App, Button, Card, Checkbox, Form, Input, InputNumber, Space, Statistic, Typography } from 'antd';
+import { App, Button, Card, Checkbox, Form, Input, InputNumber, Space, Statistic, Switch, Typography } from 'antd';
 import { useEffect, useState } from 'react';
 import { api, type CacheStats, type TransferSettings } from '../api/client';
 import { formatBytes, parseSize, sizeToInput } from '../utils/format';
 
-/** 设置：全局传输参数 + 数据源根密钥的备份导出 / 导入合并。 */
+/** 设置：全局传输参数 + WebDAV 服务 + 数据源根密钥的备份导出 / 导入合并。 */
 export default function SettingsPage() {
   const { message, modal } = App.useApp();
   const [form] = Form.useForm<{
@@ -12,13 +12,26 @@ export default function SettingsPage() {
     maxPerVolume: number;
     cacheEnabled: boolean;
   }>();
+  const [davForm] = Form.useForm<{
+    webdavEnabled: boolean;
+    webdavUsername: string;
+    webdavPassword: string;
+  }>();
   const [saving, setSaving] = useState(false);
+  const [davSaving, setDavSaving] = useState(false);
   const [cacheStats, setCacheStats] = useState<CacheStats>();
+  // 服务端最新完整设置：PUT 是整体替换，各卡片保存时以此为底合并自己
+  // 的字段，避免互相覆盖。
+  const [settings, setSettings] = useState<TransferSettings>();
 
   useEffect(() => {
     api
       .getSettings()
-      .then((s) => form.setFieldsValue({ ...s, maxSplit: sizeToInput(s.maxSplit) }))
+      .then((s) => {
+        setSettings(s);
+        form.setFieldsValue({ ...s, maxSplit: sizeToInput(s.maxSplit) });
+        davForm.setFieldsValue(s);
+      })
       .catch((e: unknown) => message.error(e instanceof Error ? e.message : String(e)));
     void api.getCacheStats().then(setCacheStats).catch(() => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -26,7 +39,9 @@ export default function SettingsPage() {
 
   const saveSettings = async () => {
     const raw = await form.validateFields();
+    if (!settings) return;
     const values: TransferSettings = {
+      ...settings,
       maxThreads: raw.maxThreads,
       maxPerVolume: raw.maxPerVolume,
       maxSplit: parseSize(raw.maxSplit) ?? 0,
@@ -34,12 +49,32 @@ export default function SettingsPage() {
     };
     setSaving(true);
     try {
-      await api.updateSettings(values);
+      setSettings(await api.updateSettings(values));
       message.success('传输设置已保存（立即对后续下载生效）');
     } catch (e) {
       message.error(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const saveWebdav = async () => {
+    const raw = await davForm.validateFields();
+    if (!settings) return;
+    const values: TransferSettings = {
+      ...settings,
+      webdavEnabled: raw.webdavEnabled,
+      webdavUsername: (raw.webdavUsername ?? '').trim(),
+      webdavPassword: raw.webdavPassword ?? '',
+    };
+    setDavSaving(true);
+    try {
+      setSettings(await api.updateSettings(values));
+      message.success('WebDAV 设置已保存（立即生效）');
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDavSaving(false);
     }
   };
 
@@ -90,6 +125,51 @@ export default function SettingsPage() {
             <Checkbox>启用全局持久密文块缓存</Checkbox>
           </Form.Item>
           <Button type="primary" loading={saving} onClick={() => void saveSettings()}>
+            保存
+          </Button>
+        </Form>
+      </Card>
+
+      <Card title="WebDAV 服务">
+        <Typography.Paragraph type="secondary">
+          以 <Typography.Text code>{`${location.origin}/dav/<数据源名>/<路径>`}</Typography.Text>{' '}
+          把全部数据源暴露为标准 WebDAV 树，Finder / Windows 网络位置 / rclone / Infuse
+          等客户端可直接挂载，服务端现场解密。服务默认关闭；未设置专用账号时沿用管理密码
+          （用户名任意），管理密码也未设置时免鉴权。
+        </Typography.Paragraph>
+        <Form form={davForm} layout="vertical" name="webdav" style={{ maxWidth: 420 }}>
+          <Form.Item
+            name="webdavEnabled"
+            label="启用 WebDAV 服务"
+            valuePropName="checked"
+            tooltip="关闭后 /dav 立即返回 404（已挂载的客户端会断开）"
+          >
+            <Switch />
+          </Form.Item>
+          <Form.Item
+            name="webdavUsername"
+            label="账号"
+            tooltip="WebDAV 专用用户名；留空表示不校验用户名"
+          >
+            <Input placeholder="留空 = 任意用户名" autoComplete="off" allowClear />
+          </Form.Item>
+          <Form.Item
+            name="webdavPassword"
+            label="密码"
+            tooltip="WebDAV 专用密码；设置后管理密码不再用于 WebDAV 登录"
+            dependencies={['webdavUsername']}
+            rules={[
+              ({ getFieldValue }) => ({
+                validator: (_r, v: string) =>
+                  (getFieldValue('webdavUsername') as string | undefined)?.trim() && !v
+                    ? Promise.reject(new Error('设置了账号时必须同时设置密码'))
+                    : Promise.resolve(),
+              }),
+            ]}
+          >
+            <Input.Password placeholder="留空 = 沿用管理密码" autoComplete="new-password" />
+          </Form.Item>
+          <Button type="primary" loading={davSaving} onClick={() => void saveWebdav()}>
             保存
           </Button>
         </Form>

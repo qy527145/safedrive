@@ -1,0 +1,18 @@
+{
+  "name": "safedrive",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "bun@1.3.14",
+  "workspaces": [
+    "web"
+  ],
+  "scripts": {
+    "dev": "turbo run dev dev:server",
+    "build": "turbo run build:server",
+    "dev:server": "cargo run",
+    "build:server": "cargo build --release"
+  },
+  "devDependencies": {
+    "turbo": "^2"
+  }
+}

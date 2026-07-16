@@ -1,0 +1,21 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "tasks": {
+    "build": {
+      "outputs": ["dist/**"]
+    },
+    "//#build:server": {
+      "dependsOn": ["safedrive-web#build"],
+      "inputs": ["src/**", "Cargo.toml", "Cargo.lock", "build.rs"],
+      "outputs": ["target/release/safedrive"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "//#dev:server": {
+      "cache": false,
+      "persistent": true
+    }
+  }
+}

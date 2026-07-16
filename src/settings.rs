@@ -84,10 +84,23 @@ pub struct Settings {
     /// 是否启用所有数据源共享的持久密文块缓存。
     #[serde(default = "default_cache_enabled")]
     pub cache_enabled: bool,
+    /// WebDAV 服务开关（/dav 数据平面）。默认关闭，需在设置页手动开启。
+    #[serde(default = "default_webdav_enabled")]
+    pub webdav_enabled: bool,
+    /// WebDAV 专用账号（留空 = 任意用户名）。
+    #[serde(default)]
+    pub webdav_username: String,
+    /// WebDAV 专用密码；留空时沿用管理密码鉴权（无管理密码则免鉴权）。
+    #[serde(default)]
+    pub webdav_password: String,
 }
 
 fn default_cache_enabled() -> bool {
     true
+}
+
+fn default_webdav_enabled() -> bool {
+    false
 }
 
 impl Default for Settings {
@@ -97,6 +110,9 @@ impl Default for Settings {
             max_threads: 16,
             max_per_volume: 4,
             cache_enabled: true,
+            webdav_enabled: false,
+            webdav_username: String::new(),
+            webdav_password: String::new(),
         }
     }
 }
@@ -111,6 +127,11 @@ impl Settings {
         }
         if self.max_per_volume == 0 || self.max_per_volume > 64 {
             return Err(ApiError::BadRequest("单分卷线程数需在 1..64".into()));
+        }
+        if !self.webdav_username.is_empty() && self.webdav_password.is_empty() {
+            return Err(ApiError::BadRequest(
+                "设置了 WebDAV 账号时必须同时设置密码".into(),
+            ));
         }
         Ok(())
     }

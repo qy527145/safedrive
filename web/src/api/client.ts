@@ -27,6 +27,12 @@ export interface TransferSettings {
   maxPerVolume: number;
   /** 全局持久密文块缓存 */
   cacheEnabled: boolean;
+  /** WebDAV 服务开关（/dav 数据平面） */
+  webdavEnabled: boolean;
+  /** WebDAV 专用账号（留空 = 任意用户名） */
+  webdavUsername: string;
+  /** WebDAV 专用密码（留空 = 沿用管理密码鉴权） */
+  webdavPassword: string;
 }
 
 export interface CacheStats {

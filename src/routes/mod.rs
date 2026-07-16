@@ -2,6 +2,7 @@ pub mod ds;
 pub mod files;
 pub mod share;
 mod system;
+pub mod webdav;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::{get, post};
@@ -30,6 +31,9 @@ pub fn router(state: AppState) -> Router {
         .nest("/api", open.merge(protected))
         // 数据平面：外部播放器/下载器可直接消费（鉴权 ?token=，见 files::stream）
         .merge(files::stream_routes())
+        // WebDAV 数据平面：/dav/<数据源名>/<路径>，Basic 鉴权（管理密码），
+        // Finder / Windows / rclone / Infuse 等客户端可直接挂载
+        .merge(webdav::routes())
         .fallback(assets::static_handler)
         // 上传走流式消费，不受内存缓冲限制
         .layer(DefaultBodyLimit::disable())

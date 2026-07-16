@@ -1,5 +1,9 @@
 import {
+  AppstoreOutlined,
   ArrowLeftOutlined,
+  BarsOutlined,
+  ClearOutlined,
+  CloudDownloadOutlined,
   DeleteOutlined,
   DownloadOutlined,
   EditOutlined,
@@ -8,6 +12,8 @@ import {
   FolderAddOutlined,
   FolderOutlined,
   LinkOutlined,
+  MoreOutlined,
+  PauseCircleOutlined,
   ReloadOutlined,
   UploadOutlined,
 } from '@ant-design/icons';
@@ -16,15 +22,19 @@ import {
   Breadcrumb,
   Button,
   Card,
+  Dropdown,
+  Empty,
   Input,
+  Segmented,
   Space,
+  Spin,
   Table,
   Tag,
   Tooltip,
   Typography,
   Upload,
 } from 'antd';
-import type { InputRef } from 'antd';
+import type { InputRef, MenuProps } from 'antd';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api, streamUrl, uploadFile, type FileCacheStatus, type FsEntry } from '../api/client';
@@ -47,6 +57,14 @@ export default function BrowserPage() {
   const [entries, setEntries] = useState<FsEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [preview, setPreview] = useState<{ path: string; name: string; size: number } | null>(null);
+  // 呈现方式：列表（表格）/ 卡片（网格），记忆在本地
+  const [view, setView] = useState<'list' | 'card'>(() =>
+    localStorage.getItem('sd.view.files') === 'card' ? 'card' : 'list',
+  );
+  const changeView = (v: 'list' | 'card') => {
+    setView(v);
+    localStorage.setItem('sd.view.files', v);
+  };
 
   const curPath = useMemo(() => stack.join('/'), [stack]);
   const joinPath = useCallback(
@@ -150,6 +168,23 @@ export default function BrowserPage() {
       setEntries((current) => current.map((entry) => entry.name === name ? {...entry, cache} : entry));
     } catch { /* 文件已删除或页面切换，忽略 */ }
   }, [dsId, joinPath]);
+
+  // 缓存操作（列表视图的按钮与卡片视图的菜单共用）
+  const warmAction = async (item: FsEntry) => {
+    await api.warmFileCache(dsId, joinPath(item.name));
+    message.success('已开始在服务端缓存，可观察实时下行速度');
+    void refreshCacheStatus(item.name);
+  };
+  const stopWarmAction = async (item: FsEntry) => {
+    await api.stopWarmFileCache(dsId, joinPath(item.name));
+    message.success('已停止主动缓存任务；播放/下载经过服务器时仍会自动缓存');
+    void refreshCacheStatus(item.name);
+  };
+  const clearCacheAction = async (item: FsEntry) => {
+    const r = await api.clearFileCache(dsId, joinPath(item.name));
+    message.success(`已清理 ${formatBytes(r.freed)}`);
+    await refresh();
+  };
 
   const entriesRef = useRef<FsEntry[]>([]);
   entriesRef.current = entries;
@@ -260,6 +295,41 @@ export default function BrowserPage() {
     setPreview({ path: joinPath(item.name), name: item.name, size: item.size });
   };
 
+  /** 卡片视图的条目操作菜单（能力与列表视图的操作列对齐）。 */
+  const entryMenuItems = (item: FsEntry): MenuProps['items'] => {
+    if (item.foreign) {
+      return [{
+        key: 'delete-foreign',
+        danger: true,
+        icon: <DeleteOutlined />,
+        label: '删除外来条目',
+        onClick: () => deleteForeignAction(item),
+      }];
+    }
+    const items: MenuProps['items'] = [];
+    if (!item.isDir) {
+      if (previewKind(item.name) !== 'none') {
+        items.push({ key: 'preview', icon: <EyeOutlined />, label: '预览', onClick: () => onNameClick(item) });
+      }
+      items.push({ key: 'download', icon: <DownloadOutlined />, label: '下载', onClick: () => downloadAction(item) });
+      items.push({ key: 'link', icon: <LinkOutlined />, label: '复制播放链接', onClick: () => void copyStreamLink(item) });
+      if (ds?.cacheEnabled) {
+        if (item.cache?.warming) {
+          items.push({ key: 'cache-stop', icon: <PauseCircleOutlined />, label: '停止缓存', onClick: () => void stopWarmAction(item) });
+        } else if (!item.cache?.complete) {
+          items.push({ key: 'cache-warm', icon: <CloudDownloadOutlined />, label: '服务端缓存', onClick: () => void warmAction(item) });
+        }
+        if (item.cache?.cached && !item.cache.warming) {
+          items.push({ key: 'cache-clear', icon: <ClearOutlined />, label: '清理缓存', onClick: () => void clearCacheAction(item) });
+        }
+      }
+      items.push({ type: 'divider' });
+    }
+    items.push({ key: 'rename', icon: <EditOutlined />, label: '重命名', onClick: () => renameAction(item) });
+    items.push({ key: 'delete', danger: true, icon: <DeleteOutlined />, label: '删除', onClick: () => deleteAction(item) });
+    return items;
+  };
+
   if (sources.loaded && !ds) {
     return (
       <Card>
@@ -271,13 +341,41 @@ export default function BrowserPage() {
   return (
     <Card
       title={
-        <Space>
+        <Space size={4}>
           <Button type="text" icon={<ArrowLeftOutlined />} onClick={() => navigate('/')} />
-          <span>{ds?.name ?? '…'}</span>
+          {/* 面包屑以数据源为根，逐层可点击回跳 */}
+          <Breadcrumb
+            items={[
+              {
+                title:
+                  stack.length === 0 ? (
+                    <span>{ds?.name ?? '…'}</span>
+                  ) : (
+                    <a onClick={() => setStack([])}>{ds?.name ?? '…'}</a>
+                  ),
+              },
+              ...stack.map((name, i) => ({
+                title:
+                  i === stack.length - 1 ? (
+                    <span>{name}</span>
+                  ) : (
+                    <a onClick={() => setStack(stack.slice(0, i + 1))}>{name}</a>
+                  ),
+              })),
+            ]}
+          />
         </Space>
       }
       extra={
         <Space>
+          <Segmented
+            value={view}
+            onChange={(v) => changeView(v as 'list' | 'card')}
+            options={[
+              { value: 'list', icon: <BarsOutlined />, title: '列表视图' },
+              { value: 'card', icon: <AppstoreOutlined />, title: '卡片视图' },
+            ]}
+          />
           <Upload
             multiple
             showUploadList={false}
@@ -309,23 +407,50 @@ export default function BrowserPage() {
         </Space>
       }
     >
-      <Breadcrumb
-        style={{ marginBottom: 12 }}
-        items={[
-          {
-            title: <a onClick={() => setStack([])}>根目录</a>,
-          },
-          ...stack.map((name, i) => ({
-            title:
-              i === stack.length - 1 ? (
-                <span>{name}</span>
-              ) : (
-                <a onClick={() => setStack(stack.slice(0, i + 1))}>{name}</a>
-              ),
-          })),
-        ]}
-      />
-
+      {view === 'card' ? (
+        <Spin spinning={loading}>
+          {entries.length === 0 ? (
+            <Empty
+              image={Empty.PRESENTED_IMAGE_SIMPLE}
+              description="空目录"
+              style={{ padding: '48px 0' }}
+            />
+          ) : (
+            <div className="file-grid">
+              {entries.map((item) => (
+                <div
+                  key={`${item.foreign ? 'f' : 'm'}:${item.name}`}
+                  className={`file-tile${item.foreign ? ' foreign' : ''}`}
+                  onClick={() => onNameClick(item)}
+                >
+                  <div className="file-tile-icon">
+                    {item.isDir ? (
+                      <FolderOutlined style={{ color: '#faad14' }} />
+                    ) : (
+                      <FileOutlined style={{ color: '#8c8c8c' }} />
+                    )}
+                  </div>
+                  <div className="file-tile-name" title={item.name}>
+                    {item.name}
+                  </div>
+                  <div className="file-tile-meta">
+                    {item.foreign ? <Tag>外来</Tag> : item.isDir ? '目录' : formatBytes(item.size)}
+                  </div>
+                  <Dropdown menu={{ items: entryMenuItems(item) }} trigger={['click']}>
+                    <Button
+                      className="file-tile-more"
+                      type="text"
+                      size="small"
+                      icon={<MoreOutlined />}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  </Dropdown>
+                </div>
+              ))}
+            </div>
+          )}
+        </Spin>
+      ) : (
       <Table<FsEntry>
         rowKey={(e) => `${e.foreign ? 'f' : 'm'}:${e.name}`}
         dataSource={entries}
@@ -377,6 +502,8 @@ export default function BrowserPage() {
             render: (_, item) => item.isDir || item.foreign ? '-' : (
               <Space size="small">
                 <Tooltip
+                  // 热力条内容宽 320px，需放宽气泡（antd 默认 max-width 250px 会溢出）
+                  overlayStyle={{ maxWidth: 380 }}
                   title={item.cache && item.cache.bitmapSummary.length > 0 && (item.cache.cached || item.cache.warming)
                     ? <CacheStrip cache={item.cache} /> : undefined}
                 >
@@ -385,20 +512,9 @@ export default function BrowserPage() {
                       ? `${formatBytes(item.cache.bytesCached)}` : item.cache?.warming ? '缓存中' : '未缓存'}
                   </Tag>
                 </Tooltip>
-                {!item.cache?.complete && !item.cache?.warming && ds?.cacheEnabled && <Button size="small" onClick={async () => {
-                  await api.warmFileCache(dsId, joinPath(item.name));
-                  message.success('已开始在服务端缓存，可观察实时下行速度');
-                  void refreshCacheStatus(item.name);
-                }}>缓存</Button>}
-                {item.cache?.warming && <Button size="small" onClick={async () => {
-                  await api.stopWarmFileCache(dsId, joinPath(item.name));
-                  message.success('已停止主动缓存任务；播放/下载经过服务器时仍会自动缓存');
-                  void refreshCacheStatus(item.name);
-                }}>停止</Button>}
-                {!item.cache?.warming && item.cache?.cached && <Button size="small" danger onClick={async () => {
-                  const r = await api.clearFileCache(dsId, joinPath(item.name));
-                  message.success(`已清理 ${formatBytes(r.freed)}`); await refresh();
-                }}>清理</Button>}
+                {!item.cache?.complete && !item.cache?.warming && ds?.cacheEnabled && <Button size="small" onClick={() => void warmAction(item)}>缓存</Button>}
+                {item.cache?.warming && <Button size="small" onClick={() => void stopWarmAction(item)}>停止</Button>}
+                {!item.cache?.warming && item.cache?.cached && <Button size="small" danger onClick={() => void clearCacheAction(item)}>清理</Button>}
               </Space>
             ),
           },
@@ -455,6 +571,7 @@ export default function BrowserPage() {
           },
         ]}
       />
+      )}
 
       {preview && (
         <PreviewModal

@@ -20,5 +20,10 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-web/node_modules
-web/dist
+# Node / Bun / Turbo（前端与任务编排）
+node_modules/
+.turbo/
+web/dist/
+web/test-results/
+web/playwright-report/
+*.tsbuildinfo

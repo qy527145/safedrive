@@ -38,8 +38,8 @@ const PCS_FILE_API: &str = "https://pcs.baidu.com/rest/2.0/pcs/file";
 const PCS_UPLOAD_API: &str = "https://d.pcs.baidu.com/rest/2.0/pcs/superfile2";
 /// locateupload（动态上传域名调度）走 d.pcs 域（对齐 OpenList）。
 const PCS_LOCATE_UPLOAD_API: &str = "https://d.pcs.baidu.com/rest/2.0/pcs/file";
-const DEFAULT_CLIENT_ID: &str = "iYCeC9g08h5vuP9UqvPHKKSVrKFXGa1v";
-const DEFAULT_CLIENT_SECRET: &str = "jXiFMOPVPCWlO2M5CwWQzffpNPaGTRBG";
+const DEFAULT_CLIENT_ID: &str = "NqOMXF6XGhGRIGemsQ9nG0Na";
+const DEFAULT_CLIENT_SECRET: &str = "SVT6xpMdLcx6v4aCR4wT8BBOTbzFO8LM";
 const PAN_APP_ID: &str = "250528";
 const DEFAULT_DOWNLOAD_UA: &str = "netdisk;P2SP;2.2.61.31;android";
 const DEFAULT_WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";

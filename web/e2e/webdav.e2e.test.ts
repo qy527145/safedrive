@@ -1,7 +1,7 @@
 /**
  * WebDAV 适配器集成测试：Node 起真实 WebDAV 服务（webdav-server），
  * safedrive 以 webdav 数据源在其上完成加密上传 → Range 流式解密下载。
- * 运行：E2E=1 pnpm vitest run src/e2e/webdav.e2e.test.ts（前置 cargo build --release）
+ * 运行：bun run test:e2e（或 E2E=1 bunx vitest run e2e/webdav.e2e.test.ts）；前置 cargo build --release
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -16,7 +16,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const BASE = 'http://127.0.0.1:52670';
 const DAV_PORT = 52671;
-const BIN = process.env.SAFEDRIVE_BIN ?? join(dirname(fileURLToPath(import.meta.url)), '../../../target/release/safedrive');
+const BIN = process.env.SAFEDRIVE_BIN ?? join(dirname(fileURLToPath(import.meta.url)), '../../target/release/safedrive');
 
 let server: ChildProcess;
 let davServer: { start: (cb: () => void) => void; stop: (cb: () => void) => void };

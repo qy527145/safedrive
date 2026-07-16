@@ -15,5 +15,5 @@
     "useDefineForClassFields": true,
     "noEmit": true
   },
-  "include": ["src"]
+  "include": ["src", "e2e", "e2e-browser", "vite.config.ts", "playwright.config.ts"]
 }

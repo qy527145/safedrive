@@ -7,9 +7,9 @@
 ## 快速开始
 
 ```bash
-# 构建（需要 Rust 工具链 + Node.js/pnpm）
-cd web && pnpm install && pnpm build && cd ..
-cargo build --release
+# 构建（需要 Rust 工具链 + Bun）
+bun install
+bun run build   # turbo：web 构建 → cargo release，内容哈希缓存，无变更时秒级完成
 
 # 运行
 ./target/release/safedrive --bind 0.0.0.0:5266 --admin-password <管理密码>
@@ -36,6 +36,22 @@ cargo build --release
 
 界面仍提供可选的 API Key（Client ID）和 Secret Key（Client Secret）入口；两者同时留空时使用内置客户端。BDUSS 除了首次设备授权，只发送给 `locatedownload` 与其返回的 CDN 下载地址；列目录、CRUD 和上传不会携带 Cookie。开放平台应用只能访问其获授权的路径时，请将“网盘根目录”设置在该授权范围内。
 
+## WebDAV 服务
+
+服务内置 WebDAV 服务端（**默认关闭**，在「系统设置 → WebDAV 服务」开启），把全部数据源以 `/dav/<数据源名>/<路径>` 暴露成一棵标准 WebDAV 树；Finder、Windows 网络位置、rclone、Infuse/nPlayer 等客户端可直接挂载 —— 解密由服务端现场完成，客户端全程只见明文文件。
+
+```
+macOS Finder   ⌘K → http://<host>:5266/dav        （用户名任意，密码 = 管理密码）
+rclone         rclone lsd --webdav-url http://<host>:5266/dav --webdav-user any --webdav-pass $(rclone obscure <管理密码>) :webdav:
+Windows        映射网络驱动器 → http://<host>:5266/dav （HTTP 下需放行 Basic，建议走 HTTPS 反代）
+```
+
+- 管理配置在「系统设置 → WebDAV 服务」：可整体开关（**默认关闭**，需手动开启；关闭后 `/dav` 返回 404），可设置专用账号密码（默认为空）
+- 鉴权：设置了专用账号密码则 Basic 校验该账号（用户名留空 = 任意用户名）；未设置时沿用管理密码（用户名任意）；管理密码也未设置时免鉴权。Bearer 会话 token 恒可用
+- 读写全集：PROPFIND / GET（Range，播放器可直接拖动）/ PUT（流式加密分卷上传，需 `Content-Length`）/ MKCOL / DELETE / MOVE / COPY（仅文件，服务端解密回源重加密）
+- LOCK/UNLOCK 是假锁，仅满足 Finder / Windows / Office 的 class 2 写入探测；PROPPATCH 假成功（云端没有可写的元数据位）
+- 解不开信封的外来条目不会出现在 WebDAV 列表中
+
 ## 架构
 
 ```
@@ -45,6 +61,7 @@ cargo build --release
 │ Rust 服务端（axum）                                          │
 │   /api/files/*  明文路径文件 API（list/mkdir/rename/…/upload）│
 │   /stream/{ds}/{path}  流式解密数据面（Range/206、断开即停）   │
+│   /dav/{ds}/{path}  WebDAV 服务端（Basic 鉴权，复用同一核心）  │
 │   crypto  ChaCha20 + HKDF + CJK 大进制名称编码 + 纯 Rust 压缩   │
 │   vault   密码本（一文件一随机密码）                          │
 │   engine  分片规划 / 断流续拉 / 并行拉取 / 顺序拼接 / 密文缓存 │
@@ -71,12 +88,12 @@ cargo build --release
 ## 开发
 
 ```bash
+bun run dev                # 调试：vite(:5173，/api 代理到后端) + cargo run(:5266) 并行
+bun run build              # 打包：web 构建 → cargo release（turbo 内容哈希缓存）
 cargo test                 # Rust 单测（crypto/vault/engine/adapters/…）
-cd web
-pnpm vitest run            # 前端单测
-pnpm build && cd .. && cargo build --release
-cd web && E2E=1 pnpm vitest run src/e2e/   # 集成 E2E（真实二进制 + 真实 WebDAV 服务）
-npx playwright test        # 浏览器 E2E
+cd web && bun run test     # 前端单测
+cd web && bun run test:e2e # 集成 E2E（真实二进制 + 真实 WebDAV 服务，前置 bun run build）
+cd web && bun run test:ui  # 浏览器 E2E
 ```
 
 设计细节见 [docs/DESIGN.md](docs/DESIGN.md)。
