@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 
 use crate::error::ApiResult;
 
@@ -82,6 +83,14 @@ pub struct FileCacheStatus {
     pub bytes_cached: u64,
     pub total_size: u64,
     pub complete: bool,
+    /// 手动触发的后台预热是否进行中（可通过 stop 接口取消）。
+    /// 注意这只是缓存的触发条件之一：播放/下载的服务器代理流也会写透
+    /// 缓存，不受此标志影响；bytes_cached / bitmap_summary 始终反映
+    /// 所有触发来源合并后的真实缓存状态。
+    pub warming: bool,
+    /// 块位图降采样：≤128 个桶，每桶为该区段已缓存块的百分比 0-100。
+    /// 前端据此渲染「哪些部分已缓存」的热力条（取自 hydraria）。
+    pub bitmap_summary: Vec<u8>,
 }
 
 pub struct CacheEntry {
@@ -195,6 +204,28 @@ impl CacheEntry {
 pub struct CacheStore {
     root: PathBuf,
     entries: RwLock<HashMap<String, Arc<CacheEntry>>>,
+    /// 进行中的文件触发预热任务：key -> 取消信号。守卫 Drop 时注销。
+    warming: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+}
+
+/// 预热任务守卫：任务结束（完成/失败/被停止）时 Drop 注销 warming 状态。
+pub struct WarmGuard {
+    warming: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    key: String,
+    cancel: Arc<Notify>,
+}
+
+impl WarmGuard {
+    /// 等待停止信号；信号在未被等待时到达也不会丢（Notify 存 permit）。
+    pub async fn cancelled(&self) {
+        self.cancel.notified().await;
+    }
+}
+
+impl Drop for WarmGuard {
+    fn drop(&mut self) {
+        self.warming.lock().unwrap().remove(&self.key);
+    }
 }
 
 impl CacheStore {
@@ -203,7 +234,38 @@ impl CacheStore {
         Ok(Self {
             root,
             entries: RwLock::new(HashMap::new()),
+            warming: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// 注册一个预热任务；同 key 已有进行中的任务时返回 None（幂等去重）。
+    pub fn begin_warm(&self, key: &str) -> Option<WarmGuard> {
+        let mut warming = self.warming.lock().unwrap();
+        if warming.contains_key(key) {
+            return None;
+        }
+        let cancel = Arc::new(Notify::new());
+        warming.insert(key.to_string(), Arc::clone(&cancel));
+        Some(WarmGuard {
+            warming: Arc::clone(&self.warming),
+            key: key.to_string(),
+            cancel,
+        })
+    }
+
+    /// 请求停止进行中的预热任务；返回是否确有任务在跑。
+    pub fn stop_warm(&self, key: &str) -> bool {
+        match self.warming.lock().unwrap().get(key) {
+            Some(cancel) => {
+                cancel.notify_one();
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn is_warming(&self, key: &str) -> bool {
+        self.warming.lock().unwrap().contains_key(key)
     }
 
     pub fn key(datasource: &str, encrypted_path: &str) -> String {
@@ -321,13 +383,20 @@ impl CacheStore {
     }
 
     pub fn status(&self, key: &str) -> FileCacheStatus {
+        let warming = self.is_warming(key);
         if let Some(entry) = self.entries.read().unwrap().get(key) {
             let bytes = entry.bytes_cached.load(Ordering::Relaxed);
+            let bitmap_summary = {
+                let bitmap = entry.bitmap.lock().unwrap();
+                downsample_bitmap(&bitmap, &entry.meta)
+            };
             return FileCacheStatus {
                 cached: bytes > 0,
                 bytes_cached: bytes,
                 total_size: entry.meta.total_size,
                 complete: bytes == entry.meta.total_size,
+                warming,
+                bitmap_summary,
             };
         }
         let root = self.root.join(key);
@@ -343,6 +412,8 @@ impl CacheStore {
                     bytes_cached: bytes,
                     total_size: meta.total_size,
                     complete: bytes == meta.total_size,
+                    warming,
+                    bitmap_summary: downsample_bitmap(&bitmap, &meta),
                 }
             }
             _ => FileCacheStatus {
@@ -350,11 +421,14 @@ impl CacheStore {
                 bytes_cached: 0,
                 total_size: 0,
                 complete: false,
+                warming,
+                bitmap_summary: Vec::new(),
             },
         }
     }
 
     pub fn clear(&self, key: &str) -> ApiResult<u64> {
+        self.stop_warm(key); // 正在预热时先请求停止，避免任务向已删除目录写入
         let bytes = self.status(key).bytes_cached;
         self.entries.write().unwrap().remove(key);
         let root = self.root.join(key);
@@ -395,6 +469,9 @@ impl CacheStore {
     }
 
     pub fn clear_all(&self) -> ApiResult<u64> {
+        for cancel in self.warming.lock().unwrap().values() {
+            cancel.notify_one();
+        }
         let bytes = self.stats().bytes_cached;
         self.entries.write().unwrap().clear();
         if self.root.exists() {
@@ -407,6 +484,36 @@ impl CacheStore {
 
 fn bitmap_len(total_size: u64) -> usize {
     total_size.div_ceil(BLOCK_SIZE).div_ceil(8) as usize
+}
+
+/// 位图降采样：压成 ≤`MAX_SUMMARY_BUCKETS` 个桶，每桶为该区段已完成块的
+/// 百分比 0-100；块数少于桶数时一桶对应一块（取自 hydraria）。
+const MAX_SUMMARY_BUCKETS: usize = 128;
+
+fn downsample_bitmap(bitmap: &[u8], meta: &CacheMeta) -> Vec<u8> {
+    let blocks_total = meta.total_size.div_ceil(meta.block_size) as usize;
+    if blocks_total == 0 {
+        return Vec::new();
+    }
+    let buckets = blocks_total.min(MAX_SUMMARY_BUCKETS).max(1);
+    let mut out = Vec::with_capacity(buckets);
+    for i in 0..buckets {
+        let lo = (i * blocks_total) / buckets;
+        let hi = (((i + 1) * blocks_total) / buckets).min(blocks_total);
+        if hi <= lo {
+            out.push(0);
+            continue;
+        }
+        let filled = (lo..hi)
+            .filter(|block| {
+                bitmap
+                    .get(block / 8)
+                    .is_some_and(|byte| byte & (1 << (block % 8)) != 0)
+            })
+            .count();
+        out.push(((filled * 100) / (hi - lo)) as u8);
+    }
+    out
 }
 
 fn bytes_from_bitmap(meta: &CacheMeta, bitmap: &[u8]) -> u64 {
@@ -475,13 +582,36 @@ mod tests {
         assert!(!entry.has_range(BLOCK_SIZE, 2 * BLOCK_SIZE - 1));
         assert_eq!(entry.read_range(5, 10).unwrap().as_ref(), &[0x5a; 6]);
         assert_eq!(store.stats().bytes_cached, BLOCK_SIZE);
+        // 位图摘要：块数 < 128 时一桶一块，前块已满、后块为空
+        assert_eq!(store.status("k").bitmap_summary, vec![100, 0]);
 
         drop(entry);
         drop(store);
         let reopened = CacheStore::new(dir.path().join("cache")).unwrap();
         assert_eq!(reopened.stats().bytes_cached, BLOCK_SIZE);
+        // 未加载的持久条目也能给出摘要（读 bitmap.bin）
+        assert_eq!(reopened.status("k").bitmap_summary, vec![100, 0]);
         let entry = reopened.open("k", 2 * BLOCK_SIZE).unwrap();
         assert!(entry.has_range(0, BLOCK_SIZE - 1));
+    }
+
+    #[test]
+    fn bitmap_summary_caps_at_128_buckets() {
+        let meta = CacheMeta {
+            total_size: 300 * BLOCK_SIZE,
+            block_size: BLOCK_SIZE,
+        };
+        // 前半部分全缓存：300 块 → 128 桶，前面的桶接近 100，后面的为 0
+        let mut bitmap = vec![0u8; (300u64.div_ceil(8)) as usize];
+        for block in 0..150usize {
+            bitmap[block / 8] |= 1 << (block % 8);
+        }
+        let summary = downsample_bitmap(&bitmap, &meta);
+        assert_eq!(summary.len(), 128);
+        assert_eq!(summary[0], 100);
+        assert_eq!(*summary.last().unwrap(), 0);
+        assert!(summary.iter().take(60).all(|&pct| pct == 100));
+        assert!(summary.iter().skip(66).all(|&pct| pct == 0));
     }
 
     #[test]
@@ -513,5 +643,28 @@ mod tests {
         assert_eq!(store.clear_datasource("a").unwrap(), BLOCK_SIZE);
         assert!(!store.status(&a).cached);
         assert!(store.status(&b).complete);
+    }
+
+    #[tokio::test]
+    async fn warm_guard_registers_stops_and_unregisters() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CacheStore::new(dir.path().join("cache")).unwrap();
+        assert!(!store.status("k").warming);
+        assert!(!store.stop_warm("k")); // 没有任务时 stop 返回 false
+
+        let guard = store.begin_warm("k").unwrap();
+        assert!(store.status("k").warming);
+        assert!(store.begin_warm("k").is_none()); // 同 key 幂等去重
+
+        assert!(store.stop_warm("k"));
+        // 信号在等待前发出也不丢（Notify 存 permit）
+        tokio::time::timeout(std::time::Duration::from_secs(1), guard.cancelled())
+            .await
+            .expect("应收到停止信号");
+        drop(guard);
+        assert!(!store.status("k").warming); // Drop 注销
+
+        // 停止后可重新触发续传
+        assert!(store.begin_warm("k").is_some());
     }
 }

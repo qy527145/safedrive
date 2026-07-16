@@ -893,6 +893,178 @@ mod tests {
         }
     }
 
+    /// 记录每次区间请求的存储：验证 seek 后哪些区间真的被请求了。
+    struct RecordingRangeStorage {
+        volumes: std::collections::HashMap<String, Bytes>,
+        requests: std::sync::Mutex<Vec<(String, u64, u64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for RecordingRangeStorage {
+        async fn list(&self, _: &str) -> ApiResult<Vec<Entry>> {
+            unreachable!()
+        }
+        async fn mkdir(&self, _: &str) -> ApiResult<()> {
+            unreachable!()
+        }
+        async fn delete(&self, _: &str) -> ApiResult<()> {
+            unreachable!()
+        }
+        async fn rename(&self, _: &str, _: &str) -> ApiResult<()> {
+            unreachable!()
+        }
+        async fn get(&self, _: &str) -> ApiResult<(Option<u64>, ByteStream)> {
+            unreachable!()
+        }
+        async fn get_range(&self, path: &str, start: u64, end: u64) -> ApiResult<ByteStream> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((path.to_string(), start, end));
+            let bytes = self.volumes[path].slice(start as usize..=end as usize);
+            Ok(stream::iter(vec![Ok(bytes)]).boxed())
+        }
+        async fn put(&self, _: &str, _: ByteStream) -> ApiResult<()> {
+            unreachable!()
+        }
+    }
+
+    /// 慢速无限流存储：单个 chunk 在测试窗口内不可能拉完，用于验证
+    /// 客户端断开后 in-flight fetcher 被 abort、不再发起新请求。
+    struct SlowEndlessStorage {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for SlowEndlessStorage {
+        async fn list(&self, _: &str) -> ApiResult<Vec<Entry>> {
+            unreachable!()
+        }
+        async fn mkdir(&self, _: &str) -> ApiResult<()> {
+            unreachable!()
+        }
+        async fn delete(&self, _: &str) -> ApiResult<()> {
+            unreachable!()
+        }
+        async fn rename(&self, _: &str, _: &str) -> ApiResult<()> {
+            unreachable!()
+        }
+        async fn get(&self, _: &str) -> ApiResult<(Option<u64>, ByteStream)> {
+            unreachable!()
+        }
+        async fn get_range(&self, _: &str, _: u64, _: u64) -> ApiResult<ByteStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(stream::unfold((), |()| async {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                Some((Ok(Bytes::from(vec![0u8; 4096])), ()))
+            })
+            .boxed())
+        }
+        async fn put(&self, _: &str, _: ByteStream) -> ApiResult<()> {
+            unreachable!()
+        }
+    }
+
+    /// 播放器 seek（Range: bytes=X-）必须直接从 X 开始拉取：
+    /// seek 点之前的分卷与字节永远不会被请求。
+    #[tokio::test]
+    async fn seek_starts_at_target_without_fetching_gap() {
+        let vol_size = 1_000_000u64;
+        let all: Vec<u8> = (0..2 * vol_size).map(|i| (i % 251) as u8).collect();
+        let mut volumes = std::collections::HashMap::new();
+        volumes.insert(
+            "vol00.bin".to_string(),
+            Bytes::copy_from_slice(&all[..vol_size as usize]),
+        );
+        volumes.insert(
+            "vol01.bin".to_string(),
+            Bytes::copy_from_slice(&all[vol_size as usize..]),
+        );
+        let storage = Arc::new(RecordingRangeStorage {
+            volumes,
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let seek = 1_200_000u64; // 第二卷内 200_000 处
+        let mut rx = stream_range_cached_mode(
+            Arc::clone(&storage) as Arc<dyn Storage>,
+            String::new(),
+            [0u8; crate::crypto::SECRET_LEN],
+            false,
+            Arc::new(layout(&[vol_size, vol_size])),
+            seek,
+            2 * vol_size - 1,
+            true, // bytes=X- 的请求形态
+            &StreamParams {
+                max_split: 256 * 1024,
+                max_threads: 4,
+                max_per_volume: 2,
+            },
+            None,
+            None,
+        );
+        let mut out = Vec::new();
+        while let Some(item) = rx.recv().await {
+            out.extend_from_slice(&item.unwrap());
+        }
+        assert_eq!(out, &all[seek as usize..]);
+        let requests = storage.requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        for (path, start, _) in requests.iter() {
+            assert_eq!(path, "vol01.bin", "seek 点之前的分卷不应被请求");
+            assert!(
+                *start >= seek - vol_size,
+                "不应回头补 seek 点之前的空档: 请求了卷内偏移 {start}"
+            );
+        }
+        // 最早的请求恰好落在 seek 点上（并发下顺序不定，看最小偏移）
+        let min_start = requests.iter().map(|(_, start, _)| *start).min().unwrap();
+        assert_eq!(min_start, seek - vol_size);
+    }
+
+    /// 客户端断开（播放器 seek 会立即弃掉旧请求）后，所有 in-flight
+    /// fetcher 被 abort，不再向上游发起新的区间请求 —— 与 hydraria 的
+    /// bandwidth claw-back 行为一致，保证 seek 不与遗留流量抢带宽。
+    #[tokio::test]
+    async fn dropping_receiver_aborts_inflight_fetchers() {
+        let storage = Arc::new(SlowEndlessStorage {
+            calls: AtomicUsize::new(0),
+        });
+        let total = 64 * 1024 * 1024u64;
+        let mut rx = stream_range_cached_mode(
+            Arc::clone(&storage) as Arc<dyn Storage>,
+            String::new(),
+            [0u8; crate::crypto::SECRET_LEN],
+            false,
+            Arc::new(layout(&[total])),
+            0,
+            total - 1,
+            true,
+            &StreamParams {
+                max_split: 1024 * 1024,
+                max_threads: 4,
+                max_per_volume: 4,
+            },
+            None,
+            None,
+        );
+        // 收到首个数据块后模拟播放器 seek：断开旧连接
+        let first = rx.recv().await.unwrap().unwrap();
+        assert!(!first.is_empty());
+        drop(rx);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let after_drop = storage.calls.load(Ordering::SeqCst);
+        assert!(
+            after_drop <= 4,
+            "断开前的在途请求数不应超过并发上限: {after_drop}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            storage.calls.load(Ordering::SeqCst),
+            after_drop,
+            "断开后不应再发起新的区间请求"
+        );
+    }
+
     #[test]
     fn parse_range_cases() {
         assert_eq!(parse_range(None, 100), (RangeSpec::Full, true));

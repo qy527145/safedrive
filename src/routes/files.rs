@@ -125,6 +125,10 @@ pub fn api_routes() -> Router<AppState> {
                 .post(file_cache_warm)
                 .delete(file_cache_clear),
         )
+        .route(
+            "/files/{ds}/cache/warm",
+            axum::routing::delete(file_cache_warm_stop),
+        )
         .route("/files/{ds}/upload", put(upload))
         .route("/uploads/{id}/progress", get(upload_progress))
 }
@@ -932,6 +936,10 @@ async fn file_cache_warm(
     if total == 0 || state.content_cache.status(&key).complete {
         return Ok(Json(json!({"ok":true,"complete":true})));
     }
+    // 注册预热任务；同文件已有任务在跑则幂等返回，避免重复拉流。
+    let Some(guard) = state.content_cache.begin_warm(&key) else {
+        return Ok(Json(json!({"ok":true,"complete":false,"warming":true})));
+    };
     let tracker = Arc::clone(&state.transfers);
     let transfer_key = format!("{ds}:{path}");
     let progress: crate::adapters::ProgressFn = Arc::new(move |n| {
@@ -955,14 +963,44 @@ async fn file_cache_warm(
         Some(progress),
     );
     tokio::spawn(async move {
-        while let Some(item) = rx.recv().await {
-            if let Err(error) = item {
-                tracing::warn!("后台缓存文件失败: ds={ds} path={path} err={error}");
-                break;
+        // guard 随任务结束（含被停止）Drop，注销 warming 状态。
+        loop {
+            tokio::select! {
+                _ = guard.cancelled() => {
+                    // 丢弃 rx 即模拟客户端断开：serializer 发送失败 → 通知
+                    // 调度器 abort 所有 in-flight fetcher，下载立即停止。
+                    tracing::info!("停止后台缓存: ds={ds} path={path}");
+                    break;
+                }
+                item = rx.recv() => match item {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        tracing::warn!("后台缓存文件失败: ds={ds} path={path} err={error}");
+                        break;
+                    }
+                    None => break,
+                }
             }
         }
     });
-    Ok(Json(json!({"ok":true,"complete":false})))
+    Ok(Json(json!({"ok":true,"complete":false,"warming":true})))
+}
+
+/// 停止手动触发的文件缓存（预热）任务。只关掉「主动预热」这一个触发条件：
+/// 已缓存数据保留、可再次触发续传；播放/下载经过服务器代理时（缓存开关
+/// 开启的前提下）仍会继续写透缓存。
+async fn file_cache_warm_stop(
+    State(state): State<AppState>,
+    Path(ds): Path<String>,
+    Query(q): Query<PathQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let path = sanitize(&q.path)?;
+    let storage = state.adapter(&ds)?;
+    let (identity, _) = cache_identity(&state, storage.as_ref(), &ds, &path).await?;
+    let stopped = state
+        .content_cache
+        .stop_warm(&crate::cache::CacheStore::key(&ds, &identity));
+    Ok(Json(json!({"ok":true,"stopped":stopped})))
 }
 
 // ---------------- 上传 ----------------
