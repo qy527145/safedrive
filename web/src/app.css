@@ -18,7 +18,7 @@ body { margin: 0; min-height: 100vh; color: var(--sd-text); background:
   radial-gradient(850px 520px at 108% 5%, rgba(81, 43, 124, .38), transparent 62%), var(--sd-bg);
   background-attachment: fixed; }
 button, input { font: inherit; }
-#root { min-height: 100vh; }
+body > #root { min-height: 100vh; }
 .app-shell { min-height: 100vh; background: transparent !important; }
 .app-header { height: 70px !important; padding: 0 28px !important; display: grid !important;
   grid-template-columns: auto minmax(280px, 1fr) auto; align-items: center; gap: 24px;

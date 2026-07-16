@@ -32,6 +32,8 @@ describe('parseSize', () => {
     expect(parseSize('64KB')).toBe(64 * 1024);
     expect(parseSize('1048576')).toBe(1048576);
     expect(parseSize('')).toBeNull();
+    expect(parseSize(undefined)).toBeNull();
+    expect(parseSize(null)).toBeNull();
     expect(parseSize('abc')).toBeNull();
     expect(parseSize('5T')).toBeNull();
   });

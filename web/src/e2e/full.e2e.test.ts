@@ -298,6 +298,15 @@ describe.skipIf(!process.env.E2E && process.env.npm_lifecycle_event !== 'test:e2
     }
     expect(cache.complete).toBe(true);
     expect(cache.bytesCached).toBe(original.length);
+    // 位图摘要：完整缓存后每个桶都应为 100%
+    const summary = (await apiJson<{bitmapSummary:number[]}>(cachePath)).bitmapSummary;
+    expect(summary.length).toBeGreaterThan(0);
+    expect(summary.every((pct)=>pct===100)).toBe(true);
+    // 文件触发缓存可停止；无任务在跑时 stopped=false（幂等）。
+    const stop = await apiJson<{ok:boolean;stopped:boolean}>(
+      `/api/files/${dsId}/cache/warm?path=${encodeURIComponent('movie.dat')}`, {method:'DELETE'});
+    expect(stop).toMatchObject({ok:true, stopped:false});
+    expect((await apiJson<{warming:boolean}>(cachePath)).warming).toBe(false);
     const speeds = await apiJson<{downloadSpeed:number}>('/api/transfers');
     expect(speeds.downloadSpeed).toBeGreaterThan(0);
     const cleared = await apiJson<{freed:number}>(cachePath, {method:'DELETE'});

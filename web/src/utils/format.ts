@@ -44,9 +44,9 @@ export function previewKind(name: string): PreviewKind {
   return 'none';
 }
 
-/** 解析人类可读大小："300M"、"1.5GB"、"512k"、纯数字（字节）。非法返回 null。 */
-export function parseSize(input: string): number | null {
-  const s = input.trim();
+/** 解析人类可读大小："300M"、"1.5GB"、"512k"、纯数字（字节）。非法或空返回 null。 */
+export function parseSize(input: string | null | undefined): number | null {
+  const s = (input ?? '').trim();
   if (!s) return null;
   const m = /^([\d.]+)\s*([a-zA-Z]*)$/.exec(s);
   if (!m) return null;

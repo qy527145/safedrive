@@ -27,7 +27,7 @@ import {
 import type { InputRef } from 'antd';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { api, streamUrl, uploadFile, type FsEntry } from '../api/client';
+import { api, streamUrl, uploadFile, type FileCacheStatus, type FsEntry } from '../api/client';
 import PreviewModal from '../components/PreviewModal';
 import { useSources } from '../stores/sources';
 import { taskProgress, taskUploaded, useTasks } from '../stores/tasks';
@@ -143,17 +143,36 @@ export default function BrowserPage() {
     message.success('播放链接已复制（可直接粘贴到 VLC / IINA / 其他设备）');
   };
 
-  const watchCache = (name: string) => {
+  const refreshCacheStatus = useCallback(async (name: string) => {
     const path = joinPath(name);
-    const poll = async () => {
-      try {
-        const cache = await api.fileCacheStatus(dsId, path);
-        setEntries((current) => current.map((entry) => entry.name === name ? {...entry, cache} : entry));
-        if (!cache.complete) window.setTimeout(() => void poll(), 1000);
-      } catch { /* 页面切换或文件删除后停止轮询 */ }
-    };
-    void poll();
-  };
+    try {
+      const cache = await api.fileCacheStatus(dsId, path);
+      setEntries((current) => current.map((entry) => entry.name === name ? {...entry, cache} : entry));
+    } catch { /* 文件已删除或页面切换，忽略 */ }
+  }, [dsId, joinPath]);
+
+  const entriesRef = useRef<FsEntry[]>([]);
+  entriesRef.current = entries;
+
+  // 缓存进度实时化：无论是手动预热还是播放/下载的写透缓存，只要该文件
+  // 正在预热（warming）或有实时下行流量（= 正在回源写缓存），就每秒刷新
+  // 其真实缓存状态；命中缓存的播放没有下行流量，也不会产生新缓存，不刷。
+  useEffect(() => {
+    if (!ds?.cacheEnabled) return;
+    const inflight = new Set<string>();
+    const timer = window.setInterval(() => {
+      const speeds = useTransfers.getState().snapshot.fileDownloadSpeeds;
+      for (const entry of entriesRef.current) {
+        if (entry.isDir || entry.foreign || !entry.cache || entry.cache.complete) continue;
+        const active = entry.cache.warming
+          || (speeds[`${dsId}:${joinPath(entry.name)}`] ?? 0) > 0;
+        if (!active || inflight.has(entry.name)) continue;
+        inflight.add(entry.name);
+        void refreshCacheStatus(entry.name).finally(() => inflight.delete(entry.name));
+      }
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [ds?.cacheEnabled, dsId, joinPath, refreshCacheStatus]);
 
   // ---------- 删除 / 重命名 / 新建目录 ----------
   const deleteAction = (item: FsEntry) => {
@@ -354,19 +373,29 @@ export default function BrowserPage() {
           },
           {
             title: '缓存',
-            width: 170,
+            width: 200,
             render: (_, item) => item.isDir || item.foreign ? '-' : (
               <Space size="small">
-                <Tag color={item.cache?.complete ? 'success' : item.cache?.cached ? 'processing' : 'default'}>
-                  {item.cache?.complete ? '完整' : item.cache?.cached
-                    ? `${formatBytes(item.cache.bytesCached)}` : '未缓存'}
-                </Tag>
-                {!item.cache?.complete && ds?.cacheEnabled && <Button size="small" onClick={async () => {
+                <Tooltip
+                  title={item.cache && item.cache.bitmapSummary.length > 0 && (item.cache.cached || item.cache.warming)
+                    ? <CacheStrip cache={item.cache} /> : undefined}
+                >
+                  <Tag color={item.cache?.complete ? 'success' : item.cache?.warming ? 'processing' : item.cache?.cached ? 'warning' : 'default'}>
+                    {item.cache?.complete ? '完整' : item.cache?.cached
+                      ? `${formatBytes(item.cache.bytesCached)}` : item.cache?.warming ? '缓存中' : '未缓存'}
+                  </Tag>
+                </Tooltip>
+                {!item.cache?.complete && !item.cache?.warming && ds?.cacheEnabled && <Button size="small" onClick={async () => {
                   await api.warmFileCache(dsId, joinPath(item.name));
                   message.success('已开始在服务端缓存，可观察实时下行速度');
-                  watchCache(item.name);
+                  void refreshCacheStatus(item.name);
                 }}>缓存</Button>}
-                {item.cache?.cached && <Button size="small" danger onClick={async () => {
+                {item.cache?.warming && <Button size="small" onClick={async () => {
+                  await api.stopWarmFileCache(dsId, joinPath(item.name));
+                  message.success('已停止主动缓存任务；播放/下载经过服务器时仍会自动缓存');
+                  void refreshCacheStatus(item.name);
+                }}>停止</Button>}
+                {!item.cache?.warming && item.cache?.cached && <Button size="small" danger onClick={async () => {
                   const r = await api.clearFileCache(dsId, joinPath(item.name));
                   message.success(`已清理 ${formatBytes(r.freed)}`); await refresh();
                 }}>清理</Button>}
@@ -443,4 +472,38 @@ export default function BrowserPage() {
 function LiveFileSpeed({ identity, fallback }: { identity: string; fallback: number }) {
   const speed = useTransfers((state) => state.snapshot.fileDownloadSpeeds[identity] ?? fallback);
   return <span className="mono-metric">{formatBytes(speed)}/s</span>;
+}
+
+/**
+ * 缓存分布热力条（取自 hydraria 的 block-bitmap heat strip）：
+ * 每段代表文件的一个连续区段，亮度随该区段缓存比例从暗到亮；
+ * 悬停单段可见对应字节区间，直观看到「缓存了哪部分」。
+ */
+function CacheStrip({ cache }: { cache: FileCacheStatus }) {
+  const buckets = cache.bitmapSummary;
+  const total = cache.totalSize;
+  if (!buckets.length || !total) return null;
+  const pctTotal = Math.min(100, Math.round((cache.bytesCached / total) * 100));
+  return (
+    <div style={{ width: 320, padding: '2px 0' }}>
+      <div style={{ display: 'flex', height: 10, gap: 1, borderRadius: 3, overflow: 'hidden' }}>
+        {buckets.map((pct, i) => {
+          const lo = Math.floor((i * total) / buckets.length);
+          const hi = Math.floor(((i + 1) * total) / buckets.length) - 1;
+          // pct 0..100 → 亮度 0.08..1.0
+          const alpha = (0.08 + (pct / 100) * 0.92).toFixed(2);
+          return (
+            <div
+              key={i}
+              title={`已缓存 ${pct}% · 字节 ${lo}-${hi}`}
+              style={{ flex: 1, background: `rgba(110, 168, 255, ${alpha})` }}
+            />
+          );
+        })}
+      </div>
+      <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
+        已缓存 {formatBytes(cache.bytesCached)} / {formatBytes(total)}（{pctTotal}%）· 亮色为已缓存区段
+      </div>
+    </div>
+  );
 }

@@ -67,6 +67,10 @@ export interface FileCacheStatus {
   bytesCached: number;
   totalSize: number;
   complete: boolean;
+  /** 手动触发的后台缓存进行中（可停止）。播放/下载的写透缓存不受此标志影响 */
+  warming: boolean;
+  /** ≤128 个桶，每桶为该区段已缓存块的百分比 0-100（缓存分布热力条） */
+  bitmapSummary: number[];
 }
 
 export interface TransferSnapshot {
@@ -193,8 +197,11 @@ export const api = {
     request<{ ok: boolean; freed: number }>(
       `/api/files/${ds}/cache?path=${encodeURIComponent(path)}`, { method: 'DELETE' }),
   warmFileCache: (ds: string, path: string) =>
-    request<{ ok: boolean; complete: boolean }>(
+    request<{ ok: boolean; complete: boolean; warming?: boolean }>(
       `/api/files/${ds}/cache?path=${encodeURIComponent(path)}`, { method: 'POST' }),
+  stopWarmFileCache: (ds: string, path: string) =>
+    request<{ ok: boolean; stopped: boolean }>(
+      `/api/files/${ds}/cache/warm?path=${encodeURIComponent(path)}`, { method: 'DELETE' }),
 
   // ---- 上传双维度进度（encrypted = 本地已加密，uploaded = 远端已确认） ----
   uploadProgress: (id: string) =>

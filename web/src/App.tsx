@@ -1,5 +1,5 @@
 import {
-  DatabaseOutlined, FolderOpenOutlined, LogoutOutlined, SettingOutlined,
+  FolderOpenOutlined, LogoutOutlined, SettingOutlined,
   SwapOutlined, SafetyCertificateOutlined,
 } from '@ant-design/icons';
 import { Badge, Button, Layout, Menu, Spin, Typography } from 'antd';
@@ -10,7 +10,6 @@ import BrowserPage from './pages/BrowserPage';
 import DataPage from './pages/DataPage';
 import LoginPage from './pages/LoginPage';
 import SettingsPage from './pages/SettingsPage';
-import SourcesPage from './pages/SourcesPage';
 import { useAuth } from './stores/auth';
 import { useTasks } from './stores/tasks';
 import { startTransferPolling, useTransfers } from './stores/transfers';
@@ -79,7 +78,6 @@ function MainLayout() {
       </button>
       <Menu className="top-nav" mode="horizontal" selectedKeys={[selected]} onClick={(event) => navigate(event.key)} items={[
         { key: '/', icon: <FolderOpenOutlined />, label: '数据管理' },
-        { key: '/sources', icon: <DatabaseOutlined />, label: '数据源' },
         { key: '/settings', icon: <SettingOutlined />, label: '设置' },
       ]} />
       <div className="header-actions">
@@ -97,7 +95,6 @@ function MainLayout() {
         <Routes>
           <Route path="/" element={<DataPage />} />
           <Route path="/browse/:dsId" element={<BrowserPage />} />
-          <Route path="/sources" element={<SourcesPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
