@@ -19,7 +19,9 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use md5::{Digest, Md5};
-use reqwest::header::{CONTENT_RANGE, COOKIE, HeaderValue, RANGE, USER_AGENT};
+use reqwest::header::{
+    CONTENT_RANGE, CONTENT_TYPE, COOKIE, HeaderValue, RANGE, REFERER, USER_AGENT,
+};
 use reqwest::multipart::{Form, Part};
 use reqwest::{Client, Method, StatusCode, Url};
 use serde::Deserialize;
@@ -27,10 +29,11 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use super::{ByteStream, Entry, ProgressFn, Storage};
+use super::{ByteStream, CloudShare, Entry, ImportedEntry, ProgressFn, Storage};
 use crate::error::{ApiError, ApiResult};
 
 const XPAN_API: &str = "https://pan.baidu.com/rest/2.0/";
+const SHARE_API: &str = "https://pan.baidu.com/";
 const OAUTH_TOKEN_API: &str = "https://openapi.baidu.com/oauth/2.0/token";
 const OAUTH_DEVICE_CODE_API: &str = "https://openapi.baidu.com/oauth/2.0/device/code";
 const OAUTH_DEVICE_APPROVE_API: &str = "https://openapi.baidu.com/device";
@@ -137,6 +140,7 @@ impl Drop for TempUpload {
 pub struct BaiduPanFs {
     root: String,
     xpan_api_base: Url,
+    share_api_base: Url,
     oauth_token_api: Url,
     oauth_device_code_api: Url,
     oauth_device_approve_api: Url,
@@ -163,6 +167,8 @@ pub struct BaiduPanFs {
 
 #[derive(Debug, Deserialize)]
 struct BaiduListItem {
+    #[serde(default)]
+    fs_id: u64,
     server_filename: String,
     #[serde(default)]
     isdir: i8,
@@ -255,6 +261,7 @@ impl BaiduPanFs {
         Ok(Self {
             root,
             xpan_api_base: parse_url("openApiBase", XPAN_API)?,
+            share_api_base: parse_url("shareApiBase", SHARE_API)?,
             oauth_token_api: parse_url("oauthTokenUrl", OAUTH_TOKEN_API)?,
             oauth_device_code_api: parse_url("oauthDeviceCodeUrl", OAUTH_DEVICE_CODE_API)?,
             oauth_device_approve_api: parse_url("oauthDeviceApproveUrl", OAUTH_DEVICE_APPROVE_API)?,
@@ -1266,6 +1273,110 @@ impl BaiduPanFs {
         .await?;
         Ok(())
     }
+
+    fn share_url(&self, path: &str) -> ApiResult<Url> {
+        self.share_api_base
+            .join(path)
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("构造百度分享地址失败: {e}")))
+    }
+
+    async fn bdstoken(&self) -> ApiResult<String> {
+        let mut url = self.share_url("api/loginStatus")?;
+        url.query_pairs_mut().append_pair("clienttype", "0");
+        let response = self
+            .web_request(Method::GET, url)
+            .header(COOKIE, self.download_cookie.clone())
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(format!("获取百度分享令牌失败: {}", mask_err(&e))))?;
+        let value = Self::response_json(response, "获取分享令牌").await?;
+        Self::ensure_api_ok(&value, "获取分享令牌", &[])?;
+        value
+            .pointer("/login_info/bdstoken")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| ApiError::Upstream("百度分享令牌响应缺少 bdstoken，请更新 BDUSS".into()))
+    }
+
+    async fn object_id(&self, path: &str) -> ApiResult<u64> {
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        self.list(parent)
+            .await?
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .and_then(|entry| entry.id)
+            .ok_or_else(|| {
+                ApiError::NotFound(format!("百度网盘分享对象不存在或缺少 fs_id: {path}"))
+            })
+    }
+
+    fn share_cookie(randsk: &str) -> ApiResult<HeaderValue> {
+        HeaderValue::from_str(&format!("BDCLND={randsk}"))
+            .map_err(|_| ApiError::Upstream("百度分享凭证含非法字符".into()))
+    }
+}
+
+fn json_number(text: &str, key: &str) -> Option<u64> {
+    let at = text.find(&format!("\"{key}\""))?;
+    let tail = text[at..].split_once(':')?.1.trim_start();
+    let tail = tail.strip_prefix('"').unwrap_or(tail);
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+fn json_numbers(text: &str, key: &str) -> Vec<u64> {
+    let needle = format!("\"{key}\"");
+    let mut rest = text;
+    let mut values = Vec::new();
+    while let Some(at) = rest.find(&needle) {
+        let tail = &rest[at + needle.len()..];
+        if let Some((_, value)) = tail.split_once(':') {
+            let value = value.trim_start();
+            let value = value.strip_prefix('"').unwrap_or(value);
+            let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(number) = digits.parse() {
+                values.push(number);
+            }
+        }
+        rest = tail;
+    }
+    values
+}
+
+fn json_strings(text: &str, key: &str) -> Vec<String> {
+    let needle = format!("\"{key}\"");
+    let mut rest = text;
+    let mut values = Vec::new();
+    while let Some(at) = rest.find(&needle) {
+        let Some((_, tail)) = rest[at + needle.len()..].split_once(':') else {
+            break;
+        };
+        let tail = tail.trim_start();
+        if let Some(tail) = tail.strip_prefix('"')
+            && let Some(end) = tail.find('"')
+        {
+            values.push(tail[..end].replace("\\/", "/"));
+            rest = &tail[end + 1..];
+            continue;
+        }
+        rest = &rest[at + needle.len()..];
+    }
+    values
+}
+
+fn share_surl(url: &Url) -> Option<String> {
+    url.path_segments()?
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|parts| parts[0] == "s")
+        // 百度短链路径固定带一个标记字符 `1`；verify/list 使用的是其后的 shorturl。
+        .map(|parts| parts[1].strip_prefix('1').unwrap_or(parts[1]).to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+fn value_u64(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| value.as_str()?.parse().ok())
 }
 
 #[async_trait]
@@ -1302,6 +1413,7 @@ impl Storage for BaiduPanFs {
                     .map_err(|e| ApiError::Upstream(format!("解析百度网盘目录条目失败: {e}")))?;
             let count = items.len();
             entries.extend(items.into_iter().map(|item| Entry {
+                id: (item.fs_id != 0).then_some(item.fs_id),
                 name: item.server_filename,
                 is_dir: item.isdir == 1,
                 size: item.size,
@@ -1396,6 +1508,181 @@ impl Storage for BaiduPanFs {
         )
         .await
         .map(|_| ())
+    }
+
+    async fn share(&self, paths: &[String]) -> ApiResult<CloudShare> {
+        if paths.is_empty() {
+            return Err(ApiError::BadRequest("请至少选择一个分享条目".into()));
+        }
+        let mut ids = Vec::with_capacity(paths.len());
+        for path in paths {
+            ids.push(self.object_id(path).await?);
+        }
+        let alphabet = b"abcdefghjkmnpqrstuvwxyz23456789";
+        let mut random = [0u8; 4];
+        getrandom::fill(&mut random)
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("生成分享密码失败: {e}")))?;
+        let password: String = random
+            .into_iter()
+            .map(|byte| alphabet[byte as usize % alphabet.len()] as char)
+            .collect();
+        let token = self.bdstoken().await?;
+        let mut url = self.share_url("share/pset")?;
+        url.query_pairs_mut()
+            .append_pair("bdstoken", &token)
+            .append_pair("clienttype", "0");
+        let response = self
+            .web_request(Method::POST, url)
+            .header(COOKIE, self.download_cookie.clone())
+            .form(&[
+                ("fid_list", serde_json::to_string(&ids).unwrap()),
+                ("schannel", "4".to_owned()),
+                ("pwd", password.clone()),
+            ])
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(format!("创建百度分享失败: {}", mask_err(&e))))?;
+        let value = Self::response_json(response, "创建分享").await?;
+        Self::ensure_api_ok(&value, "创建分享", &[])?;
+        let url = value
+            .get("link")
+            .or_else(|| value.get("shorturl"))
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| ApiError::Upstream("百度创建分享响应缺少短链".into()))?;
+        Ok(CloudShare {
+            url: url.to_owned(),
+            password,
+        })
+    }
+
+    async fn import_share(&self, share: &CloudShare, dest: &str) -> ApiResult<Vec<ImportedEntry>> {
+        let initial =
+            Url::parse(&share.url).map_err(|_| ApiError::BadRequest("百度分享短链无效".into()))?;
+        if !matches!(initial.scheme(), "http" | "https") {
+            return Err(ApiError::BadRequest("百度分享短链协议无效".into()));
+        }
+        let allowed_host = initial.host_str() == Some("pan.baidu.com")
+            || initial.host_str() == self.share_api_base.host_str();
+        if !allowed_host {
+            return Err(ApiError::BadRequest("百度分享短链域名无效".into()));
+        }
+        // `/s/1xxxx` 中的 `1` 是路径标记；verify/list 使用后面的 shorturl。
+        // 不预先 GET 短链：受密码保护的链接会重定向到 share/init，反而丢失原路径。
+        let shorturl = share_surl(&initial)
+            .ok_or_else(|| ApiError::BadRequest("无法从百度分享短链提取 shorturl".into()))?;
+        let final_url = initial;
+
+        let mut verify_url = self.share_url("share/verify")?;
+        verify_url.query_pairs_mut().append_pair("surl", &shorturl);
+        let mut init_referer = self.share_url("share/init")?;
+        init_referer
+            .query_pairs_mut()
+            .append_pair("surl", &shorturl);
+        let verify_response = self
+            .web_request(Method::POST, verify_url)
+            .header(REFERER, init_referer.as_str())
+            .multipart(Form::new().text("pwd", share.password.clone()))
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(format!("验证百度分享密码失败: {}", mask_err(&e))))?;
+        let verified = Self::response_json(verify_response, "验证分享密码").await?;
+        Self::ensure_api_ok(&verified, "验证分享密码", &[])?;
+        let randsk = verified
+            .get("randsk")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| ApiError::Upstream("百度验证分享响应缺少 randsk".into()))?;
+        let share_cookie = Self::share_cookie(randsk)?;
+
+        let mut list_url = self.share_url("share/list")?;
+        list_url
+            .query_pairs_mut()
+            .append_pair("shorturl", &shorturl)
+            .append_pair("root", "1");
+        let list_response = self
+            .web_request(Method::GET, list_url)
+            .header(COOKIE, share_cookie)
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(format!("读取百度分享内容失败: {}", mask_err(&e))))?;
+        let listing = Self::response_json(list_response, "读取分享列表").await?;
+        Self::ensure_api_ok(&listing, "读取分享列表", &[])?;
+        let share_id = listing
+            .get("share_id")
+            .and_then(value_u64)
+            .ok_or_else(|| ApiError::Upstream("百度分享列表缺少 share_id".into()))?;
+        let from = listing
+            .get("uk")
+            .and_then(value_u64)
+            .ok_or_else(|| ApiError::Upstream("百度分享列表缺少 uk".into()))?;
+        let shared_items: Vec<(u64, String)> = listing
+            .get("list")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                Some((
+                    item.get("fs_id").and_then(value_u64)?,
+                    item.get("server_filename")?.as_str()?.to_owned(),
+                ))
+            })
+            .collect();
+        if shared_items.is_empty() {
+            return Err(ApiError::Upstream("百度分享中没有可转存的文件".into()));
+        }
+        let ids: Vec<u64> = shared_items.iter().map(|(id, _)| *id).collect();
+        // randsk 响应已是百分号编码；URL 构造器需要原始值，否则 `%` 会被二次编码。
+        let sekey = percent_encoding::percent_decode_str(randsk)
+            .decode_utf8()
+            .map_err(|_| ApiError::Upstream("百度随机访问码编码无效".into()))?;
+        let mut transfer_url = self.share_url("share/transfer")?;
+        transfer_url
+            .query_pairs_mut()
+            .append_pair("shareid", &share_id.to_string())
+            .append_pair("from", &from.to_string())
+            .append_pair("sekey", &sekey)
+            .append_pair("ondup", "newcopy")
+            .append_pair("async", "1")
+            .append_pair("clienttype", "0");
+        let destination = self.remote_path(dest);
+        let response = self
+            .web_request(Method::POST, transfer_url)
+            .header(COOKIE, self.download_cookie.clone())
+            .header(REFERER, final_url.as_str())
+            .header(
+                CONTENT_TYPE,
+                "application/x-www-form-urlencoded; charset=UTF-8",
+            )
+            .form(&[
+                ("fsidlist", serde_json::to_string(&ids).unwrap()),
+                ("path", destination),
+            ])
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(format!("转存百度分享失败: {}", mask_err(&e))))?;
+        let value = Self::response_json(response, "转存分享").await?;
+        Self::ensure_api_ok(&value, "转存分享", &[])?;
+        let mut transferred: HashMap<u64, String> = value
+            .pointer("/extra/list")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                let id = item.get("from_fs_id").and_then(value_u64)?;
+                let name = item.get("to")?.as_str()?.rsplit('/').next()?.to_owned();
+                Some((id, name))
+            })
+            .collect();
+        shared_items
+            .into_iter()
+            .map(|(id, source_name)| {
+                let name = transferred
+                    .remove(&id)
+                    .ok_or_else(|| ApiError::Upstream(format!("百度转存结果缺少源文件 ID {id}")))?;
+                Ok(ImportedEntry { source_name, name })
+            })
+            .collect()
     }
 
     async fn get(&self, path: &str) -> ApiResult<(Option<u64>, ByteStream)> {
@@ -1556,7 +1843,17 @@ fn log_url(url: &Url) -> String {
 /// reqwest 错误信息内嵌完整 URL（含 access_token 等凭据），入日志或
 /// 返回给客户端前必须脱敏。
 fn mask_err(e: &reqwest::Error) -> String {
-    mask_credentials(&e.to_string())
+    use std::error::Error;
+    let mut messages = vec![e.to_string()];
+    let mut source = e.source();
+    while let Some(error) = source {
+        let message = error.to_string();
+        if messages.last() != Some(&message) {
+            messages.push(message);
+        }
+        source = error.source();
+    }
+    mask_credentials(&messages.join(": "))
 }
 
 fn mask_credentials(s: &str) -> String {
@@ -1622,6 +1919,7 @@ mod tests {
             "oauthTokenUrl": format!("{base}/oauth/token"),
             "oauthDeviceCodeUrl": format!("{base}/oauth/device/code"),
             "oauthDeviceApproveUrl": format!("{base}/device"),
+            "shareApiBase": format!("{base}/"),
             "pcsApiBase": format!("{base}/rest/2.0/pcs/file"),
             "uploadApiBase": format!("{base}/rest/2.0/pcs/superfile2"),
             "uploadLocateApi": format!("{base}/rest/2.0/pcs/locateupload")
@@ -1646,6 +1944,20 @@ mod tests {
         assert!(!masked.contains("verysecretvalue"), "{masked}");
         assert!(!masked.contains("secret-device-code"), "{masked}");
         assert!(masked.contains("client_id=abc"), "{masked}");
+    }
+
+    #[test]
+    fn parses_share_page_metadata_and_short_link() {
+        let url = Url::parse("https://pan.baidu.com/s/1AbC123?pwd=xy9z").unwrap();
+        assert_eq!(share_surl(&url).as_deref(), Some("AbC123"));
+        let page = r#"{"shareid":12345,"share_uk":"67890","file_list":[{"fs_id":42,"server_filename":"first"},{"fs_id":"43","server_filename":"second"}]}"#;
+        assert_eq!(json_number(page, "shareid"), Some(12345));
+        assert_eq!(json_number(page, "share_uk"), Some(67890));
+        assert_eq!(json_numbers(page, "fs_id"), vec![42, 43]);
+        assert_eq!(
+            json_strings(page, "server_filename"),
+            vec!["first", "second"]
+        );
     }
 
     #[tokio::test]
@@ -1815,6 +2127,151 @@ mod tests {
         StatusCode::OK
     }
 
+    async fn login_status(
+        headers: HeaderMap,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        assert_eq!(headers.get(COOKIE).unwrap(), "BDUSS=test");
+        assert_eq!(query.len(), 1, "loginStatus 只应携带 clienttype");
+        assert_eq!(query.get("clienttype").map(String::as_str), Some("0"));
+        Json(json!({
+            "errno": 0,
+            "login_info": { "bdstoken": "share-token" }
+        }))
+    }
+
+    async fn share_pset(
+        headers: HeaderMap,
+        Query(query): Query<HashMap<String, String>>,
+        AxumForm(form): AxumForm<HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        assert_eq!(headers.get(COOKIE).unwrap(), "BDUSS=test");
+        assert_eq!(query.len(), 2, "pset 只应携带 bdstoken 和 clienttype");
+        assert_eq!(
+            query.get("bdstoken").map(String::as_str),
+            Some("share-token")
+        );
+        assert_eq!(query.get("clienttype").map(String::as_str), Some("0"));
+        assert_eq!(form.len(), 3, "pset 表单只应包含抓包确认的三个字段");
+        assert_eq!(
+            form.get("fid_list").map(String::as_str),
+            Some("[111029556403029]")
+        );
+        assert_eq!(form.get("schannel").map(String::as_str), Some("4"));
+        let password = form.get("pwd").expect("缺少分享密码");
+        assert_eq!(password.len(), 4);
+        assert!(password.chars().all(|ch| ch.is_ascii_alphanumeric()));
+        Json(json!({
+            "errno": 0,
+            "link": "https://pan.baidu.com/s/10Tu8WSOdLQVnJpX-oI8Fhg"
+        }))
+    }
+
+    async fn share_verify(
+        headers: HeaderMap,
+        request: axum::extract::Request,
+    ) -> impl IntoResponse {
+        assert!(
+            headers
+                .get(REFERER)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with("/share/init?surl=qym_MmGtZhFrTpKqf_H0oQ")
+        );
+        assert_eq!(request.uri().query(), Some("surl=qym_MmGtZhFrTpKqf_H0oQ"));
+        assert!(
+            headers
+                .get(CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("multipart/form-data; boundary=")
+        );
+        assert!(headers.get(COOKIE).is_none());
+        let body = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("name=\"pwd\""));
+        assert!(body.contains("8888"));
+        Json(json!({
+            "errno": 0,
+            "randsk": "1TC7Fk1rVV1N0p8a%2B6Ds%3D"
+        }))
+    }
+
+    async fn share_list(
+        headers: HeaderMap,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        assert_eq!(
+            headers.get(COOKIE).unwrap(),
+            "BDCLND=1TC7Fk1rVV1N0p8a%2B6Ds%3D"
+        );
+        assert_eq!(query.len(), 2);
+        assert_eq!(
+            query.get("shorturl").map(String::as_str),
+            Some("qym_MmGtZhFrTpKqf_H0oQ")
+        );
+        assert_eq!(query.get("root").map(String::as_str), Some("1"));
+        Json(json!({
+            "errno": 0,
+            "share_id": 7913431993u64,
+            "uk": 2225681668u64,
+            "list": [{
+                "fs_id": "468270950994653",
+                "server_filename": "cipher-dir",
+                "isdir": "1"
+            }]
+        }))
+    }
+
+    async fn share_transfer(
+        headers: HeaderMap,
+        Query(query): Query<HashMap<String, String>>,
+        AxumForm(form): AxumForm<HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        assert_eq!(headers.get(COOKIE).unwrap(), "BDUSS=test");
+        assert!(
+            headers
+                .get(REFERER)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with("/s/1qym_MmGtZhFrTpKqf_H0oQ")
+        );
+        assert_eq!(
+            headers.get(CONTENT_TYPE).unwrap(),
+            "application/x-www-form-urlencoded; charset=UTF-8"
+        );
+        assert_eq!(query.len(), 6);
+        assert_eq!(query.get("shareid").map(String::as_str), Some("7913431993"));
+        assert_eq!(query.get("from").map(String::as_str), Some("2225681668"));
+        assert_eq!(
+            query.get("sekey").map(String::as_str),
+            Some("1TC7Fk1rVV1N0p8a+6Ds=")
+        );
+        assert_eq!(query.get("ondup").map(String::as_str), Some("newcopy"));
+        assert_eq!(query.get("async").map(String::as_str), Some("1"));
+        assert_eq!(query.get("clienttype").map(String::as_str), Some("0"));
+        assert_eq!(
+            form.get("fsidlist").map(String::as_str),
+            Some("[468270950994653]")
+        );
+        assert_eq!(form.get("path").map(String::as_str), Some("/safe/asd"));
+        Json(json!({
+            "errno": 0,
+            "extra": { "list": [{
+                "from": "/cipher-dir",
+                "from_fs_id": 468270950994653u64,
+                "to": "/safe/asd/cipher-dir (1)",
+                "to_fs_id": 305680771816485u64
+            }]},
+            "task_id": 0
+        }))
+    }
+
     async fn xpan_get(
         headers: HeaderMap,
         Query(query): Query<HashMap<String, String>>,
@@ -1831,6 +2288,7 @@ mod tests {
         Json(json!({
             "errno": 0,
             "list": [{
+                "fs_id": 111029556403029u64,
                 "server_filename": "cipher-dir",
                 "isdir": 1,
                 "size": 0,
@@ -1993,6 +2451,11 @@ mod tests {
             .route("/oauth/token", get(oauth_token))
             .route("/oauth/device/code", get(oauth_device_code))
             .route("/device", get(oauth_device_approve))
+            .route("/api/loginStatus", get(login_status))
+            .route("/share/pset", post(share_pset))
+            .route("/share/verify", post(share_verify))
+            .route("/share/list", get(share_list))
+            .route("/share/transfer", post(share_transfer))
             .route("/rest/2.0/xpan/file", get(xpan_get).post(xpan_post))
             .route("/rest/2.0/xpan/nas", get(uinfo))
             .route("/rest/2.0/pcs/superfile2", post(upload_block))
@@ -2038,6 +2501,22 @@ mod tests {
             (&"renewed-token".to_string(), &"refresh-new-2".to_string())
         );
         assert!(second.2 >= unix_time_secs() + 3599);
+        let share = fs.share(&["cipher-dir".to_owned()]).await.unwrap();
+        assert_eq!(share.url, "https://pan.baidu.com/s/10Tu8WSOdLQVnJpX-oI8Fhg");
+        assert_eq!(share.password.len(), 4);
+        let imported = fs
+            .import_share(
+                &CloudShare {
+                    url: format!("{base}/s/1qym_MmGtZhFrTpKqf_H0oQ"),
+                    password: "8888".into(),
+                },
+                "asd",
+            )
+            .await
+            .unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].source_name, "cipher-dir");
+        assert_eq!(imported[0].name, "cipher-dir (1)");
         fs.mkdir("new").await.unwrap();
         fs.rename("new", "renamed").await.unwrap();
         fs.delete("renamed").await.unwrap();

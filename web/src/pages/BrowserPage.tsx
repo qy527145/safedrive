@@ -5,6 +5,7 @@ import {
   ClearOutlined,
   CloudDownloadOutlined,
   DeleteOutlined,
+  DownOutlined,
   DownloadOutlined,
   EditOutlined,
   EyeOutlined,
@@ -12,6 +13,7 @@ import {
   FolderAddOutlined,
   FolderOutlined,
   LinkOutlined,
+  ImportOutlined,
   MoreOutlined,
   PauseCircleOutlined,
   ReloadOutlined,
@@ -22,6 +24,7 @@ import {
   Breadcrumb,
   Button,
   Card,
+  Checkbox,
   Dropdown,
   Empty,
   Input,
@@ -32,10 +35,9 @@ import {
   Tag,
   Tooltip,
   Typography,
-  Upload,
 } from 'antd';
 import type { InputRef, MenuProps } from 'antd';
-import type { DragEvent } from 'react';
+import type { ChangeEvent, DragEvent } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api, streamUrl, uploadFile, type FileCacheStatus, type FsEntry } from '../api/client';
@@ -116,6 +118,7 @@ export default function BrowserPage() {
   const ds = sources.list.find((d) => d.id === dsId);
   const [stack, setStack] = useState<string[]>([]);
   const [entries, setEntries] = useState<FsEntry[]>([]);
+  const [selectedNames, setSelectedNames] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const dragDepth = useRef(0);
@@ -140,6 +143,7 @@ export default function BrowserPage() {
     setLoading(true);
     try {
       setEntries(await api.listFiles(dsId, curPath));
+      setSelectedNames([]);
     } catch (e) {
       message.error(e instanceof Error ? e.message : String(e));
     } finally {
@@ -157,6 +161,8 @@ export default function BrowserPage() {
   }, [refresh]);
 
   // ---------- 上传 ----------
+  const filePicker = useRef<HTMLInputElement>(null);
+  const folderPicker = useRef<HTMLInputElement>(null);
   const enqueueUploads = (files: UploadCandidate[]) => {
     const existing = new Set(entries.map((e) => e.name));
     for (const { file, relativePath } of files) {
@@ -212,6 +218,12 @@ export default function BrowserPage() {
     // 文件夹选择带 webkitRelativePath（"目录/子目录/文件"），普通选择为空。
     relativePath: (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name,
   }));
+
+  const onPickerChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = '';
+    if (files.length) enqueueUploads(pickerCandidates(files));
+  };
 
   const isFileDrag = (event: DragEvent) =>
     Array.from(event.dataTransfer.types).includes('Files');
@@ -389,6 +401,66 @@ export default function BrowserPage() {
     setTimeout(() => nameInput.current?.focus(), 100);
   };
 
+  // ---------- 云盘分享 ----------
+  const createShareAction = async () => {
+    if (selectedNames.length === 0) {
+      message.warning('请先选择要分享的文件或文件夹');
+      return;
+    }
+    let result: { link: string };
+    try {
+      result = await api.createShare(dsId, selectedNames.map(joinPath));
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    modal.confirm({
+      title: `已创建分享（${selectedNames.length} 项）`,
+      icon: <LinkOutlined />,
+      content: <Space direction="vertical" style={{ width: '100%' }}>
+        <Typography.Text type="warning">链接包含提取码和解密信息，请只发给可信接收者。</Typography.Text>
+        <Input.TextArea readOnly value={result.link} autoSize={{ minRows: 4, maxRows: 8 }} onFocus={(e) => e.target.select()} />
+      </Space>,
+      okText: '复制链接',
+      cancelText: '关闭',
+      onOk: async () => {
+        await navigator.clipboard.writeText(result.link);
+        message.success('标准分享链接已复制');
+      },
+    });
+  };
+
+  const importShareAction = () => {
+    let link = '';
+    const run = async (force: boolean) => {
+      const result = await api.importShare(dsId, link.trim(), curPath, force);
+      message.success(`已导入 ${result.imported} 项`);
+      await refresh();
+    };
+    modal.confirm({
+      title: '导入分享',
+      icon: <ImportOutlined />,
+      content: <Input.TextArea autoSize={{ minRows: 4, maxRows: 8 }} placeholder="粘贴 sd:// 分享链接" onChange={(e) => { link = e.target.value; }} />,
+      okText: '导入到当前目录',
+      onOk: async () => {
+        if (!link.trim()) throw new Error('请粘贴分享链接');
+        try {
+          await run(false);
+        } catch (error) {
+          const text = error instanceof Error ? error.message : String(error);
+          if (!text.includes('加密模式不兼容')) throw error;
+          modal.confirm({
+            title: '加密模式不兼容',
+            content: `${text}。仍要继续吗？`,
+            okText: '仍然导入',
+            okButtonProps: { danger: true },
+            onOk: () => run(true),
+          });
+        }
+      },
+    });
+  };
+
   // ---------- 行为 ----------
   const onNameClick = (item: FsEntry) => {
     if (item.foreign) return;
@@ -461,6 +533,15 @@ export default function BrowserPage() {
           <span>支持文件和文件夹，将上传到当前目录</span>
         </div>
       )}
+      <input ref={filePicker} type="file" multiple hidden onChange={onPickerChange} />
+      <input
+        ref={folderPicker}
+        type="file"
+        multiple
+        hidden
+        {...({ webkitdirectory: '', directory: '' } as Record<string, string>)}
+        onChange={onPickerChange}
+      />
       <Card
       title={
         <Space size={4}>
@@ -498,30 +579,20 @@ export default function BrowserPage() {
               { value: 'card', icon: <AppstoreOutlined />, title: '卡片视图' },
             ]}
           />
-          <Upload
-            multiple
-            showUploadList={false}
-            beforeUpload={(file, fileList) => {
-              // beforeUpload 每个文件回调一次；只在首个文件时入队整批
-              if (file === fileList[0]) enqueueUploads(pickerCandidates(fileList as unknown as File[]));
-              return false;
-            }}
+          <Dropdown
+            menu={{ items: [
+              { key: 'files', label: '选择文件（可多选）', onClick: () => filePicker.current?.click() },
+              { key: 'folder', label: '选择文件夹', onClick: () => folderPicker.current?.click() },
+            ] }}
           >
             <Button type="primary" icon={<UploadOutlined />}>
-              上传文件
+              上传 <DownOutlined />
             </Button>
-          </Upload>
-          <Upload
-            directory
-            showUploadList={false}
-            beforeUpload={(file, fileList) => {
-              // beforeUpload 每个文件回调一次；只在首个文件时入队整批
-              if (file === fileList[0]) enqueueUploads(pickerCandidates(fileList as unknown as File[]));
-              return false;
-            }}
-          >
-            <Button icon={<UploadOutlined />}>上传文件夹</Button>
-          </Upload>
+          </Dropdown>
+          {ds?.type === 'baidupan' && <Button icon={<LinkOutlined />} disabled={!selectedNames.length} onClick={() => void createShareAction()}>
+            分享{selectedNames.length ? ` (${selectedNames.length})` : ''}
+          </Button>}
+          {ds?.type === 'baidupan' && <Button icon={<ImportOutlined />} onClick={importShareAction}>导入分享</Button>}
           <Button icon={<FolderAddOutlined />} onClick={newFolderAction}>
             新建目录
           </Button>
@@ -545,6 +616,14 @@ export default function BrowserPage() {
                   className={`file-tile${item.foreign ? ' foreign' : ''}`}
                   onClick={() => onNameClick(item)}
                 >
+                  {!item.foreign && ds?.type === 'baidupan' && <Checkbox
+                    checked={selectedNames.includes(item.name)}
+                    onClick={(event) => event.stopPropagation()}
+                    onChange={(event) => setSelectedNames((current) => event.target.checked
+                      ? [...current, item.name]
+                      : current.filter((name) => name !== item.name))}
+                    style={{ position: 'absolute', left: 10, top: 10 }}
+                  />}
                   <div className="file-tile-icon">
                     {item.isDir ? (
                       <FolderOutlined style={{ color: '#faad14' }} />
@@ -574,11 +653,16 @@ export default function BrowserPage() {
         </Spin>
       ) : (
       <Table<FsEntry>
-        rowKey={(e) => `${e.foreign ? 'f' : 'm'}:${e.name}`}
+        rowKey="name"
         dataSource={entries}
         loading={loading}
         pagination={false}
         size="middle"
+        rowSelection={ds?.type === 'baidupan' ? {
+          selectedRowKeys: selectedNames,
+          getCheckboxProps: (item) => ({ disabled: item.foreign }),
+          onChange: (keys) => setSelectedNames(keys.map(String)),
+        } : undefined}
         columns={[
           {
             title: '名称',

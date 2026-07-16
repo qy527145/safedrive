@@ -27,7 +27,7 @@ use crate::vault::CachedNode;
 
 const PLAIN_VOLUME_SUFFIX: &str = ".__safedrive_volumes__";
 
-fn parent_and_name(path: &str) -> (&str, &str) {
+pub(crate) fn parent_and_name(path: &str) -> (&str, &str) {
     path.rsplit_once('/').unwrap_or(("", path))
 }
 
@@ -75,7 +75,7 @@ fn volume_names(format: &str, source: &str, count: usize) -> Vec<String> {
         .collect()
 }
 
-async fn plain_locate(
+pub(crate) async fn plain_locate(
     storage: &dyn crate::adapters::Storage,
     path: &str,
 ) -> ApiResult<(crate::adapters::Entry, String, bool)> {

@@ -147,6 +147,7 @@ impl Storage for WebdavFs {
                 continue;
             }
             entries.push(Entry {
+                id: None,
                 name,
                 is_dir: item.is_dir,
                 size: item.size,

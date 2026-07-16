@@ -4,7 +4,7 @@ pub mod webdav;
 
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
 use crate::registry::DataSource;
@@ -13,11 +13,31 @@ use crate::registry::DataSource;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Entry {
+    /// 上游数据源的稳定对象 ID（不支持的数据源为 None）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
     /// 毫秒时间戳；未知时为 0。
     pub mtime: u64,
+}
+
+/// 云盘原生分享结果。标准 `sd://` 封装由路由层统一完成。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudShare {
+    pub url: String,
+    pub password: String,
+}
+
+/// 云盘转存后的名称映射。`source_name` 是分享中的存储名，`name` 是目标目录
+/// 实际落地名（上游使用 newcopy 时两者可能不同）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedEntry {
+    pub source_name: String,
+    pub name: String,
 }
 
 pub type ByteStream = BoxStream<'static, std::io::Result<bytes::Bytes>>;
@@ -38,6 +58,18 @@ pub trait Storage: Send + Sync {
     async fn delete(&self, path: &str) -> ApiResult<()>;
     /// 重命名/移动（同一数据源内）。
     async fn rename(&self, from: &str, to: &str) -> ApiResult<()>;
+    /// 使用数据源的原生能力创建分享。`paths` 是存储端相对路径。
+    async fn share(&self, _paths: &[String]) -> ApiResult<CloudShare> {
+        Err(ApiError::BadRequest("该数据源不支持分享".into()))
+    }
+    /// 解析并转存原生分享到 `dest`，返回转存后在目标目录下的存储名。
+    async fn import_share(
+        &self,
+        _share: &CloudShare,
+        _dest: &str,
+    ) -> ApiResult<Vec<ImportedEntry>> {
+        Err(ApiError::BadRequest("该数据源不支持导入分享".into()))
+    }
     /// 流式读取整个对象，返回 (大小(若已知), 字节流)。
     async fn get(&self, path: &str) -> ApiResult<(Option<u64>, ByteStream)>;
     /// 读取对象的字节区间 [start, end]（含端点）。下载引擎的 fetcher 用它并行拉取分片。

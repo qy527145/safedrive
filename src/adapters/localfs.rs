@@ -57,6 +57,7 @@ impl Storage for LocalFs {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             entries.push(Entry {
+                id: None,
                 name,
                 is_dir: meta.is_dir(),
                 size: if meta.is_dir() { 0 } else { meta.len() },

@@ -65,6 +65,7 @@ export interface DsConfig {
   accessToken?: string;
   refreshToken?: string;
   accessTokenExpiresAt?: number;
+  shareApiBase?: string;
 }
 export type DsInput = Omit<DsRecord, 'id' | 'createdAt' | 'password'> & { password?: string };
 
@@ -196,6 +197,16 @@ export const api = {
     request<{ ok: boolean }>(`/api/files/${ds}/delete-foreign`, {
       method: 'POST',
       body: JSON.stringify({ path, name }),
+    }),
+  createShare: (ds: string, paths: string[]) =>
+    request<{ link: string }>(`/api/files/${ds}/share`, {
+      method: 'POST',
+      body: JSON.stringify({ paths }),
+    }),
+  importShare: (ds: string, link: string, dir: string, force = false) =>
+    request<{ ok: boolean; imported: number }>(`/api/files/${ds}/import`, {
+      method: 'POST',
+      body: JSON.stringify({ link, dir, force }),
     }),
   fileCacheStatus: (ds: string, path: string) =>
     request<FileCacheStatus>(`/api/files/${ds}/cache?path=${encodeURIComponent(path)}`),

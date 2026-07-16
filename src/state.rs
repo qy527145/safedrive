@@ -8,6 +8,38 @@ use crate::registry::Registry;
 use crate::settings::SettingsStore;
 use crate::vault::PathCache;
 
+/// SafeDrive 发往数据源的 HTTP 客户端配置。代理和调试 TLS 只影响上游请求，
+/// 不影响浏览器访问 SafeDrive 自身的监听地址。
+#[derive(Debug, Clone, Default)]
+pub struct HttpClientOptions {
+    pub proxy: Option<String>,
+    pub ca_cert: Option<PathBuf>,
+    pub insecure_tls: bool,
+}
+
+fn build_http_client(options: &HttpClientOptions) -> anyhow::Result<reqwest::Client> {
+    let mut builder =
+        reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+    if let Some(proxy) = options.proxy.as_deref() {
+        builder = builder.proxy(reqwest::Proxy::all(proxy)?);
+    }
+    if let Some(path) = options.ca_cert.as_deref() {
+        let bytes = std::fs::read(path).map_err(|error| {
+            anyhow::anyhow!("读取 HTTP CA 证书 {} 失败: {error}", path.display())
+        })?;
+        let certificate = reqwest::Certificate::from_pem(&bytes)
+            .or_else(|_| reqwest::Certificate::from_der(&bytes))
+            .map_err(|error| {
+                anyhow::anyhow!("解析 HTTP CA 证书 {} 失败: {error}", path.display())
+            })?;
+        builder = builder.add_root_certificate(certificate);
+    }
+    if options.insecure_tls {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    Ok(builder.build()?)
+}
+
 /// 全局应用状态。加解密全部在服务端完成（信任模型：服务器可信、云存储不可信）。
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
@@ -42,13 +74,20 @@ impl std::ops::Deref for AppState {
 }
 
 impl AppState {
+    #[cfg(test)]
     pub fn new(data_dir: PathBuf, admin_password: Option<String>) -> anyhow::Result<Self> {
+        Self::new_with_http_options(data_dir, admin_password, HttpClientOptions::default())
+    }
+
+    pub fn new_with_http_options(
+        data_dir: PathBuf,
+        admin_password: Option<String>,
+        http_options: HttpClientOptions,
+    ) -> anyhow::Result<Self> {
         let registry = Registry::load(data_dir.join("datasources.json"))?;
         let settings = SettingsStore::load(data_dir.join("settings.json"))?;
         let content_cache = Arc::new(crate::cache::CacheStore::new(data_dir.join("cache"))?);
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()?;
+        let http = build_http_client(&http_options)?;
         Ok(Self(Arc::new(Inner {
             registry,
             settings,

@@ -1,26 +1,14 @@
-//! 分享 API：子树快照导出 + 分享包导入（嫁接）。
-//!
-//! v5 信封链下的分享物 = 节点密钥 + 定位信息：
-//! - 文件分享包：`{ kind:"file", name, size, secret }`
-//! - 目录分享包：`{ kind:"dir",  name, secret }` —— 持 FK 者可解开整棵
-//!   子树（含分享后新增的条目）。
-//!
-//! 导入 = **嫁接（graft）**：接收方先把密文数据放进自己数据源（云盘侧
-//! 转存/手动拷贝，内容零重加密），再调 import 在目标目录下用自己的
-//! nameKey 编一个新信封（secret 原样），指向该密文数据。
-//!
-//! 重名策略（on_conflict）：rename（默认，自动加「 (N)」后缀，Finder 式）
-//! / skip / error。
+//! 标准 `sd://` 分享协议与云盘原生分享/转存编排。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::routing::post;
 use axum::{Json, Router};
 use base64::Engine;
-use base64::engine::general_purpose::STANDARD as B64;
+use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::adapters::sanitize;
+use crate::adapters::{CloudShare, sanitize};
 use crate::crypto::SECRET_LEN;
 use crate::crypto::names::{NameMeta, decode_name, encode_name};
 use crate::error::{ApiError, ApiResult};
@@ -37,191 +25,196 @@ pub fn routes() -> Router<AppState> {
 
 #[derive(Deserialize)]
 struct ShareBody {
-    /// 要分享的明文路径。
-    path: String,
+    paths: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct SharePack {
-    sdshare: u32,
-    kind: String, // "file" | "dir"
+#[serde(rename_all = "camelCase")]
+struct SharedItem {
+    storage_name: String,
     name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    size: Option<u64>,
-    /// base64(节点秘密)：文件 pw / 目录 FK。
-    secret: String,
-    /// 该节点在导出方云端的密文路径（云盘侧转存时定位用）。
-    enc_path: String,
+    size: u64,
+    is_dir: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret: Option<String>,
 }
 
-/// 导出分享包。**分享包含密钥明文** —— 请通过安全渠道传递。
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SharePack {
+    version: u32,
+    source_type: String,
+    cloud: CloudShare,
+    encrypted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root_password: Option<String>,
+    items: Vec<SharedItem>,
+}
+
 async fn share_export(
     State(state): State<AppState>,
     Path(ds): Path<String>,
     Json(body): Json<ShareBody>,
-) -> ApiResult<Json<SharePack>> {
-    let path = sanitize(&body.path)?;
-    if path.is_empty() {
-        return Err(ApiError::BadRequest("不能分享数据源根目录".into()));
+) -> ApiResult<Json<serde_json::Value>> {
+    if body.paths.is_empty() {
+        return Err(ApiError::BadRequest("请至少选择一个文件或文件夹".into()));
     }
+    if body.paths.len() > 100 {
+        return Err(ApiError::BadRequest("单次最多分享 100 个条目".into()));
+    }
+    let datasource = state.datasource(&ds)?;
     let storage = state.adapter(&ds)?;
-    let node = super::files::resolve(&state, storage.as_ref(), &ds, &path).await?;
-    let meta = decode_name(&node.parent_key, &node.nc)
-        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("无法解码 {path} 的密文名")))?;
-    Ok(Json(SharePack {
-        sdshare: 1,
-        kind: if node.dir {
-            "dir".into()
+    let mut storage_paths = Vec::with_capacity(body.paths.len());
+    let mut items = Vec::with_capacity(body.paths.len());
+    for raw_path in body.paths {
+        let path = sanitize(&raw_path)?;
+        if path.is_empty() {
+            return Err(ApiError::BadRequest("不能分享数据源根目录".into()));
+        }
+        if datasource.encryption_enabled {
+            let node = super::files::resolve(&state, storage.as_ref(), &ds, &path).await?;
+            let meta = decode_name(&node.parent_key, &node.nc)
+                .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("无法解码 {path} 的密文名")))?;
+            storage_paths.push(node.enc_path);
+            items.push(SharedItem {
+                storage_name: node.nc,
+                name: meta.name,
+                size: meta.size,
+                is_dir: meta.is_dir,
+                secret: Some(B64.encode(meta.secret)),
+            });
         } else {
-            "file".into()
-        },
-        name: meta.name,
-        size: (!node.dir).then_some(meta.size),
-        secret: B64.encode(node.secret),
-        enc_path: node.enc_path,
-    }))
+            let (entry, actual, _) = super::files::plain_locate(storage.as_ref(), &path).await?;
+            let storage_name = super::files::parent_and_name(&actual).1.to_owned();
+            storage_paths.push(actual);
+            items.push(SharedItem {
+                storage_name,
+                name: super::files::parent_and_name(&path).1.to_owned(),
+                size: entry.size,
+                is_dir: entry.is_dir,
+                secret: None,
+            });
+        }
+    }
+    let cloud = storage.share(&storage_paths).await?;
+    let pack = SharePack {
+        version: 1,
+        source_type: datasource.ds_type,
+        cloud,
+        encrypted: datasource.encryption_enabled,
+        root_password: datasource.encryption_enabled.then_some(datasource.password),
+        items,
+    };
+    let encoded = URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&pack).map_err(|e| ApiError::Internal(e.into()))?);
+    Ok(Json(json!({ "link": format!("sd://{encoded}") })))
 }
 
-// ---------------- 导入（嫁接） ----------------
-
 #[derive(Deserialize)]
-struct ImportQuery {
-    /// 冲突策略：rename（默认）/ skip / error。
-    #[serde(default)]
-    on_conflict: Option<String>,
-}
-
-#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ImportBody {
-    /// 分享包。
-    pack: SharePack,
-    /// 目标明文目录（"" = 根）。
+    link: String,
     dir: String,
-    /// 密文数据在**本数据源**中的当前位置（云盘转存后的密文文件夹名，
-    /// 相对目标目录的存储端路径；即转存落地的那个乱名目录）。
-    enc_name: String,
+    #[serde(default)]
+    force: bool,
 }
 
-/// 把分享的密文数据嫁接进自己的文件树：给它编一个自己父钥的新信封。
-/// 前置：接收方已把密文文件夹放到目标目录对应的存储端目录下。
 async fn share_import(
     State(state): State<AppState>,
     Path(ds): Path<String>,
-    Query(q): Query<ImportQuery>,
     Json(body): Json<ImportBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    if body.pack.sdshare != 1 {
-        return Err(ApiError::BadRequest("不支持的分享包版本".into()));
+    if body.link.len() > 64 * 1024 {
+        return Err(ApiError::BadRequest("分享链接过长".into()));
     }
-    let is_dir = match body.pack.kind.as_str() {
-        "dir" => true,
-        "file" => false,
-        other => return Err(ApiError::BadRequest(format!("未知分享类型: {other}"))),
-    };
-    let secret: [u8; SECRET_LEN] = B64
-        .decode(&body.pack.secret)
+    let encoded = body
+        .link
+        .trim()
+        .strip_prefix("sd://")
+        .ok_or_else(|| ApiError::BadRequest("分享链接必须以 sd:// 开头".into()))?;
+    let pack: SharePack = URL_SAFE_NO_PAD
+        .decode(encoded)
         .ok()
-        .and_then(|v| v.try_into().ok())
-        .ok_or_else(|| ApiError::BadRequest("分享包密钥格式无效".into()))?;
-    let enc_name = body.enc_name.trim();
-    if enc_name.is_empty() || enc_name.contains('/') {
-        return Err(ApiError::BadRequest("enc_name 必须是单段存储名".into()));
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| ApiError::BadRequest("分享链接格式无效或已损坏".into()))?;
+    if pack.version != 1 {
+        return Err(ApiError::BadRequest(format!(
+            "不支持的分享协议版本: {}",
+            pack.version
+        )));
     }
-    let on_conflict = q.on_conflict.as_deref().unwrap_or("rename");
-
+    let datasource = state.datasource(&ds)?;
+    if datasource.ds_type != pack.source_type {
+        return Err(ApiError::BadRequest(format!(
+            "分享属于 {} 数据源，不能导入到 {} 数据源",
+            pack.source_type, datasource.ds_type
+        )));
+    }
+    if datasource.encryption_enabled != pack.encrypted && !body.force {
+        return Err(ApiError::BadRequest(
+            "加密模式不兼容：分享与当前数据源一个加密、一个未加密；确认强制导入后内容将按外来条目显示".into(),
+        ));
+    }
     let dir = sanitize(&body.dir)?;
     let storage = state.adapter(&ds)?;
-
-    // 嫁接与 mkdir 同锁：判存 + rename 必须互斥
-    let lock = state.mkdir_lock(&ds);
-    let _guard = lock.lock().await;
-
-    let parent = super::files::resolve(&state, storage.as_ref(), &ds, &dir).await?;
-    if !parent.dir {
-        return Err(ApiError::BadRequest(format!("{dir} 不是目录")));
-    }
-    // 密文数据必须已就位
-    let src_enc = super::files::join_enc(&parent.enc_path, enc_name);
-    storage
-        .list(&src_enc)
-        .await
-        .map_err(|_| ApiError::BadRequest(format!("密文数据未就位: {enc_name}")))?;
-
-    // 重名解决：rename → 「name (N)」；skip → 幂等返回；error → 409 语义
-    let entries = storage.list(&parent.enc_path).await?;
-    let taken: std::collections::HashSet<String> = entries
-        .iter()
-        .filter(|e| e.is_dir)
-        .filter_map(|e| decode_name(&parent.secret, &e.name).map(|m| m.name))
-        .collect();
-    let final_name = if !taken.contains(&body.pack.name) {
-        body.pack.name.clone()
+    let parent = if datasource.encryption_enabled {
+        Some(super::files::resolve(&state, storage.as_ref(), &ds, &dir).await?)
     } else {
-        match on_conflict {
-            "skip" => {
-                return Ok(Json(
-                    json!({ "ok": true, "skipped": true, "name": body.pack.name }),
-                ));
-            }
-            "error" => {
-                return Err(ApiError::BadRequest(format!(
-                    "已存在同名条目: {}",
-                    body.pack.name
-                )));
-            }
-            _ => next_free_name(&body.pack.name, &taken)
-                .ok_or_else(|| ApiError::BadRequest("无法生成不冲突的名字".into()))?,
+        None
+    };
+    let dest = parent
+        .as_ref()
+        .map_or(dir.as_str(), |node| node.enc_path.as_str());
+    let transferred = storage.import_share(&pack.cloud, dest).await?;
+
+    // 两端均加密：内容无需重加密，只把每个根信封改用当前目录密钥封装；
+    // 这正是一次存储端 rename，节点 secret 与整棵子树密码链保持不变。
+    if pack.encrypted && datasource.encryption_enabled {
+        let parent = parent.expect("加密数据源必有目标父节点");
+        if transferred.len() != pack.items.len() {
+            return Err(ApiError::Upstream(format!(
+                "百度转存返回 {} 个条目，分享包包含 {} 个，无法安全重建加密文件名",
+                transferred.len(),
+                pack.items.len()
+            )));
         }
-    };
-
-    // 新信封（secret 原样 → 分享者的整棵子树钥匙链保持有效）
-    let meta = NameMeta {
-        name: final_name.clone(),
-        size: body.pack.size.unwrap_or(0),
-        is_dir,
-        secret,
-    };
-    let new_nc = encode_name(&parent.secret, &meta)
-        .ok_or_else(|| ApiError::BadRequest(format!("名称过长: {final_name}")))?;
-    let dst_enc = super::files::join_enc(&parent.enc_path, &new_nc);
-    storage.rename(&src_enc, &dst_enc).await?;
-
-    let child_path = if dir.is_empty() {
-        final_name.clone()
-    } else {
-        format!("{dir}/{final_name}")
-    };
-    state.cache.put(
-        &ds,
-        &child_path,
-        crate::vault::CachedNode {
-            secret,
-            nc: new_nc,
-            dir: is_dir,
-        },
-    );
-    Ok(Json(
-        json!({ "ok": true, "name": final_name, "renamed": final_name != body.pack.name }),
-    ))
-}
-
-/// Finder 式后缀：「报告.pdf」→「报告 (1).pdf」；目录「电影」→「电影 (1)」。
-fn next_free_name(name: &str, taken: &std::collections::HashSet<String>) -> Option<String> {
-    let (stem, ext) = match name.rsplit_once('.') {
-        // 隐藏文件（.gitignore）或无扩展名的按整名处理
-        Some((s, e)) if !s.is_empty() => (s, Some(e)),
-        _ => (name, None),
-    };
-    for n in 1..1000u32 {
-        let candidate = match ext {
-            Some(e) => format!("{stem} ({n}).{e}"),
-            None => format!("{stem} ({n})"),
-        };
-        if !taken.contains(&candidate) {
-            return Some(candidate);
+        let transferred_names: std::collections::HashMap<&str, &str> = transferred
+            .iter()
+            .map(|entry| (entry.source_name.as_str(), entry.name.as_str()))
+            .collect();
+        for item in &pack.items {
+            let landed_name = transferred_names
+                .get(item.storage_name.as_str())
+                .ok_or_else(|| {
+                    ApiError::Upstream(format!(
+                        "百度转存结果缺少预期条目 {}，已停止重建加密文件名",
+                        item.storage_name
+                    ))
+                })?;
+            let secret: [u8; SECRET_LEN] = item
+                .secret
+                .as_deref()
+                .and_then(|secret| B64.decode(secret).ok())
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| ApiError::BadRequest("分享包的节点密钥无效".into()))?;
+            let meta = NameMeta {
+                name: item.name.clone(),
+                size: item.size,
+                is_dir: item.is_dir,
+                secret,
+            };
+            let new_name = encode_name(&parent.secret, &meta)
+                .ok_or_else(|| ApiError::BadRequest(format!("名称过长: {}", item.name)))?;
+            storage
+                .rename(
+                    &super::files::join_enc(&parent.enc_path, landed_name),
+                    &super::files::join_enc(&parent.enc_path, &new_name),
+                )
+                .await?;
         }
+        state.cache.evict_subtree(&ds, &dir);
     }
-    None
+    Ok(Json(json!({ "ok": true, "imported": transferred.len() })))
 }
 
 // ---------------- 同名清理（rclone dedupe 式兜底） ----------------

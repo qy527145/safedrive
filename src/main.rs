@@ -29,6 +29,15 @@ struct Cli {
     /// 管理密码；不设置则免登录（仅建议本机使用）
     #[arg(long, env = "SAFEDRIVE_ADMIN_PASSWORD")]
     admin_password: Option<String>,
+    /// 上游 HTTP/HTTPS 代理，例如 http://127.0.0.1:8080
+    #[arg(long, env = "SAFEDRIVE_HTTP_PROXY")]
+    http_proxy: Option<String>,
+    /// 额外信任的 PEM/DER CA 证书（mitmproxy 通常使用 mitmproxy-ca-cert.pem）
+    #[arg(long, env = "SAFEDRIVE_HTTP_CA_CERT")]
+    http_ca_cert: Option<std::path::PathBuf>,
+    /// 跳过上游 HTTPS 证书校验；仅限临时抓包调试
+    #[arg(long, env = "SAFEDRIVE_INSECURE_TLS", default_value_t = false)]
+    insecure_tls: bool,
 }
 
 #[tokio::main]
@@ -68,7 +77,24 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let state = state::AppState::new(data_dir, cli.admin_password)?;
+    if cli.http_proxy.is_some() {
+        tracing::info!("已为上游数据源请求启用显式 HTTP 代理");
+    }
+    if let Some(path) = &cli.http_ca_cert {
+        tracing::info!("已加载上游 HTTP 附加 CA: {}", path.display());
+    }
+    if cli.insecure_tls {
+        tracing::warn!("已禁用上游 HTTPS 证书校验；仅应在临时抓包调试时使用");
+    }
+    let state = state::AppState::new_with_http_options(
+        data_dir,
+        cli.admin_password,
+        state::HttpClientOptions {
+            proxy: cli.http_proxy,
+            ca_cert: cli.http_ca_cert,
+            insecure_tls: cli.insecure_tls,
+        },
+    )?;
     let app = routes::router(state);
 
     let listener = tokio::net::TcpListener::bind(&cli.bind).await?;
