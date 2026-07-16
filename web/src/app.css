@@ -90,6 +90,16 @@ body > #root { min-height: 100vh; }
 .source-icon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 10px;
   color: var(--sd-accent); font-size: 22px; background: rgba(110,168,255,.1); border: 1px solid rgba(110,168,255,.18); }
 .source-icon-sm { width: 30px; height: 30px; font-size: 15px; border-radius: 8px; }
+/* 文件浏览器拖放上传：遮罩覆盖当前目录，但不拦截 dragleave/drop 事件。 */
+.file-drop-zone { position: relative; }
+.file-drop-zone.is-dragging > .ant-card { border-color: var(--sd-accent) !important; }
+.file-drop-overlay { position: absolute; inset: 0; z-index: 20; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 8px; min-height: 260px; pointer-events: none;
+  color: var(--sd-text); border: 2px dashed var(--sd-accent); border-radius: 8px;
+  background: rgba(10, 12, 18, .88); backdrop-filter: blur(6px); }
+.file-drop-overlay .anticon { color: var(--sd-accent); font-size: 42px; }
+.file-drop-overlay strong { font-size: 18px; }
+.file-drop-overlay span { color: #9aa6ba; font-size: 13px; }
 /* 文件浏览器卡片视图：自适应网格瓦片 */
 .file-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); gap: 12px;
   min-height: 240px; align-content: start; }

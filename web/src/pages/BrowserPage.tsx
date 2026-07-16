@@ -35,6 +35,7 @@ import {
   Upload,
 } from 'antd';
 import type { InputRef, MenuProps } from 'antd';
+import type { DragEvent } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api, streamUrl, uploadFile, type FileCacheStatus, type FsEntry } from '../api/client';
@@ -43,6 +44,66 @@ import { useSources } from '../stores/sources';
 import { taskProgress, taskUploaded, useTasks } from '../stores/tasks';
 import { formatBytes, formatTime, previewKind } from '../utils/format';
 import { useTransfers } from '../stores/transfers';
+
+type UploadCandidate = { file: File; relativePath: string };
+
+type DroppedFileEntry = {
+  isFile: true;
+  isDirectory: false;
+  fullPath: string;
+  file: (success: (file: File) => void, error?: (error: DOMException) => void) => void;
+};
+
+type DroppedDirectoryEntry = {
+  isFile: false;
+  isDirectory: true;
+  createReader: () => {
+    readEntries: (
+      success: (entries: DroppedEntry[]) => void,
+      error?: (error: DOMException) => void,
+    ) => void;
+  };
+};
+
+type DroppedEntry = DroppedFileEntry | DroppedDirectoryEntry;
+
+const readDroppedFile = (entry: DroppedFileEntry) =>
+  new Promise<File>((resolve, reject) => entry.file(resolve, reject));
+
+/** readEntries 每次只保证返回一批，目录较大时必须一直读取到空批次。 */
+async function readDroppedDirectory(entry: DroppedDirectoryEntry): Promise<DroppedEntry[]> {
+  const reader = entry.createReader();
+  const result: DroppedEntry[] = [];
+  while (true) {
+    const batch = await new Promise<DroppedEntry[]>((resolve, reject) =>
+      reader.readEntries(resolve, reject),
+    );
+    if (batch.length === 0) return result;
+    result.push(...batch);
+  }
+}
+
+async function filesFromDroppedEntry(entry: DroppedEntry): Promise<UploadCandidate[]> {
+  if (entry.isFile) {
+    const file = await readDroppedFile(entry);
+    return [{ file, relativePath: entry.fullPath.replace(/^\/+/, '') || file.name }];
+  }
+  const children = await readDroppedDirectory(entry);
+  return (await Promise.all(children.map(filesFromDroppedEntry))).flat();
+}
+
+async function filesFromDrop(dataTransfer: DataTransfer): Promise<UploadCandidate[]> {
+  const entries = Array.from(dataTransfer.items)
+    .filter((item) => item.kind === 'file')
+    .map((item) =>
+      (item as unknown as { webkitGetAsEntry?: () => DroppedEntry | null })
+        .webkitGetAsEntry?.() ?? null,
+    )
+    .filter((entry): entry is DroppedEntry => entry !== null);
+
+  if (entries.length > 0) return (await Promise.all(entries.map(filesFromDroppedEntry))).flat();
+  return Array.from(dataTransfer.files).map((file) => ({ file, relativePath: file.name }));
+}
 
 /** 加密文件浏览器：与服务端只交换明文路径，加解密全部发生在服务端。 */
 export default function BrowserPage() {
@@ -56,6 +117,8 @@ export default function BrowserPage() {
   const [stack, setStack] = useState<string[]>([]);
   const [entries, setEntries] = useState<FsEntry[]>([]);
   const [loading, setLoading] = useState(false);
+  const [draggingFiles, setDraggingFiles] = useState(false);
+  const dragDepth = useRef(0);
   const [preview, setPreview] = useState<{ path: string; name: string; size: number } | null>(null);
   // 呈现方式：列表（表格）/ 卡片（网格），记忆在本地
   const [view, setView] = useState<'list' | 'card'>(() =>
@@ -94,11 +157,10 @@ export default function BrowserPage() {
   }, [refresh]);
 
   // ---------- 上传 ----------
-  const enqueueUploads = (files: File[]) => {
+  const enqueueUploads = (files: UploadCandidate[]) => {
     const existing = new Set(entries.map((e) => e.name));
-    for (const file of files) {
-      // 文件夹上传带 webkitRelativePath（"目录/子目录/文件"），普通上传为空
-      const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
+    for (const { file, relativePath } of files) {
+      const rel = relativePath.replace(/\\/g, '/');
       const top = rel.split('/')[0];
       if (rel === file.name && existing.has(top)) {
         message.warning(`已存在同名条目，跳过: ${top}`);
@@ -142,6 +204,52 @@ export default function BrowserPage() {
           void refresh();
         },
       );
+    }
+  };
+
+  const pickerCandidates = (files: File[]) => files.map((file) => ({
+    file,
+    // 文件夹选择带 webkitRelativePath（"目录/子目录/文件"），普通选择为空。
+    relativePath: (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name,
+  }));
+
+  const isFileDrag = (event: DragEvent) =>
+    Array.from(event.dataTransfer.types).includes('Files');
+
+  const onDragEnter = (event: DragEvent<HTMLDivElement>) => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    dragDepth.current += 1;
+    setDraggingFiles(true);
+  };
+
+  const onDragOver = (event: DragEvent<HTMLDivElement>) => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  };
+
+  const onDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDraggingFiles(false);
+  };
+
+  const onDrop = async (event: DragEvent<HTMLDivElement>) => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    dragDepth.current = 0;
+    setDraggingFiles(false);
+    try {
+      const files = await filesFromDrop(event.dataTransfer);
+      if (files.length === 0) {
+        message.warning('没有找到可上传的文件（空文件夹暂不支持上传）');
+        return;
+      }
+      enqueueUploads(files);
+    } catch (error) {
+      message.error(`读取拖入内容失败: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
 
@@ -339,7 +447,21 @@ export default function BrowserPage() {
   }
 
   return (
-    <Card
+    <div
+      className={`file-drop-zone${draggingFiles ? ' is-dragging' : ''}`}
+      onDragEnter={onDragEnter}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={(event) => void onDrop(event)}
+    >
+      {draggingFiles && (
+        <div className="file-drop-overlay" aria-hidden="true">
+          <UploadOutlined />
+          <strong>拖放到这里上传</strong>
+          <span>支持文件和文件夹，将上传到当前目录</span>
+        </div>
+      )}
+      <Card
       title={
         <Space size={4}>
           <Button type="text" icon={<ArrowLeftOutlined />} onClick={() => navigate('/')} />
@@ -381,7 +503,7 @@ export default function BrowserPage() {
             showUploadList={false}
             beforeUpload={(file, fileList) => {
               // beforeUpload 每个文件回调一次；只在首个文件时入队整批
-              if (file === fileList[0]) enqueueUploads(fileList as unknown as File[]);
+              if (file === fileList[0]) enqueueUploads(pickerCandidates(fileList as unknown as File[]));
               return false;
             }}
           >
@@ -394,7 +516,7 @@ export default function BrowserPage() {
             showUploadList={false}
             beforeUpload={(file, fileList) => {
               // beforeUpload 每个文件回调一次；只在首个文件时入队整批
-              if (file === fileList[0]) enqueueUploads(fileList as unknown as File[]);
+              if (file === fileList[0]) enqueueUploads(pickerCandidates(fileList as unknown as File[]));
               return false;
             }}
           >
@@ -582,7 +704,8 @@ export default function BrowserPage() {
           onClose={() => setPreview(null)}
         />
       )}
-    </Card>
+      </Card>
+    </div>
   );
 }
 
