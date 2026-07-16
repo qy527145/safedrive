@@ -19,7 +19,7 @@ use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{Stream, StreamExt};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -28,7 +28,7 @@ use crate::crypto::{ChunkPrp, content_cipher_params};
 use crate::error::{ApiError, ApiResult};
 
 /// 开区间请求的首块小分片（加速播放器起播/seek 响应）。
-const HEAD_SMALL_SPLIT: u64 = 512 * 1024;
+const HEAD_SMALL_SPLIT: u64 = 256 * 1024;
 const HEAD_SMALL_COUNT: usize = 4;
 
 // ---------------- 布局（≈ hydraria probe） ----------------
@@ -193,9 +193,20 @@ pub fn plan_chunks(
     max_split: u64,
     open_ended: bool,
 ) -> Vec<PlannedChunk> {
+    plan_chunks_with_head_count(layout, start, end, max_split, open_ended, HEAD_SMALL_COUNT)
+}
+
+fn plan_chunks_with_head_count(
+    layout: &FileLayout,
+    start: u64,
+    end: u64,
+    max_split: u64,
+    open_ended: bool,
+    head_count: usize,
+) -> Vec<PlannedChunk> {
     let split = max_split.max(1); // 下限由设置校验保证，这里只防 0
     let head: usize = if open_ended && split > HEAD_SMALL_SPLIT {
-        HEAD_SMALL_COUNT
+        head_count
     } else {
         0
     };
@@ -232,18 +243,6 @@ pub struct StreamParams {
     pub max_split: u64,
     pub max_threads: usize,
     pub max_per_volume: usize,
-}
-
-/// fetcher 退出（成功/失败/被 abort）时自动归还并发额度。
-struct ReleaseGuard {
-    tx: mpsc::UnboundedSender<usize>,
-    vol: usize,
-}
-
-impl Drop for ReleaseGuard {
-    fn drop(&mut self) {
-        let _ = self.tx.send(self.vol);
-    }
 }
 
 /// 按合并区间 [start, end] 流式产出解密后的明文字节，可选持久密文缓存。
@@ -310,14 +309,22 @@ pub fn stream_range_cached_mode(
     let max_split = storage
         .max_range_size()
         .map_or(params.max_split, |limit| params.max_split.min(limit));
-    let plan = plan_chunks(&layout, start, end, max_split, open_ended);
     let max_threads = params.max_threads.max(1);
     let max_per_volume = params.max_per_volume.max(1);
+    // 整个初始并发窗口都使用小分片；否则默认 16 线程会有 12 个线程
+    // 越过 Hydraria 固定的 4 块头部区，立即跑到播放点几十 MiB 之外。
+    let plan = plan_chunks_with_head_count(
+        &layout,
+        start,
+        end,
+        max_split,
+        open_ended,
+        max_threads.max(HEAD_SMALL_COUNT),
+    );
     let total_chunks = plan.len();
-    let vol_count = layout.volumes.len().max(1);
 
     tracing::debug!(
-        "stream_range [{start},{end}] chunks={total_chunks} split={} threads={max_threads} per_vol={max_per_volume} open_ended={open_ended}",
+        "stream_range [{start},{end}] chunks={total_chunks} split={} threads={max_threads} per_vol={max_per_volume} open_ended={open_ended} window={max_threads}",
         max_split,
     );
 
@@ -336,100 +343,85 @@ pub fn stream_range_cached_mode(
     }
 
     let (out_tx, out_rx) = mpsc::channel::<io::Result<Bytes>>(8);
-    let (release_tx, mut release_rx) = mpsc::unbounded_channel::<usize>();
-    let cancel = Arc::new(Notify::new());
 
-    // 调度器：优先按计划顺序并遵守单卷额度；额度用尽后扫描后续分卷，
-    // 若没有其它分卷可用则软化单卷上限，保证总线程不会无故闲置。
-    let sched_plan = plan.clone();
-    let sched_cancel = Arc::clone(&cancel);
-    let sched_storage = Arc::clone(&storage);
-    let sched_layout = Arc::clone(&layout);
-    let sched_cache = cache;
-    let sched_progress = network_progress;
+    // 调度器与 serializer 合并：窗口锚定当前输出块，只有播放器真正
+    // 消费完一块才向前移动一格，不再因后台 fetch 已完成而无限预取。
     tokio::spawn(async move {
-        let mut spawned = vec![false; total_chunks];
-        let mut spawned_count = 0usize;
-        let mut inflight = 0usize;
-        let mut inflight_vol = vec![0usize; vol_count];
+        let plan = Arc::new(plan);
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(total_chunks);
-        loop {
-            while spawned_count < total_chunks && inflight < max_threads {
-                // 与 hydraria 一致：先选最低序号且未达到单卷上限的块；
-                // 若请求只覆盖一个分卷，则软化单卷上限以用满总线程预算。
-                let pick = (0..total_chunks)
-                    .find(|&idx| {
-                        !spawned[idx] && inflight_vol[sched_plan[idx].vol] < max_per_volume
-                    })
-                    .or_else(|| (0..total_chunks).find(|&idx| !spawned[idx]));
-                let Some(idx) = pick else { break };
-                let c = sched_plan[idx].clone();
-                let tx = senders[idx].take().expect("每个 chunk 只孵化一次");
-                let guard = ReleaseGuard {
-                    tx: release_tx.clone(),
-                    vol: c.vol,
-                };
-                spawned[idx] = true;
-                spawned_count += 1;
-                inflight += 1;
-                inflight_vol[c.vol] += 1;
-                let vol_name = sched_layout.volumes[c.vol].name.clone();
-                let obj_path = if enc_folder.is_empty() {
-                    vol_name
-                } else {
-                    format!("{enc_folder}/{vol_name}")
-                };
-                let st = Arc::clone(&sched_storage);
-                let chunk_cache = sched_cache.clone();
-                let progress = sched_progress.clone();
-                handles.push(tokio::spawn(async move {
-                    let _guard = guard;
-                    fetch_chunk(st, obj_path, pw, encrypted, c, tx, chunk_cache, progress).await;
-                }));
-            }
-            if spawned_count >= total_chunks && inflight == 0 {
-                break;
-            }
-            tokio::select! {
-                _ = sched_cancel.notified() => {
-                    tracing::debug!("客户端断开，abort {} 个 in-flight fetcher", inflight);
-                    for h in &handles {
-                        h.abort();
-                    }
-                    break;
-                }
-                got = release_rx.recv() => {
-                    match got {
-                        Some(v) => {
-                            inflight -= 1;
-                            inflight_vol[v] -= 1;
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-    });
+        let mut next_to_spawn = 0usize;
 
-    // serializer：按计划顺序转发到输出通道。
-    let ser_cancel = Arc::clone(&cancel);
-    tokio::spawn(async move {
+        let spawn_one = |idx: usize, tx: mpsc::Sender<io::Result<Bytes>>| -> JoinHandle<()> {
+            let c = plan[idx].clone();
+            let vol_name = layout.volumes[c.vol].name.clone();
+            let obj_path = if enc_folder.is_empty() {
+                vol_name
+            } else {
+                format!("{enc_folder}/{vol_name}")
+            };
+            let st = Arc::clone(&storage);
+            let chunk_cache = cache.clone();
+            let progress = network_progress.clone();
+            tokio::spawn(async move {
+                fetch_chunk(st, obj_path, pw, encrypted, c, tx, chunk_cache, progress).await;
+            })
+        };
+        let abort_all = |handles: &[JoinHandle<()>]| {
+            for handle in handles {
+                handle.abort();
+            }
+        };
+
+        // 首块独占启动，保证云端连接、缓存磁盘锁和解密 CPU 优先服务
+        // 播放点；首字节进入 HTTP body 后再展开其余并发。
+        if total_chunks > 0 {
+            let tx = senders[0].take().expect("首块 sender 仅使用一次");
+            handles.push(spawn_one(0, tx));
+            next_to_spawn = 1;
+        }
+        let mut initial_window_opened = false;
+
         'outer: for (i, mut rx) in receivers.into_iter().enumerate() {
             let expect = plan[i].len;
             let mut got = 0u64;
             while got < expect {
-                match rx.recv().await {
+                let item = tokio::select! {
+                    biased;
+                    _ = out_tx.closed() => {
+                        tracing::debug!(
+                            "客户端在 chunk {i} 等待期间断开，abort {} 个 fetcher",
+                            handles.len()
+                        );
+                        abort_all(&handles);
+                        break 'outer;
+                    }
+                    item = rx.recv() => item,
+                };
+                match item {
                     Some(Ok(b)) => {
                         got += b.len() as u64;
                         if out_tx.send(Ok(b)).await.is_err() {
-                            // 客户端断开
-                            ser_cancel.notify_one();
+                            tracing::debug!(
+                                "客户端在 chunk {i} 输出期间断开，abort {} 个 fetcher",
+                                handles.len()
+                            );
+                            abort_all(&handles);
                             break 'outer;
+                        }
+                        if !initial_window_opened {
+                            let target = total_chunks.min(max_threads);
+                            while next_to_spawn < target {
+                                let idx = next_to_spawn;
+                                let tx = senders[idx].take().expect("chunk sender 仅使用一次");
+                                handles.push(spawn_one(idx, tx));
+                                next_to_spawn += 1;
+                            }
+                            initial_window_opened = true;
                         }
                     }
                     Some(Err(e)) => {
                         let _ = out_tx.send(Err(e)).await;
-                        ser_cancel.notify_one();
+                        abort_all(&handles);
                         break 'outer;
                     }
                     None => {
@@ -438,10 +430,20 @@ pub fn stream_range_cached_mode(
                                 "分片 {i} 提前结束（{got}/{expect} 字节）"
                             ))))
                             .await;
-                        ser_cancel.notify_one();
+                        abort_all(&handles);
                         break 'outer;
                     }
                 }
+            }
+
+            // 当前块已实际交付，播放窗口只前进一格。max_per_volume 保持
+            // 软限制语义，但绝不跳去远卷寻找配额，因此线程集中在播放点。
+            let target = total_chunks.min(i.saturating_add(1).saturating_add(max_threads));
+            while next_to_spawn < target {
+                let idx = next_to_spawn;
+                let tx = senders[idx].take().expect("chunk sender 仅使用一次");
+                handles.push(spawn_one(idx, tx));
+                next_to_spawn += 1;
             }
         }
     });
@@ -464,16 +466,26 @@ async fn fetch_chunk(
     if let Some(cache) = &cache
         && cache.has_range(c.merged_start, merged_end)
     {
-        match cache.read_range(c.merged_start, merged_end) {
-            Ok(cached_bytes) => {
-                let mut buf = cached_bytes.to_vec();
-                if encrypted {
-                    crate::crypto::apply_content_keystream(&pw, c.merged_start, &mut buf);
-                }
-                let _ = tx.send(Ok(Bytes::from(buf))).await;
+        // 稀疏文件读取和大块 ChaCha20 解密都是同步操作。放在 async
+        // worker 上会阻塞整个 Tokio runtime，表现为“缓存已满仍等很久”。
+        let hit_cache = Arc::clone(cache);
+        let hit_start = c.merged_start;
+        let hit = tokio::task::spawn_blocking(move || {
+            let cached_bytes = hit_cache.read_range(hit_start, merged_end)?;
+            let mut buf = cached_bytes.to_vec();
+            if encrypted {
+                crate::crypto::apply_content_keystream(&pw, hit_start, &mut buf);
+            }
+            Ok::<Bytes, io::Error>(Bytes::from(buf))
+        })
+        .await;
+        match hit {
+            Ok(Ok(bytes)) => {
+                let _ = tx.send(Ok(bytes)).await;
                 return;
             }
-            Err(e) => tracing::warn!("读取密文缓存失败，回源: {e}"),
+            Ok(Err(e)) => tracing::warn!("读取密文缓存失败，回源: {e}"),
+            Err(e) => tracing::warn!("缓存读取任务异常，回源: {e}"),
         }
     }
     if let Some(cache) = &cache {
@@ -1131,6 +1143,25 @@ mod tests {
         // 非开区间不削
         let plan2 = plan_chunks(&l, 0, l.total - 1, 5_000_000, false);
         assert_eq!(plan2[0].len, 5_000_000);
+    }
+
+    #[test]
+    fn open_ended_initial_window_stays_close_to_playback_point() {
+        let threads = 16;
+        let l = layout(&[256 * 1024 * 1024]);
+        let plan = plan_chunks_with_head_count(&l, 0, l.total - 1, 5 * 1024 * 1024, true, threads);
+        assert!(plan.len() > threads);
+        assert!(
+            plan[..threads]
+                .iter()
+                .all(|chunk| chunk.len == HEAD_SMALL_SPLIT),
+            "初始线程窗口必须全部使用小分片"
+        );
+        assert_eq!(
+            plan[threads - 1].merged_start + plan[threads - 1].len,
+            threads as u64 * HEAD_SMALL_SPLIT,
+            "默认 16 线程只覆盖播放点附近 4 MiB，而非散到远端"
+        );
     }
 
     #[test]

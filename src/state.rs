@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::adapters::{self, Storage};
 use crate::error::{ApiError, ApiResult};
@@ -52,6 +53,11 @@ pub struct Inner {
     pub cache: PathCache,
     /// 全数据源共享的持久密文块缓存。
     pub content_cache: Arc<crate::cache::CacheStore>,
+    /// 播放器会在起播/seek 时连续建立多个 Range 请求。分卷布局来自一次
+    /// 云端 list，短期缓存可避免每个 Range 都重新探测所有分卷。
+    layout_cache: Mutex<HashMap<String, (Arc<crate::engine::FileLayout>, Instant)>>,
+    /// 同一文件的布局探测单飞锁，防止 PotPlayer 并发 Range 同时打到云端。
+    layout_probe_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub transfers: Arc<crate::transfer::TransferTracker>,
     /// 登录会话 token（内存态，重启后失效）。
     pub sessions: RwLock<HashSet<String>>,
@@ -93,6 +99,8 @@ impl AppState {
             settings,
             cache: PathCache::default(),
             content_cache,
+            layout_cache: Mutex::new(HashMap::new()),
+            layout_probe_locks: Mutex::new(HashMap::new()),
             transfers: Arc::new(crate::transfer::TransferTracker::default()),
             sessions: RwLock::new(HashSet::new()),
             uploading: Mutex::new(HashSet::new()),
@@ -150,6 +158,35 @@ impl AppState {
     pub fn mkdir_lock(&self, ds: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.mkdir_locks.lock().unwrap();
         Arc::clone(locks.entry(ds.to_string()).or_default())
+    }
+
+    /// Hydraria 的 probe cache 同类优化：播放器每次 seek 都会创建新连接，
+    /// 但分卷布局在短时间内不会变化，无需重复执行昂贵的云端 list。
+    pub fn cached_layout(&self, key: &str) -> Option<Arc<crate::engine::FileLayout>> {
+        const LAYOUT_CACHE_TTL: Duration = Duration::from_secs(300);
+        let mut cache = self.layout_cache.lock().unwrap();
+        match cache.get(key) {
+            Some((layout, saved_at)) if saved_at.elapsed() < LAYOUT_CACHE_TTL => {
+                Some(Arc::clone(layout))
+            }
+            Some(_) => {
+                cache.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    pub fn put_cached_layout(&self, key: String, layout: Arc<crate::engine::FileLayout>) {
+        self.layout_cache
+            .lock()
+            .unwrap()
+            .insert(key, (layout, Instant::now()));
+    }
+
+    pub fn layout_probe_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.layout_probe_locks.lock().unwrap();
+        Arc::clone(locks.entry(key.to_string()).or_default())
     }
 
     /// 数据源的信封链根密钥。

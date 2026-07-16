@@ -992,36 +992,43 @@ async fn file_cache_warm(
         if node.dir {
             return Err(ApiError::BadRequest("目录不能加入文件缓存".into()));
         }
-        let layout = engine::load_layout(storage.as_ref(), &node.enc_path, &node.secret).await?;
-        (
-            node.enc_path.clone(),
-            node.secret,
-            true,
-            layout,
-            node.enc_path,
+        let meta = decode_name(&node.parent_key, &node.nc)
+            .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("无法读取文件元数据")))?;
+        let identity = node.enc_path.clone();
+        let layout_key = crate::cache::CacheStore::key(&ds, &identity);
+        let layout = load_stream_layout(
+            &state,
+            &layout_key,
+            storage.as_ref(),
+            &node.enc_path,
+            &node.secret,
+            meta.size,
         )
+        .await?;
+        (node.enc_path.clone(), node.secret, true, layout, identity)
     } else {
         let (entry, actual, split) = plain_locate(storage.as_ref(), &path).await?;
         if entry.is_dir && !split {
             return Err(ApiError::BadRequest("目录不能加入文件缓存".into()));
         }
         let (folder, layout) = if split {
+            let layout_key = crate::cache::CacheStore::key(&ds, &actual);
             (
                 actual.clone(),
-                engine::load_layout_ordered(storage.as_ref(), &actual).await?,
+                load_ordered_stream_layout(&state, &layout_key, storage.as_ref(), &actual).await?,
             )
         } else {
             let (parent, name) = parent_and_name(&actual);
             (
                 parent.to_string(),
-                engine::FileLayout {
+                Arc::new(engine::FileLayout {
                     total: entry.size,
                     volumes: vec![engine::VolumeMeta {
                         name: name.into(),
                         size: entry.size,
                         offset: 0,
                     }],
-                },
+                }),
             )
         };
         (folder, [0u8; SECRET_LEN], false, layout, actual)
@@ -1046,7 +1053,7 @@ async fn file_cache_warm(
         folder,
         secret,
         encrypted,
-        Arc::new(layout),
+        layout,
         0,
         total - 1,
         false,
@@ -1428,8 +1435,18 @@ pub(crate) async fn stream_file(
     let transfer = state.settings.get();
     let enc_folder = node.enc_path.clone();
 
-    // 布局：列分卷 + 前缀和（≈ hydraria probe，本地信息、开销小，不做缓存）
-    let layout = Arc::new(engine::load_layout(storage.as_ref(), &enc_folder, &node.secret).await?);
+    // PotPlayer 起播和 seek 会连续建立 Range 连接。布局探测需要一次云端
+    // list，复用 Hydraria 的 probe-cache 思路，避免缓存命中时仍卡在探测上。
+    let layout_key = crate::cache::CacheStore::key(ds, &enc_folder);
+    let layout = load_stream_layout(
+        state,
+        &layout_key,
+        storage.as_ref(),
+        &enc_folder,
+        &node.secret,
+        meta.size,
+    )
+    .await?;
     if layout.total != meta.size {
         return Err(ApiError::Upstream(format!(
             "云端分卷总大小 {} 与记录 {} 不符（数据可能被外部修改）",
@@ -1523,6 +1540,62 @@ pub(crate) async fn stream_file(
         .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))
 }
 
+async fn load_stream_layout(
+    state: &AppState,
+    key: &str,
+    storage: &dyn crate::adapters::Storage,
+    enc_folder: &str,
+    secret: &[u8],
+    expected_total: u64,
+) -> ApiResult<Arc<engine::FileLayout>> {
+    if let Some(layout) = state.cached_layout(key)
+        && layout.total == expected_total
+    {
+        tracing::debug!("stream layout cache HIT key={key}");
+        return Ok(layout);
+    }
+
+    // Double-check under a per-file lock: PotPlayer commonly sends several
+    // initial Range probes concurrently and only the first one should list.
+    let probe_lock = state.layout_probe_lock(key);
+    let _guard = probe_lock.lock().await;
+    if let Some(layout) = state.cached_layout(key)
+        && layout.total == expected_total
+    {
+        tracing::debug!("stream layout cache HIT after inflight wait key={key}");
+        return Ok(layout);
+    }
+
+    let layout = Arc::new(engine::load_layout(storage, enc_folder, secret).await?);
+    state.put_cached_layout(key.to_string(), Arc::clone(&layout));
+    tracing::debug!(
+        "stream layout cache MISS key={key} total={} volumes={}",
+        layout.total,
+        layout.volumes.len()
+    );
+    Ok(layout)
+}
+
+async fn load_ordered_stream_layout(
+    state: &AppState,
+    key: &str,
+    storage: &dyn crate::adapters::Storage,
+    folder: &str,
+) -> ApiResult<Arc<engine::FileLayout>> {
+    if let Some(layout) = state.cached_layout(key) {
+        tracing::debug!("ordered stream layout cache HIT key={key}");
+        return Ok(layout);
+    }
+    let probe_lock = state.layout_probe_lock(key);
+    let _guard = probe_lock.lock().await;
+    if let Some(layout) = state.cached_layout(key) {
+        return Ok(layout);
+    }
+    let layout = Arc::new(engine::load_layout_ordered(storage, folder).await?);
+    state.put_cached_layout(key.to_string(), Arc::clone(&layout));
+    Ok(layout)
+}
+
 async fn stream_plain(
     state: &AppState,
     storage: Arc<dyn crate::adapters::Storage>,
@@ -1537,23 +1610,24 @@ async fn stream_plain(
         return Err(ApiError::BadRequest("不能下载目录".into()));
     }
     let (enc_folder, layout) = if split {
-        let layout = engine::load_layout_ordered(storage.as_ref(), &actual).await?;
+        let layout_key = crate::cache::CacheStore::key(ds, &actual);
+        let layout =
+            load_ordered_stream_layout(state, &layout_key, storage.as_ref(), &actual).await?;
         (actual.clone(), layout)
     } else {
         let (parent, name) = parent_and_name(&actual);
         (
             parent.to_string(),
-            engine::FileLayout {
+            Arc::new(engine::FileLayout {
                 volumes: vec![engine::VolumeMeta {
                     name: name.to_string(),
                     size: entry.size,
                     offset: 0,
                 }],
                 total: entry.size,
-            },
+            }),
         )
     };
-    let layout = Arc::new(layout);
     let total = layout.total;
     let mime = mime_guess::from_path(path).first_or_octet_stream();
     let file_name = parent_and_name(path).1;
