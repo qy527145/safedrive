@@ -8,6 +8,7 @@ import {
   DownOutlined,
   DownloadOutlined,
   EditOutlined,
+  ExportOutlined,
   EyeOutlined,
   FileOutlined,
   FolderAddOutlined,
@@ -42,6 +43,7 @@ import type { ChangeEvent, DragEvent } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { api, streamUrl, uploadFile, type FileCacheStatus, type FsEntry } from '../api/client';
+import MoveModal from '../components/MoveModal';
 import PreviewModal from '../components/PreviewModal';
 import { useSources } from '../stores/sources';
 import { taskProgress, taskUploaded, useTasks } from '../stores/tasks';
@@ -128,6 +130,7 @@ export default function BrowserPage() {
   );
   const [entries, setEntries] = useState<FsEntry[]>([]);
   const [selectedNames, setSelectedNames] = useState<string[]>([]);
+  const [moveOpen, setMoveOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const dragDepth = useRef(0);
@@ -346,6 +349,41 @@ export default function BrowserPage() {
       onOk: async () => {
         await api.deletePath(dsId, joinPath(item.name));
         message.success('已删除');
+        await refresh();
+      },
+    });
+  };
+
+  /** 批量删除：逐项串行删除选中条目，失败的逐条归因，最后统一刷新。 */
+  const batchDeleteAction = () => {
+    const names = [...selectedNames];
+    modal.confirm({
+      title: `删除选中的 ${names.length} 项？`,
+      content: '云端密文与密码本中的对应密钥都会被删除，目录会递归删除。',
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        const failed: string[] = [];
+        let done = 0;
+        for (const name of names) {
+          try {
+            await api.deletePath(dsId, joinPath(name));
+            done += 1;
+          } catch (e) {
+            failed.push(`${name}：${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+        if (failed.length === 0) {
+          message.success(`已删除 ${done} 项`);
+        } else {
+          modal.error({
+            title: `${failed.length} 项删除失败${done ? `（${done} 项已成功）` : ''}`,
+            content: (
+              <Typography.Paragraph style={{ whiteSpace: 'pre-wrap', marginBottom: 0 }}>
+                {failed.join('\n')}
+              </Typography.Paragraph>
+            ),
+          });
+        }
         await refresh();
       },
     });
@@ -659,6 +697,20 @@ export default function BrowserPage() {
         </Space>
       }
     >
+      {selectedNames.length > 0 && (
+        <Space style={{ marginBottom: 12 }} wrap>
+          <Typography.Text type="secondary">已选 {selectedNames.length} 项</Typography.Text>
+          <Button size="small" icon={<ExportOutlined />} onClick={() => setMoveOpen(true)}>
+            移动到…
+          </Button>
+          <Button size="small" danger icon={<DeleteOutlined />} onClick={batchDeleteAction}>
+            删除
+          </Button>
+          <Button size="small" type="text" onClick={() => setSelectedNames([])}>
+            取消选择
+          </Button>
+        </Space>
+      )}
       {view === 'card' ? (
         <Spin spinning={loading}>
           {entries.length === 0 ? (
@@ -675,7 +727,7 @@ export default function BrowserPage() {
                   className={`file-tile${item.foreign ? ' foreign' : ''}`}
                   onClick={() => onNameClick(item)}
                 >
-                  {!item.foreign && ds?.type === 'baidupan' && <Checkbox
+                  {!item.foreign && <Checkbox
                     checked={selectedNames.includes(item.name)}
                     onClick={(event) => event.stopPropagation()}
                     onChange={(event) => setSelectedNames((current) => event.target.checked
@@ -717,11 +769,11 @@ export default function BrowserPage() {
         loading={loading}
         pagination={false}
         size="middle"
-        rowSelection={ds?.type === 'baidupan' ? {
+        rowSelection={{
           selectedRowKeys: selectedNames,
           getCheckboxProps: (item) => ({ disabled: item.foreign }),
           onChange: (keys) => setSelectedNames(keys.map(String)),
-        } : undefined}
+        }}
         columns={[
           {
             title: '名称',
@@ -849,6 +901,16 @@ export default function BrowserPage() {
           },
         ]}
       />
+      )}
+
+      {moveOpen && (
+        <MoveModal
+          dsId={dsId}
+          sourceDir={curPath}
+          names={selectedNames}
+          onClose={() => setMoveOpen(false)}
+          onMoved={() => void refresh()}
+        />
       )}
 
       {preview && (
