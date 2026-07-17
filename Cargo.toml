@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "端到端零知识加密的数据源管理 Web 客户端（单二进制，前端嵌入）"
 license = "MIT"
+repository = "https://github.com/qy527145/safedrive"
+# 前端产物随包发布，cargo install 不依赖 bun/npm；发布前需先执行 bun run --cwd web build
+include = ["/src/**", "/build.rs", "/web/dist/**", "/README.md", "/LICENSE"]
 
 [dependencies]
 anyhow = "1"
