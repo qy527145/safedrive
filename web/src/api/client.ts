@@ -47,7 +47,7 @@ export interface FsEntry {
   isDir: boolean;
   size: number;
   mtime: number;
-  /** true = 无法解密的外来条目（仅可删除） */
+  /** true = 无法解密的外来条目（可删除；受管格式的可输入原密码解密纳管） */
   foreign: boolean;
   cache?: FileCacheStatus;
   downloadSpeed: number;
@@ -197,6 +197,12 @@ export const api = {
     request<{ ok: boolean }>(`/api/files/${ds}/delete-foreign`, {
       method: 'POST',
       body: JSON.stringify({ path, name }),
+    }),
+  /** 用条目原加密密码（f_key）解密外来条目，并改用当前链路密码重新封装名字。 */
+  adoptForeign: (ds: string, path: string, name: string, password: string) =>
+    request<{ ok: boolean; name: string; isDir: boolean }>(`/api/files/${ds}/adopt-foreign`, {
+      method: 'POST',
+      body: JSON.stringify({ path, name, password }),
     }),
   createShare: (ds: string, paths: string[]) =>
     request<{ link: string }>(`/api/files/${ds}/share`, {

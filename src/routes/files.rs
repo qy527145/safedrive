@@ -11,6 +11,8 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use futures_util::TryStreamExt;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Deserialize;
@@ -119,6 +121,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/files/{ds}/rename", post(rename))
         .route("/files/{ds}/delete", post(delete))
         .route("/files/{ds}/delete-foreign", post(delete_foreign))
+        .route("/files/{ds}/adopt-foreign", post(adopt_foreign))
         .route(
             "/files/{ds}/cache",
             get(file_cache_status)
@@ -909,6 +912,103 @@ async fn delete_foreign(
     let target = join_enc(&parent.enc_path, name);
     storage.delete(&target).await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct AdoptForeignBody {
+    /// 外来条目所在的明文目录（"" = 根）。
+    path: String,
+    /// 存储端原始名字。
+    name: String,
+    /// 该条目原加密链路的密码（原数据源密码；或 base64 的 16 字节目录 FK）。
+    password: String,
+}
+
+/// 解密外来条目并纳入当前链路：用输入密码（f_key）解开信封拿到明文名
+/// 与节点 secret，再换当前目录的链路密钥重编码名字 —— 一次存储端
+/// rename，secret 原样带走，内容零重加密（与跨目录移动同一机制）。
+/// 典型场景：手动转存他人分享的加密文件后按外来条目显示，输入对方
+/// 密码即可在本数据源正常呈现。密码不对 → 400，不做任何 rename。
+async fn adopt_foreign(
+    State(state): State<AppState>,
+    Path(ds): Path<String>,
+    Json(body): Json<AdoptForeignBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let dir = sanitize(&body.path)?;
+    let name = body.name.trim();
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        return Err(ApiError::BadRequest("非法名称".into()));
+    }
+    let password = body.password.trim();
+    if password.is_empty() {
+        return Err(ApiError::BadRequest("请输入该条目的加密密码".into()));
+    }
+    let storage = state.adapter(&ds)?;
+    let parent = resolve(&state, storage.as_ref(), &ds, &dir).await?;
+    if !parent.dir {
+        return Err(ApiError::BadRequest(format!("{dir} 不是目录")));
+    }
+    let parent_keys = parent.decode_keys();
+    let entries = storage.list(&parent.enc_path).await?;
+    let entry = entries
+        .iter()
+        .find(|e| e.name == name)
+        .ok_or_else(|| ApiError::NotFound(format!("外来条目不存在: {name}")))?;
+    if !entry.is_dir {
+        return Err(ApiError::BadRequest(
+            "该条目不是受管加密格式（缺少分卷文件夹），无法解密".into(),
+        ));
+    }
+    if decode_multi(&parent_keys, name).is_some() {
+        return Err(ApiError::BadRequest(
+            "该条目已可用当前链路密码解密，无需操作".into(),
+        ));
+    }
+
+    // 输入密码 → 候选密钥：按数据源根密码派生；若输入本身是 base64 的
+    // 16 字节密钥（分享包 secret 的格式，对应非根目录的 FK）也直接试。
+    let mut keys = vec![crate::crypto::derive_root_key(password.as_bytes())];
+    if let Some(fk) = B64
+        .decode(password)
+        .ok()
+        .and_then(|bytes| <[u8; SECRET_LEN]>::try_from(bytes).ok())
+    {
+        keys.push(fk);
+    }
+    let meta = decode_multi(&keys, name)
+        .ok_or_else(|| ApiError::BadRequest("密码不正确，无法解密该条目".into()))?;
+
+    // 解密名与现有受管条目冲突则拒绝（rename 后两条会争同一明文名）
+    if entries
+        .iter()
+        .filter(|e| e.is_dir)
+        .any(|e| decode_multi(&parent_keys, &e.name).is_some_and(|m| m.name == meta.name))
+    {
+        return Err(ApiError::BadRequest(format!(
+            "当前目录已存在同名条目: {}",
+            meta.name
+        )));
+    }
+
+    // 换父钥重编码信封（secret 不变）→ 一次 rename 纳入当前链路
+    let new_nc = encode_name(&parent.secret, &meta)
+        .ok_or_else(|| ApiError::BadRequest(format!("名称过长: {}", meta.name)))?;
+    storage
+        .rename(
+            &join_enc(&parent.enc_path, name),
+            &join_enc(&parent.enc_path, &new_nc),
+        )
+        .await?;
+    state.cache.put(
+        &ds,
+        &join_enc(&dir, &meta.name),
+        CachedNode {
+            secret: meta.secret,
+            nc: new_nc,
+            dir: meta.is_dir,
+        },
+    );
+    Ok(Json(json!({ "ok": true, "name": meta.name, "isDir": meta.is_dir })))
 }
 
 async fn cache_identity(
@@ -1729,5 +1829,189 @@ mod config_tests {
         let names = volume_names("{s}_{i}.bin", "movie.mkv", 12);
         assert_eq!(names[0], "movie.mkv_01.bin");
         assert_eq!(names[11], "movie.mkv_12.bin");
+    }
+}
+
+#[cfg(test)]
+mod adopt_foreign_tests {
+    use super::*;
+    use crate::crypto::{apply_content_keystream, derive_root_key, gen_secret};
+    use http_body_util::BodyExt;
+    use tower::util::ServiceExt;
+
+    fn setup() -> (AppState, axum::Router, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cloud = dir.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+        let state = AppState::new(dir.path().join("data"), None).unwrap();
+        state
+            .registry
+            .create(crate::registry::DataSource {
+                id: "ds1".into(),
+                name: "cloud".into(),
+                ds_type: "localfs".into(),
+                config: serde_json::json!({ "root": cloud.to_str().unwrap() }),
+                encryption_enabled: true,
+                password: "mine".into(),
+                prev_password: None,
+                volume_enabled: true,
+                volume_size: 64 * 1024,
+                volume_strategy: "fixed".into(),
+                volume_name_format: "{s}_{i}.bin".into(),
+                cache_enabled: false,
+                created_at: 1,
+            })
+            .unwrap();
+        (state.clone(), crate::routes::router(state), dir)
+    }
+
+    /// 模拟手动转存：按「别人的链路密钥」编码的受管文件直接落进云端根。
+    /// 返回存储名。
+    fn plant_foreign(cloud: &std::path::Path, key: &[u8], name: &str, content: &[u8]) -> String {
+        let pw = gen_secret();
+        let nc = encode_name(
+            key,
+            &NameMeta {
+                name: name.into(),
+                size: content.len() as u64,
+                is_dir: false,
+                secret: pw,
+            },
+        )
+        .unwrap();
+        let folder = cloud.join(&nc);
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut ct = content.to_vec();
+        apply_content_keystream(&pw, 0, &mut ct);
+        std::fs::write(folder.join(&gen_chunk_names(&pw, 1)[0]), ct).unwrap();
+        nc
+    }
+
+    async fn send(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value, Vec<u8>) {
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        let body = match body {
+            Some(v) => {
+                builder = builder.header("content-type", "application/json");
+                Body::from(serde_json::to_vec(&v).unwrap())
+            }
+            None => Body::empty(),
+        };
+        let resp = app.clone().oneshot(builder.body(body).unwrap()).await.unwrap();
+        let (parts, body) = resp.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes().to_vec();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (parts.status, json, bytes)
+    }
+
+    async fn list_root(app: &axum::Router) -> Vec<serde_json::Value> {
+        let (st, json, _) = send(app, "GET", "/api/files/ds1/list?path=", None).await;
+        assert_eq!(st, StatusCode::OK);
+        json["entries"].as_array().unwrap().clone()
+    }
+
+    /// 端到端：转存文件按外来显示 → 错密码 400 且不 rename → 对密码
+    /// 解密纳管 → 正常列出并可流式解密内容。
+    #[tokio::test]
+    async fn adopt_foreign_with_sharer_password() {
+        let (_state, app, dir) = setup();
+        let cloud = dir.path().join("cloud");
+        let foreign_key = derive_root_key(b"theirs");
+        let nc = plant_foreign(&cloud, &foreign_key, "movie.mp4", b"hello");
+
+        // 转存落地后按外来条目显示
+        let entries = list_root(&app).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], nc);
+        assert_eq!(entries[0]["foreign"], true);
+
+        // 错误密码：400 提示，不得 rename
+        let (st, json, _) = send(
+            &app,
+            "POST",
+            "/api/files/ds1/adopt-foreign",
+            Some(serde_json::json!({ "path": "", "name": nc, "password": "wrong" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(json["error"].as_str().unwrap().contains("密码不正确"));
+        assert!(cloud.join(&nc).exists(), "错误密码不能触发 rename");
+
+        // 正确密码：解密并纳入当前链路
+        let (st, json, _) = send(
+            &app,
+            "POST",
+            "/api/files/ds1/adopt-foreign",
+            Some(serde_json::json!({ "path": "", "name": nc, "password": "theirs" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{json}");
+        assert_eq!(json["name"], "movie.mp4");
+        assert!(!cloud.join(&nc).exists(), "信封已换当前链路密钥重编码");
+
+        let entries = list_root(&app).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "movie.mp4");
+        assert_eq!(entries[0]["foreign"], false);
+        assert_eq!(entries[0]["size"], 5);
+
+        // secret 原样带走：内容零重加密即可解密
+        let (st, _, bytes) = send(&app, "GET", "/stream/ds1/movie.mp4", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(bytes, b"hello");
+    }
+
+    /// base64 直贴目录 FK（非根目录分享的场景）也可解密。
+    #[tokio::test]
+    async fn adopt_foreign_with_base64_fk() {
+        let (_state, app, dir) = setup();
+        let fk = gen_secret();
+        let nc = plant_foreign(&dir.path().join("cloud"), &fk, "报告.pdf", b"x");
+        let (st, json, _) = send(
+            &app,
+            "POST",
+            "/api/files/ds1/adopt-foreign",
+            Some(serde_json::json!({ "path": "", "name": nc, "password": B64.encode(fk) })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{json}");
+        assert_eq!(json["name"], "报告.pdf");
+    }
+
+    /// 解密名与现有条目冲突 / 条目本就受管 → 拒绝且不 rename。
+    #[tokio::test]
+    async fn adopt_foreign_rejects_conflict_and_managed() {
+        let (_state, app, dir) = setup();
+        let cloud = dir.path().join("cloud");
+        // 现有受管条目 movie.mp4（当前链路密钥编码）
+        let mine = plant_foreign(&cloud, &derive_root_key(b"mine"), "movie.mp4", b"a");
+        // 外来条目解密后同名
+        let nc = plant_foreign(&cloud, &derive_root_key(b"theirs"), "movie.mp4", b"b");
+
+        let (st, json, _) = send(
+            &app,
+            "POST",
+            "/api/files/ds1/adopt-foreign",
+            Some(serde_json::json!({ "path": "", "name": nc, "password": "theirs" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(json["error"].as_str().unwrap().contains("同名条目"), "{json}");
+        assert!(cloud.join(&nc).exists());
+
+        // 受管条目本身不允许走 adopt
+        let (st, json, _) = send(
+            &app,
+            "POST",
+            "/api/files/ds1/adopt-foreign",
+            Some(serde_json::json!({ "path": "", "name": mine, "password": "mine" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(json["error"].as_str().unwrap().contains("无需操作"), "{json}");
     }
 }

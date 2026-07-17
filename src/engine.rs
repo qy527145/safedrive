@@ -183,10 +183,10 @@ pub struct PlannedChunk {
     pub vol_off: u64,
 }
 
-/// 把合并区间 [start, end] 先按分卷边界、再按 split 切开；开区间请求的
-/// 前几个 chunk 用更小的分片（HEAD_SMALL_SPLIT）。
-/// 每个 chunk 只落在一个分卷内 —— fetcher 只需向单个对象发一次区间读。
-pub fn plan_chunks(
+/// 测试用便捷包装：以默认头部小分片数（HEAD_SMALL_COUNT）规划分片。
+/// 生产路径按并发线程数调 plan_chunks_with_head_count。
+#[cfg(test)]
+fn plan_chunks(
     layout: &FileLayout,
     start: u64,
     end: u64,
@@ -196,6 +196,9 @@ pub fn plan_chunks(
     plan_chunks_with_head_count(layout, start, end, max_split, open_ended, HEAD_SMALL_COUNT)
 }
 
+/// 把合并区间 [start, end] 先按分卷边界、再按 split 切开；开区间请求的
+/// 前 head_count 个 chunk 用更小的分片（HEAD_SMALL_SPLIT）。
+/// 每个 chunk 只落在一个分卷内 —— fetcher 只需向单个对象发一次区间读。
 fn plan_chunks_with_head_count(
     layout: &FileLayout,
     start: u64,

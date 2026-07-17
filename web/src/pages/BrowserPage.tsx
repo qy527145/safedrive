@@ -17,6 +17,7 @@ import {
   MoreOutlined,
   PauseCircleOutlined,
   ReloadOutlined,
+  UnlockOutlined,
   UploadOutlined,
 } from '@ant-design/icons';
 import {
@@ -39,7 +40,7 @@ import {
 import type { InputRef, MenuProps } from 'antd';
 import type { ChangeEvent, DragEvent } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { api, streamUrl, uploadFile, type FileCacheStatus, type FsEntry } from '../api/client';
 import PreviewModal from '../components/PreviewModal';
 import { useSources } from '../stores/sources';
@@ -116,7 +117,15 @@ export default function BrowserPage() {
   const enqueue = useTasks((s) => s.enqueue);
 
   const ds = sources.list.find((d) => d.id === dsId);
-  const [stack, setStack] = useState<string[]>([]);
+  // 当前目录放在 URL 查询参数里（?path=a/b），进入子目录会 push 历史记录，
+  // 浏览器前进/后退沿目录层级走，刷新也能停留在原目录。
+  const [searchParams, setSearchParams] = useSearchParams();
+  const curPath = searchParams.get('path') ?? '';
+  const stack = useMemo(() => (curPath ? curPath.split('/') : []), [curPath]);
+  const gotoPath = useCallback(
+    (path: string) => setSearchParams(path ? { path } : {}),
+    [setSearchParams],
+  );
   const [entries, setEntries] = useState<FsEntry[]>([]);
   const [selectedNames, setSelectedNames] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
@@ -132,7 +141,6 @@ export default function BrowserPage() {
     localStorage.setItem('sd.view.files', v);
   };
 
-  const curPath = useMemo(() => stack.join('/'), [stack]);
   const joinPath = useCallback(
     (name: string) => (curPath ? `${curPath}/${name}` : name),
     [curPath],
@@ -358,6 +366,46 @@ export default function BrowserPage() {
 
   const nameInput = useRef<InputRef>(null);
 
+  /** 解密外来条目：输入其原加密密码（f_key），服务端解开信封后换当前
+   * 链路密码重新封装名字（一次 rename）。密码不对时弹窗提示，不 rename。 */
+  const adoptForeignAction = (item: FsEntry) => {
+    let value = '';
+    modal.confirm({
+      title: `解密外来条目「${item.name}」`,
+      icon: <UnlockOutlined />,
+      content: (
+        <Space direction="vertical" style={{ width: '100%' }}>
+          <Typography.Text type="secondary">
+            输入该条目原来的加密密码（分享方的数据源密码，或 base64 目录密钥）。
+            解密成功后将改用当前目录的链路密码重新封装，之后即可正常浏览。
+          </Typography.Text>
+          <Input.Password
+            ref={nameInput}
+            placeholder="原加密密码（f_key）"
+            onChange={(e) => (value = e.target.value)}
+          />
+        </Space>
+      ),
+      okText: '解密',
+      onOk: async () => {
+        const password = value.trim();
+        if (!password) throw new Error('请输入密码');
+        try {
+          const r = await api.adoptForeign(dsId, curPath, item.name, password);
+          message.success(`已解密并纳入当前目录：${r.name}`);
+          await refresh();
+        } catch (e) {
+          modal.error({
+            title: '解密失败',
+            content: e instanceof Error ? e.message : String(e),
+          });
+          throw e; // 保留输入弹窗，便于更正后重试
+        }
+      },
+    });
+    setTimeout(() => nameInput.current?.focus(), 100);
+  };
+
   const renameAction = (item: FsEntry) => {
     let value = item.name;
     modal.confirm({
@@ -465,7 +513,7 @@ export default function BrowserPage() {
   const onNameClick = (item: FsEntry) => {
     if (item.foreign) return;
     if (item.isDir) {
-      setStack((s) => [...s, item.name]);
+      gotoPath(joinPath(item.name));
       return;
     }
     if (previewKind(item.name) === 'none') {
@@ -478,13 +526,24 @@ export default function BrowserPage() {
   /** 卡片视图的条目操作菜单（能力与列表视图的操作列对齐）。 */
   const entryMenuItems = (item: FsEntry): MenuProps['items'] => {
     if (item.foreign) {
-      return [{
+      const foreignItems: MenuProps['items'] = [];
+      if (item.isDir) {
+        // 受管加密条目在存储端总是文件夹；只有这类外来条目才可能解密纳管
+        foreignItems.push({
+          key: 'adopt-foreign',
+          icon: <UnlockOutlined />,
+          label: '输入密码解密',
+          onClick: () => adoptForeignAction(item),
+        });
+      }
+      foreignItems.push({
         key: 'delete-foreign',
         danger: true,
         icon: <DeleteOutlined />,
         label: '删除外来条目',
         onClick: () => deleteForeignAction(item),
-      }];
+      });
+      return foreignItems;
     }
     const items: MenuProps['items'] = [];
     if (!item.isDir) {
@@ -554,7 +613,7 @@ export default function BrowserPage() {
                   stack.length === 0 ? (
                     <span>{ds?.name ?? '…'}</span>
                   ) : (
-                    <a onClick={() => setStack([])}>{ds?.name ?? '…'}</a>
+                    <a onClick={() => gotoPath('')}>{ds?.name ?? '…'}</a>
                   ),
               },
               ...stack.map((name, i) => ({
@@ -562,7 +621,7 @@ export default function BrowserPage() {
                   i === stack.length - 1 ? (
                     <span>{name}</span>
                   ) : (
-                    <a onClick={() => setStack(stack.slice(0, i + 1))}>{name}</a>
+                    <a onClick={() => gotoPath(stack.slice(0, i + 1).join('/'))}>{name}</a>
                   ),
               })),
             ]}
@@ -730,12 +789,25 @@ export default function BrowserPage() {
             width: 220,
             render: (_, item) =>
               item.foreign ? (
-                <Button
-                  size="small"
-                  danger
-                  icon={<DeleteOutlined />}
-                  onClick={() => deleteForeignAction(item)}
-                />
+                <Space>
+                  {item.isDir && (
+                    <Tooltip title="输入密码解密">
+                      <Button
+                        size="small"
+                        icon={<UnlockOutlined />}
+                        onClick={() => adoptForeignAction(item)}
+                      />
+                    </Tooltip>
+                  )}
+                  <Tooltip title="删除外来条目">
+                    <Button
+                      size="small"
+                      danger
+                      icon={<DeleteOutlined />}
+                      onClick={() => deleteForeignAction(item)}
+                    />
+                  </Tooltip>
+                </Space>
               ) : (
                 <Space>
                   {!item.isDir && previewKind(item.name) !== 'none' && (

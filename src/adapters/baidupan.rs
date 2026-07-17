@@ -1317,54 +1317,6 @@ impl BaiduPanFs {
     }
 }
 
-fn json_number(text: &str, key: &str) -> Option<u64> {
-    let at = text.find(&format!("\"{key}\""))?;
-    let tail = text[at..].split_once(':')?.1.trim_start();
-    let tail = tail.strip_prefix('"').unwrap_or(tail);
-    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
-}
-
-fn json_numbers(text: &str, key: &str) -> Vec<u64> {
-    let needle = format!("\"{key}\"");
-    let mut rest = text;
-    let mut values = Vec::new();
-    while let Some(at) = rest.find(&needle) {
-        let tail = &rest[at + needle.len()..];
-        if let Some((_, value)) = tail.split_once(':') {
-            let value = value.trim_start();
-            let value = value.strip_prefix('"').unwrap_or(value);
-            let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
-            if let Ok(number) = digits.parse() {
-                values.push(number);
-            }
-        }
-        rest = tail;
-    }
-    values
-}
-
-fn json_strings(text: &str, key: &str) -> Vec<String> {
-    let needle = format!("\"{key}\"");
-    let mut rest = text;
-    let mut values = Vec::new();
-    while let Some(at) = rest.find(&needle) {
-        let Some((_, tail)) = rest[at + needle.len()..].split_once(':') else {
-            break;
-        };
-        let tail = tail.trim_start();
-        if let Some(tail) = tail.strip_prefix('"')
-            && let Some(end) = tail.find('"')
-        {
-            values.push(tail[..end].replace("\\/", "/"));
-            rest = &tail[end + 1..];
-            continue;
-        }
-        rest = &rest[at + needle.len()..];
-    }
-    values
-}
-
 fn share_surl(url: &Url) -> Option<String> {
     url.path_segments()?
         .collect::<Vec<_>>()
@@ -1947,17 +1899,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_share_page_metadata_and_short_link() {
+    fn parses_share_short_link() {
         let url = Url::parse("https://pan.baidu.com/s/1AbC123?pwd=xy9z").unwrap();
         assert_eq!(share_surl(&url).as_deref(), Some("AbC123"));
-        let page = r#"{"shareid":12345,"share_uk":"67890","file_list":[{"fs_id":42,"server_filename":"first"},{"fs_id":"43","server_filename":"second"}]}"#;
-        assert_eq!(json_number(page, "shareid"), Some(12345));
-        assert_eq!(json_number(page, "share_uk"), Some(67890));
-        assert_eq!(json_numbers(page, "fs_id"), vec![42, 43]);
-        assert_eq!(
-            json_strings(page, "server_filename"),
-            vec!["first", "second"]
-        );
     }
 
     #[tokio::test]
