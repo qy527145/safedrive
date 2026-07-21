@@ -30,7 +30,10 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use super::{ByteStream, CloudShare, Entry, ImportedEntry, ProgressFn, Storage};
+use super::{
+    ByteStream, CloudShare, Entry, ImportedEntry, ProgressFn, RangeRead, RangeTransferMetrics,
+    Storage,
+};
 use crate::error::{ApiError, ApiResult};
 
 const XPAN_API: &str = "https://pan.baidu.com/rest/2.0/";
@@ -63,12 +66,6 @@ const VOLUME_RETRY_BACKOFF_MS: u64 = if cfg!(test) { 50 } else { 5_000 };
 /// 后并发稳定。仍以账号级信号量限制同账号总并发。
 const DEFAULT_UPLOAD_THREADS: usize = 3;
 const LINK_TTL: Duration = Duration::from_secs(10 * 60);
-const DOWNLOAD_HEDGE_DELAY: Duration = if cfg!(test) {
-    Duration::from_millis(40)
-} else {
-    Duration::from_millis(1_200)
-};
-
 /// 账号级（BDUSS 维度）superfile2 并发槽：同一账号哪怕来自不同适配器
 /// 实例（并发上传多个文件时每个请求各建一个实例）也共享同一配额，
 /// 避免多文件叠加把账号总并发推过上游容忍度。适配器按请求新建，
@@ -84,23 +81,28 @@ static VIP_TYPES: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, i64>>> =
 #[derive(Debug, Clone)]
 struct DownloadUrlHealth {
     ewma_ttfb_ms: f64,
+    ewma_body_bps: f64,
     successes: u64,
     failures: u64,
     last_failure: Option<Instant>,
+    last_seen: Instant,
 }
 
 impl Default for DownloadUrlHealth {
     fn default() -> Self {
         Self {
             ewma_ttfb_ms: 500.0,
+            ewma_body_bps: 8.0 * 1024.0 * 1024.0,
             successes: 0,
             failures: 0,
             last_failure: None,
+            last_seen: Instant::now(),
         }
     }
 }
 
 type DownloadHealthMap = HashMap<(u64, String), DownloadUrlHealth>;
+type RangeAttemptMap = HashMap<(String, u64, u64), (usize, Instant)>;
 static DOWNLOAD_URL_HEALTH: std::sync::LazyLock<std::sync::Mutex<DownloadHealthMap>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
@@ -118,21 +120,178 @@ fn download_health_score(account: u64, url: &Url) -> f64 {
         .filter(|at| at.elapsed() < Duration::from_secs(60))
         .map_or(0.0, |_| 2_000.0);
     value.ewma_ttfb_ms
+        + 1_000_000_000.0 / value.ewma_body_bps.max(1.0)
         + recent_penalty
         + value.failures.saturating_sub(value.successes) as f64 * 250.0
 }
 
 fn record_download_health(account: u64, url: &Url, elapsed: Duration, success: bool) {
     let mut health = DOWNLOAD_URL_HEALTH.lock().unwrap();
+    if health.len() > 1024 {
+        health.retain(|_, value| value.last_seen.elapsed() < Duration::from_secs(30 * 60));
+    }
     let value = health.entry((account, download_host(url))).or_default();
+    value.last_seen = Instant::now();
     if success {
         let sample = elapsed.as_secs_f64() * 1_000.0;
         value.ewma_ttfb_ms = value.ewma_ttfb_ms * 0.75 + sample * 0.25;
+    } else {
+        value.failures = value.failures.saturating_add(1);
+        value.last_failure = Some(Instant::now());
+    }
+}
+
+fn record_download_body(account: u64, url: &Url, elapsed: Duration, bytes: u64, success: bool) {
+    let mut health = DOWNLOAD_URL_HEALTH.lock().unwrap();
+    let value = health.entry((account, download_host(url))).or_default();
+    value.last_seen = Instant::now();
+    if success {
+        if bytes > 0 {
+            let bps = bytes as f64 / elapsed.as_secs_f64().max(0.001);
+            value.ewma_body_bps = value.ewma_body_bps * 0.75 + bps * 0.25;
+        }
         value.successes = value.successes.saturating_add(1);
     } else {
         value.failures = value.failures.saturating_add(1);
         value.last_failure = Some(Instant::now());
     }
+}
+
+fn download_hedge_delay(account: u64, primary: Option<&Url>) -> Duration {
+    if cfg!(test) {
+        return Duration::from_millis(40);
+    }
+    let delay_ms = primary
+        .and_then(|url| {
+            DOWNLOAD_URL_HEALTH
+                .lock()
+                .unwrap()
+                .get(&(account, download_host(url)))
+                .map(|value| value.ewma_ttfb_ms * 2.0)
+        })
+        .unwrap_or(1_000.0)
+        .clamp(400.0, 2_000.0);
+    Duration::from_millis(delay_ms as u64)
+}
+
+#[derive(Clone)]
+struct DownloadResponseMeta {
+    account: u64,
+    url: Url,
+}
+
+fn observed_body_stream(
+    mut response: reqwest::Response,
+    metrics: Option<Arc<RangeTransferMetrics>>,
+) -> ByteStream {
+    let expected = response.content_length();
+    let meta = response.extensions_mut().remove::<DownloadResponseMeta>();
+    let inner = response
+        .bytes_stream()
+        .map_err(std::io::Error::other)
+        .boxed();
+    struct State {
+        inner: ByteStream,
+        meta: Option<DownloadResponseMeta>,
+        metrics: Option<Arc<RangeTransferMetrics>>,
+        started: Instant,
+        bytes: u64,
+        expected: Option<u64>,
+        finished: bool,
+        outcome_recorded: bool,
+    }
+    futures_util::stream::unfold(
+        State {
+            inner,
+            meta,
+            metrics,
+            started: Instant::now(),
+            bytes: 0,
+            expected,
+            finished: false,
+            outcome_recorded: false,
+        },
+        |mut state| async move {
+            if state.finished {
+                return None;
+            }
+            match state.inner.next().await {
+                Some(Ok(bytes)) => {
+                    state.bytes = state.bytes.saturating_add(bytes.len() as u64);
+                    if let Some(metrics) = &state.metrics {
+                        metrics.record_body_bytes(bytes.len() as u64);
+                    }
+                    if !state.outcome_recorded
+                        && state
+                            .expected
+                            .is_some_and(|expected| state.bytes >= expected)
+                    {
+                        if let Some(meta) = &state.meta {
+                            record_download_body(
+                                meta.account,
+                                &meta.url,
+                                state.started.elapsed(),
+                                state.bytes,
+                                true,
+                            );
+                        }
+                        if let Some(metrics) = &state.metrics {
+                            metrics.record_body_completion();
+                        }
+                        state.outcome_recorded = true;
+                    }
+                    Some((Ok(bytes), state))
+                }
+                Some(Err(error)) => {
+                    if !state.outcome_recorded
+                        && let Some(meta) = &state.meta
+                    {
+                        record_download_body(
+                            meta.account,
+                            &meta.url,
+                            state.started.elapsed(),
+                            state.bytes,
+                            false,
+                        );
+                    }
+                    if !state.outcome_recorded
+                        && let Some(metrics) = &state.metrics
+                    {
+                        metrics.record_candidate_failure();
+                    }
+                    state.finished = true;
+                    Some((Err(error), state))
+                }
+                None => {
+                    let complete = state
+                        .expected
+                        .is_none_or(|expected| state.bytes >= expected);
+                    if !state.outcome_recorded
+                        && let Some(meta) = &state.meta
+                    {
+                        record_download_body(
+                            meta.account,
+                            &meta.url,
+                            state.started.elapsed(),
+                            state.bytes,
+                            complete,
+                        );
+                    }
+                    if !state.outcome_recorded
+                        && let Some(metrics) = &state.metrics
+                    {
+                        if complete {
+                            metrics.record_body_completion();
+                        } else {
+                            metrics.record_candidate_failure();
+                        }
+                    }
+                    None
+                }
+            }
+        },
+    )
+    .boxed()
 }
 
 fn account_key(bduss: &HeaderValue) -> u64 {
@@ -220,7 +379,7 @@ pub struct BaiduPanFs {
     /// Per-adapter retry rotation. If a response returned headers but its body
     /// later stalled, the engine retries the same range and this bias forces a
     /// different candidate to lead the next controlled race.
-    range_attempts: Mutex<HashMap<(String, u64, u64), (usize, Instant)>>,
+    range_attempts: Mutex<RangeAttemptMap>,
     /// 账号级 superfile2 并发槽（见 UPLOAD_SLOTS）。
     upload_slots: Arc<tokio::sync::Semaphore>,
     /// superfile2 分片并发数（uploadThreads，1..=32，默认 3）。
@@ -890,18 +1049,34 @@ impl BaiduPanFs {
         range: Option<(u64, u64)>,
         retry_bias: usize,
     ) -> ApiResult<reqwest::Response> {
+        self.download_response_tracked(remote_path, range, retry_bias, None)
+            .await
+    }
+
+    async fn download_response_tracked(
+        &self,
+        remote_path: &str,
+        range: Option<(u64, u64)>,
+        retry_bias: usize,
+        metrics: Option<Arc<RangeTransferMetrics>>,
+    ) -> ApiResult<reqwest::Response> {
         for attempt in 0..2 {
             let urls = self.locatedownload(remote_path).await?;
             let candidates = self.ordered_download_urls(&urls, range, retry_bias)?;
+            let hedge_delay = download_hedge_delay(self.account_key, candidates.first());
             let mut requests = FuturesUnordered::new();
             for (rank, url) in candidates.into_iter().take(2).enumerate() {
                 let http = self.http.clone();
                 let user_agent = self.download_user_agent.clone();
                 let cookie = self.download_cookie.clone();
+                let metrics = metrics.clone();
                 requests.push(
                     async move {
                         if rank > 0 {
-                            tokio::time::sleep(DOWNLOAD_HEDGE_DELAY).await;
+                            tokio::time::sleep(hedge_delay).await;
+                            if let Some(metrics) = &metrics {
+                                metrics.record_hedge();
+                            }
                         }
                         let started = Instant::now();
                         let mut request = http
@@ -922,8 +1097,12 @@ impl BaiduPanFs {
             let mut last_error = String::from("没有可用下载候选");
             while let Some((winner_rank, url, elapsed, result)) = requests.next().await {
                 match result {
-                    Ok(resp) if resp.status().is_success() => {
+                    Ok(mut resp) if resp.status().is_success() => {
                         record_download_health(self.account_key, &url, elapsed, true);
+                        resp.extensions_mut().insert(DownloadResponseMeta {
+                            account: self.account_key,
+                            url: url.clone(),
+                        });
                         tracing::debug!(
                             "百度下载候选命中: host={} ttfb_ms={} winner_rank={} range={range:?}",
                             download_host(&url),
@@ -934,6 +1113,9 @@ impl BaiduPanFs {
                     }
                     Ok(resp) => {
                         record_download_health(self.account_key, &url, elapsed, false);
+                        if let Some(metrics) = &metrics {
+                            metrics.record_candidate_failure();
+                        }
                         let status = resp.status();
                         stale_links |=
                             matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND);
@@ -941,6 +1123,9 @@ impl BaiduPanFs {
                     }
                     Err(error) => {
                         record_download_health(self.account_key, &url, elapsed, false);
+                        if let Some(metrics) = &metrics {
+                            metrics.record_candidate_failure();
+                        }
                         last_error = format!("host={} error={error}", download_host(&url));
                     }
                 }
@@ -1478,6 +1663,10 @@ impl Storage for BaiduPanFs {
         Some(MAX_PREVIEW_RANGE)
     }
 
+    fn download_profile_key(&self) -> Option<String> {
+        Some("baidupan".to_owned())
+    }
+
     async fn list(&self, path: &str) -> ApiResult<Vec<Entry>> {
         let remote = self.remote_path(path);
         const LIMIT: usize = 1000;
@@ -1783,13 +1972,23 @@ impl Storage for BaiduPanFs {
             .download_response(&self.remote_path(path), None, 0)
             .await?;
         let size = resp.content_length();
-        Ok((
-            size,
-            resp.bytes_stream().map_err(std::io::Error::other).boxed(),
-        ))
+        Ok((size, observed_body_stream(resp, None)))
     }
 
     async fn get_range(&self, path: &str, start: u64, end: u64) -> ApiResult<ByteStream> {
+        Ok(self
+            .get_range_tracked(path, start, end, Arc::new(RangeTransferMetrics::default()))
+            .await?
+            .stream)
+    }
+
+    async fn get_range_tracked(
+        &self,
+        path: &str,
+        start: u64,
+        end: u64,
+        metrics: Arc<RangeTransferMetrics>,
+    ) -> ApiResult<RangeRead> {
         if end < start || end - start + 1 > MAX_PREVIEW_RANGE {
             return Err(ApiError::BadRequest(
                 "百度网盘单个下载分片必须在 1..=5MiB".into(),
@@ -1798,9 +1997,18 @@ impl Storage for BaiduPanFs {
         let remote = self.remote_path(path);
         let retry_bias = self.next_range_retry_bias(&remote, start, end).await;
         let resp = self
-            .download_response(&remote, Some((start, end)), retry_bias)
+            .download_response_tracked(
+                &remote,
+                Some((start, end)),
+                retry_bias,
+                Some(Arc::clone(&metrics)),
+            )
             .await?;
         if resp.status() != StatusCode::PARTIAL_CONTENT {
+            if let Some(meta) = resp.extensions().get::<DownloadResponseMeta>() {
+                record_download_body(meta.account, &meta.url, Duration::ZERO, 0, false);
+            }
+            metrics.record_candidate_failure();
             return Err(ApiError::Upstream(format!(
                 "百度网盘忽略 Range 请求，返回 {}",
                 resp.status()
@@ -1813,11 +2021,26 @@ impl Storage for BaiduPanFs {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("");
         if !actual.starts_with(&expected) {
+            if let Some(meta) = resp.extensions().get::<DownloadResponseMeta>() {
+                record_download_body(meta.account, &meta.url, Duration::ZERO, 0, false);
+            }
+            metrics.record_candidate_failure();
             return Err(ApiError::Upstream(format!(
                 "百度网盘 Content-Range 不匹配: 期望 {expected}*, 实际 {actual}"
             )));
         }
-        Ok(resp.bytes_stream().map_err(std::io::Error::other).boxed())
+        let timeout_meta = resp.extensions().get::<DownloadResponseMeta>().cloned();
+        let stream = observed_body_stream(resp, Some(Arc::clone(&metrics)));
+        Ok(match timeout_meta {
+            Some(meta) => RangeRead::with_timeout_feedback(
+                stream,
+                Arc::new(move || {
+                    record_download_body(meta.account, &meta.url, Duration::ZERO, 0, false);
+                    metrics.record_candidate_failure();
+                }),
+            ),
+            None => RangeRead::new(stream),
+        })
     }
 
     async fn put(&self, path: &str, mut body: ByteStream) -> ApiResult<()> {
@@ -2091,6 +2314,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn download_health_uses_completed_body_throughput() {
+        let account = 0xb0d1_5eedu64;
+        let fast = Url::parse("https://body-fast.example/file").unwrap();
+        let slow = Url::parse("https://body-slow.example/file").unwrap();
+        record_download_health(account, &fast, Duration::from_millis(80), true);
+        record_download_health(account, &slow, Duration::from_millis(80), true);
+        record_download_body(
+            account,
+            &fast,
+            Duration::from_millis(100),
+            8 * 1024 * 1024,
+            true,
+        );
+        record_download_body(account, &slow, Duration::from_secs(2), 1024 * 1024, true);
+        assert!(
+            download_health_score(account, &fast) < download_health_score(account, &slow),
+            "响应头相同的候选必须按完整响应体吞吐排序"
+        );
+    }
+
     #[tokio::test]
     async fn slow_primary_download_is_hedged_to_second_candidate() {
         #[derive(Clone)]
@@ -2129,14 +2373,20 @@ mod tests {
         cfg["pcsApiBase"] = format!("{base}/locate").into();
         let fs = BaiduPanFs::from_config_with_persister(&cfg, Client::new(), None).unwrap();
         let started = Instant::now();
+        let metrics = Arc::new(RangeTransferMetrics::default());
         let response = fs
-            .download_response("/safe/hedge", Some((0, 1)), 0)
+            .download_response_tracked("/safe/hedge", Some((0, 1)), 0, Some(Arc::clone(&metrics)))
             .await
             .unwrap();
         assert_eq!(response.url().path(), "/fast");
         assert!(
             started.elapsed() < Duration::from_millis(180),
             "第二候选应在慢主请求完成前胜出"
+        );
+        assert_eq!(
+            metrics.snapshot().0,
+            1,
+            "实际发出的第二候选必须计为一次对冲"
         );
     }
 
@@ -2712,11 +2962,30 @@ mod tests {
             "只有实际访问另一个分卷时才按需获取其直链"
         );
 
-        let mut stream = fs.get_range("volume", 2, 5).await.unwrap();
+        let body_metrics = Arc::new(RangeTransferMetrics::default());
+        let mut stream = fs
+            .get_range_tracked("volume", 2, 5, Arc::clone(&body_metrics))
+            .await
+            .unwrap()
+            .stream;
         let mut got = Vec::new();
         while let Some(chunk) = stream.next().await {
             got.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(got, b"2345");
+        assert_eq!(body_metrics.snapshot().2, 4);
+        assert_eq!(body_metrics.snapshot().3, 1);
+
+        let timeout_metrics = Arc::new(RangeTransferMetrics::default());
+        let read = fs
+            .get_range_tracked("volume", 6, 7, Arc::clone(&timeout_metrics))
+            .await
+            .unwrap();
+        read.report_timeout();
+        assert_eq!(
+            timeout_metrics.snapshot().1,
+            1,
+            "引擎报告的响应体超时必须反向降权实际获胜候选"
+        );
     }
 }

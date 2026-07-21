@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,7 @@ use tokio::sync::Notify;
 use crate::error::ApiResult;
 
 pub const BLOCK_SIZE: u64 = 1024 * 1024;
+const BITMAP_FLUSH_INTERVAL: Duration = Duration::from_millis(300);
 
 #[cfg(unix)]
 fn pread_exact(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
@@ -96,13 +98,24 @@ pub struct FileCacheStatus {
 pub struct CacheEntry {
     root: PathBuf,
     meta: CacheMeta,
-    file: Mutex<std::fs::File>,
+    // Positional FileExt reads/writes do not share a cursor. Keeping the File
+    // itself lock-free lets cached playback reads overlap write-through I/O.
+    file: std::fs::File,
     bitmap: Mutex<Vec<u8>>,
     /// 每块已经写入的半开区间并集；只有完整覆盖后才设置持久位图。
-    partial: Mutex<Vec<Vec<(u32, u32)>>>,
+    // Only blocks that are currently incomplete need interval metadata. A
+    // sparse map avoids one Vec header per MiB for very large sparse files.
+    partial: Mutex<HashMap<u64, Vec<(u32, u32)>>>,
     bytes_cached: AtomicU64,
     hits: AtomicU64,
     misses: AtomicU64,
+    bitmap_generation: AtomicU64,
+    persisted_generation: AtomicU64,
+    bitmap_flush: Mutex<BitmapFlushState>,
+}
+
+struct BitmapFlushState {
+    last_flush: Instant,
 }
 
 impl CacheEntry {
@@ -111,29 +124,66 @@ impl CacheEntry {
         (self.meta.total_size - start).min(self.meta.block_size)
     }
 
-    fn has_block(&self, block: u64) -> bool {
-        let bitmap = self.bitmap.lock().unwrap();
-        bitmap
-            .get((block / 8) as usize)
-            .is_some_and(|byte| byte & (1 << (block % 8)) != 0)
-    }
-
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn has_range(&self, start: u64, end: u64) -> bool {
         if end < start || end >= self.meta.total_size {
             return false;
         }
         let first = start / self.meta.block_size;
         let last = end / self.meta.block_size;
-        (first..=last).all(|block| self.has_block(block))
+        let bitmap = self.bitmap.lock().unwrap();
+        (first..=last).all(|block| bitmap_has_block(&bitmap, block))
     }
 
+    /// Return complete cached byte ranges within `[start, end]`. Adjacent
+    /// blocks are coalesced so the streaming engine only switches source when
+    /// it crosses a real cache gap.
+    pub fn cached_ranges(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        if end < start || start >= self.meta.total_size {
+            return Vec::new();
+        }
+        let end = end.min(self.meta.total_size - 1);
+        let first = start / self.meta.block_size;
+        let last = end / self.meta.block_size;
+        let bitmap = self.bitmap.lock().unwrap();
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for block in first..=last {
+            if !bitmap_has_block(&bitmap, block) {
+                continue;
+            }
+            let lo = start.max(block * self.meta.block_size);
+            let hi = end.min((block + 1) * self.meta.block_size - 1);
+            if let Some(previous) = ranges.last_mut()
+                && previous.1.saturating_add(1) == lo
+            {
+                previous.1 = hi;
+            } else {
+                ranges.push((lo, hi));
+            }
+        }
+        ranges
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn read_range(&self, start: u64, end: u64) -> std::io::Result<Bytes> {
         let len = usize::try_from(end - start + 1)
             .map_err(|_| std::io::Error::other("cache range too large"))?;
         let mut bytes = vec![0u8; len];
-        pread_exact(&self.file.lock().unwrap(), &mut bytes, start)?;
+        pread_exact(&self.file, &mut bytes, start)?;
         self.hits.fetch_add(1, Ordering::Relaxed);
         Ok(Bytes::from(bytes))
+    }
+
+    pub(crate) fn read_range_untracked(&self, start: u64, end: u64) -> std::io::Result<Bytes> {
+        let len = usize::try_from(end - start + 1)
+            .map_err(|_| std::io::Error::other("cache range too large"))?;
+        let mut bytes = vec![0u8; len];
+        pread_exact(&self.file, &mut bytes, start)?;
+        Ok(Bytes::from(bytes))
+    }
+
+    pub(crate) fn record_hit(&self) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_miss(&self) {
@@ -150,7 +200,7 @@ impl CacheEntry {
         if end >= self.meta.total_size {
             return Err(std::io::Error::other("cache write exceeds file size"));
         }
-        pwrite_all(&self.file.lock().unwrap(), data, start)?;
+        pwrite_all(&self.file, data, start)?;
 
         let first = start / self.meta.block_size;
         let last = end / self.meta.block_size;
@@ -168,7 +218,7 @@ impl CacheEntry {
                 let block_end = block_start + self.block_len(block);
                 let lo = (start.max(block_start) - block_start) as u32;
                 let hi = (end.saturating_add(1).min(block_end) - block_start) as u32;
-                let intervals = &mut partial[block as usize];
+                let intervals = partial.entry(block).or_default();
                 merge_interval(intervals, lo, hi);
                 if intervals.len() == 1
                     && intervals[0].0 == 0
@@ -189,16 +239,62 @@ impl CacheEntry {
                 if bitmap[byte_index] & bit == 0 {
                     bitmap[byte_index] |= bit;
                     newly_cached += self.block_len(block);
-                    partial[block as usize].clear();
+                    partial.remove(&block);
                 }
             }
             if newly_cached > 0 {
                 self.bytes_cached.fetch_add(newly_cached, Ordering::Relaxed);
-                std::fs::write(self.root.join("bitmap.bin"), &*bitmap)?;
+                self.bitmap_generation.fetch_add(1, Ordering::Release);
             }
         }
+        self.persist_bitmap(false)?;
         Ok(())
     }
+
+    /// Persist completed-block metadata at a bounded cadence. The generation
+    /// check prevents a concurrent write from being lost behind an older
+    /// snapshot; `force` is used when a stream's writeback worker drains.
+    pub fn persist_bitmap(&self, force: bool) -> std::io::Result<()> {
+        let generation = self.bitmap_generation.load(Ordering::Acquire);
+        if generation == self.persisted_generation.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut state = self.bitmap_flush.lock().unwrap();
+        if !force && state.last_flush.elapsed() < BITMAP_FLUSH_INTERVAL {
+            return Ok(());
+        }
+        let (snapshot, snapshot_generation) = {
+            let bitmap = self.bitmap.lock().unwrap();
+            (
+                bitmap.clone(),
+                self.bitmap_generation.load(Ordering::Acquire),
+            )
+        };
+        let target = self.root.join("bitmap.bin");
+        let temporary = self.root.join("bitmap.bin.tmp");
+        std::fs::write(&temporary, snapshot)?;
+        // Rust's platform rename primitive replaces an existing file on both
+        // supported targets, so readers observe either complete generation.
+        std::fs::rename(&temporary, &target)?;
+        self.persisted_generation
+            .store(snapshot_generation, Ordering::Release);
+        state.last_flush = Instant::now();
+        Ok(())
+    }
+}
+
+impl Drop for CacheEntry {
+    fn drop(&mut self) {
+        if let Err(error) = self.persist_bitmap(true) {
+            tracing::warn!("缓存位图最终落盘失败: {error}");
+        }
+    }
+}
+
+fn bitmap_has_block(bitmap: &[u8], block: u64) -> bool {
+    bitmap
+        .get((block / 8) as usize)
+        .is_some_and(|byte| byte & (1 << (block % 8)) != 0)
 }
 
 pub struct CacheStore {
@@ -324,17 +420,21 @@ impl CacheStore {
             .open(root.join("file.bin"))?;
         let mut bitmap = std::fs::read(root.join("bitmap.bin"))?;
         bitmap.resize(bitmap_len(total_size), 0);
-        let blocks = total_size.div_ceil(BLOCK_SIZE) as usize;
         let bytes_cached = bytes_from_bitmap(&wanted, &bitmap);
         let entry = Arc::new(CacheEntry {
             root,
             meta: wanted,
-            file: Mutex::new(file),
+            file,
             bitmap: Mutex::new(bitmap),
-            partial: Mutex::new(vec![Vec::new(); blocks]),
+            partial: Mutex::new(HashMap::new()),
             bytes_cached: AtomicU64::new(bytes_cached),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            bitmap_generation: AtomicU64::new(0),
+            persisted_generation: AtomicU64::new(0),
+            bitmap_flush: Mutex::new(BitmapFlushState {
+                last_flush: Instant::now(),
+            }),
         });
         entries.insert(key.to_string(), Arc::clone(&entry));
         Ok(entry)
@@ -495,7 +595,7 @@ fn downsample_bitmap(bitmap: &[u8], meta: &CacheMeta) -> Vec<u8> {
     if blocks_total == 0 {
         return Vec::new();
     }
-    let buckets = blocks_total.min(MAX_SUMMARY_BUCKETS).max(1);
+    let buckets = blocks_total.clamp(1, MAX_SUMMARY_BUCKETS);
     let mut out = Vec::with_capacity(buckets);
     for i in 0..buckets {
         let lo = (i * blocks_total) / buckets;
@@ -593,6 +693,26 @@ mod tests {
         assert_eq!(reopened.status("k").bitmap_summary, vec![100, 0]);
         let entry = reopened.open("k", 2 * BLOCK_SIZE).unwrap();
         assert!(entry.has_range(0, BLOCK_SIZE - 1));
+    }
+
+    #[test]
+    fn cached_ranges_coalesce_full_blocks_and_leave_real_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CacheStore::new(dir.path().join("cache")).unwrap();
+        let entry = store.open("mixed", 4 * BLOCK_SIZE).unwrap();
+        entry
+            .write_range(0, &vec![1; (2 * BLOCK_SIZE) as usize])
+            .unwrap();
+        entry
+            .write_range(3 * BLOCK_SIZE, &vec![2; BLOCK_SIZE as usize])
+            .unwrap();
+        assert_eq!(
+            entry.cached_ranges(BLOCK_SIZE / 2, 4 * BLOCK_SIZE - 1),
+            vec![
+                (BLOCK_SIZE / 2, 2 * BLOCK_SIZE - 1),
+                (3 * BLOCK_SIZE, 4 * BLOCK_SIZE - 1),
+            ]
+        );
     }
 
     #[test]

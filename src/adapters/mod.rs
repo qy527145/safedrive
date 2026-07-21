@@ -5,6 +5,8 @@ pub mod webdav;
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{ApiError, ApiResult};
 use crate::registry::DataSource;
@@ -42,14 +44,82 @@ pub struct ImportedEntry {
 
 pub type ByteStream = BoxStream<'static, std::io::Result<bytes::Bytes>>;
 
+pub struct RangeRead {
+    pub stream: ByteStream,
+    timeout_feedback: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl RangeRead {
+    pub fn new(stream: ByteStream) -> Self {
+        Self {
+            stream,
+            timeout_feedback: None,
+        }
+    }
+
+    pub fn with_timeout_feedback(
+        stream: ByteStream,
+        feedback: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            stream,
+            timeout_feedback: Some(feedback),
+        }
+    }
+
+    pub fn report_timeout(&self) {
+        if let Some(feedback) = &self.timeout_feedback {
+            feedback();
+        }
+    }
+}
+
 /// 上传进度回调：报告「已确认写入上游」的**增量**字节数。
 pub type ProgressFn = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
+
+/// Per-client-stream diagnostics populated by adapters while Range requests
+/// are active. The engine snapshots these counters in its final summary log.
+#[derive(Default)]
+pub struct RangeTransferMetrics {
+    hedges: AtomicU64,
+    candidate_failures: AtomicU64,
+    body_bytes: AtomicU64,
+    body_completions: AtomicU64,
+}
+
+impl RangeTransferMetrics {
+    pub fn record_hedge(&self) {
+        self.hedges.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_candidate_failure(&self) {
+        self.candidate_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_body_bytes(&self, bytes: u64) {
+        self.body_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+    pub fn record_body_completion(&self) {
+        self.body_completions.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn snapshot(&self) -> (u64, u64, u64, u64) {
+        (
+            self.hedges.load(Ordering::Relaxed),
+            self.candidate_failures.load(Ordering::Relaxed),
+            self.body_bytes.load(Ordering::Relaxed),
+            self.body_completions.load(Ordering::Relaxed),
+        )
+    }
+}
 
 /// 数据源适配器：纯粹的 I/O 驱动。路径为数据源根内的相对路径（"a/b/c"，根为 ""）。
 #[async_trait]
 pub trait Storage: Send + Sync {
     /// 上游单次 Range 请求的硬上限；下载规划器会自动取全局 split 与它的较小值。
     fn max_range_size(&self) -> Option<u64> {
+        None
+    }
+    /// Stable, non-secret key for reusing recently learned download
+    /// concurrency. This is advisory only and never acts as a global limiter.
+    fn download_profile_key(&self) -> Option<String> {
         None
     }
     async fn list(&self, path: &str) -> ApiResult<Vec<Entry>>;
@@ -104,6 +174,17 @@ pub trait Storage: Send + Sync {
             async move { out }
         });
         Ok(filtered.boxed())
+    }
+    /// Range read with optional adapter-level diagnostics. Providers can
+    /// override this to report hedges and response-body outcomes.
+    async fn get_range_tracked(
+        &self,
+        path: &str,
+        start: u64,
+        end: u64,
+        _metrics: Arc<RangeTransferMetrics>,
+    ) -> ApiResult<RangeRead> {
+        Ok(RangeRead::new(self.get_range(path, start, end).await?))
     }
     /// 流式写入对象（覆盖）。
     async fn put(&self, path: &str, body: ByteStream) -> ApiResult<()>;

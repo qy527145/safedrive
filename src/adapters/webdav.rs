@@ -109,6 +109,15 @@ impl WebdavFs {
 
 #[async_trait]
 impl Storage for WebdavFs {
+    fn download_profile_key(&self) -> Option<String> {
+        let url = reqwest::Url::parse(&self.base).ok()?;
+        Some(format!(
+            "webdav:{}:{}",
+            url.host_str()?,
+            url.port_or_known_default().unwrap_or(0)
+        ))
+    }
+
     async fn list(&self, path: &str) -> ApiResult<Vec<Entry>> {
         const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <D:propfind xmlns:D="DAV:"><D:prop>

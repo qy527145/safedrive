@@ -10,9 +10,10 @@
 //! 上传：明文流按运行偏移一次性过 ChaCha20，再按分卷大小切开流式写入
 //! 存储（内存占用 ≈ 通道缓冲，与文件大小无关）。
 
+use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use bytes::{Bytes, BytesMut};
 use chacha20::ChaCha20;
@@ -23,7 +24,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::adapters::Storage;
+use crate::adapters::{RangeTransferMetrics, Storage};
 use crate::crypto::{ChunkPrp, content_cipher_params};
 use crate::error::{ApiError, ApiResult};
 
@@ -31,6 +32,7 @@ use crate::error::{ApiError, ApiResult};
 const HEAD_SMALL_SPLIT: u64 = 256 * 1024;
 const HEAD_SMALL_COUNT: usize = 4;
 const OUTPUT_BATCH: usize = 64 * 1024;
+const CACHE_READ_BATCH: u64 = 256 * 1024;
 /// Cache writes arrive from reqwest in small TLS/body frames. Writing every frame
 /// synchronously serializes all download workers on the cache file lock and can
 /// stall Tokio's I/O workers. Coalesce ciphertext to cache-block sized batches
@@ -66,7 +68,6 @@ pub async fn load_layout(
     let entries = storage.list(enc_folder).await?;
     let prp = ChunkPrp::new(pw);
     let mut indexed: Vec<(usize, String, u64)> = entries
-        .into_iter()
         .into_iter()
         .filter(|e| !e.is_dir)
         .filter_map(|e| prp.index_of(&e.name).map(|i| (i, e.name, e.size)))
@@ -310,11 +311,26 @@ struct FetchStats {
     index: usize,
     volume: usize,
     bytes: u64,
+    cache_bytes: u64,
     elapsed: std::time::Duration,
     attempts: usize,
+    retries: usize,
     timeouts: usize,
     cache_hit: bool,
     success: bool,
+}
+
+#[derive(Clone)]
+struct FetchContext {
+    mode: StreamMode,
+    storage: Arc<dyn Storage>,
+    obj_path: String,
+    pw: [u8; crate::crypto::SECRET_LEN],
+    encrypted: bool,
+    cache: Option<Arc<crate::cache::CacheEntry>>,
+    cache_writeback: Option<CacheWriteback>,
+    network_progress: Option<crate::adapters::ProgressFn>,
+    transfer_metrics: Arc<RangeTransferMetrics>,
 }
 
 struct AdaptiveConcurrency {
@@ -327,6 +343,46 @@ struct AdaptiveConcurrency {
     probing: bool,
 }
 
+struct LearnedConcurrency {
+    value: usize,
+    updated: std::time::Instant,
+}
+
+static LEARNED_DOWNLOAD_CONCURRENCY: LazyLock<Mutex<HashMap<String, LearnedConcurrency>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn load_learned_concurrency(key: Option<&str>, cap: usize, mode: StreamMode) -> usize {
+    if mode == StreamMode::Playback {
+        return cap.clamp(1, 4);
+    }
+    let Some(key) = key else {
+        return cap.clamp(1, 4);
+    };
+    let mut profiles = LEARNED_DOWNLOAD_CONCURRENCY.lock().unwrap();
+    profiles.retain(|_, value| value.updated.elapsed() < std::time::Duration::from_secs(10 * 60));
+    profiles
+        .get(key)
+        .map_or(cap.clamp(1, 4), |value| value.value.clamp(1, cap.max(1)))
+}
+
+fn save_learned_concurrency(key: Option<&str>, value: usize) {
+    let Some(key) = key else {
+        return;
+    };
+    let mut profiles = LEARNED_DOWNLOAD_CONCURRENCY.lock().unwrap();
+    if profiles.len() > 128 {
+        profiles
+            .retain(|_, value| value.updated.elapsed() < std::time::Duration::from_secs(10 * 60));
+    }
+    profiles.insert(
+        key.to_owned(),
+        LearnedConcurrency {
+            value: value.max(1),
+            updated: std::time::Instant::now(),
+        },
+    );
+}
+
 struct CacheWrite {
     start: u64,
     data: Bytes,
@@ -335,43 +391,54 @@ struct CacheWrite {
 #[derive(Clone)]
 struct CacheWriteback {
     tx: mpsc::Sender<CacheWrite>,
+    queue_wait_micros: Arc<AtomicU64>,
 }
 
 impl CacheWriteback {
     fn new(cache: Arc<crate::cache::CacheEntry>, capacity: usize) -> (Self, JoinHandle<()>) {
         let (tx, mut rx) = mpsc::channel::<CacheWrite>(capacity.max(2));
-        let handle = tokio::spawn(async move {
-            while let Some(write) = rx.recv().await {
-                let entry = Arc::clone(&cache);
-                match tokio::task::spawn_blocking(move || {
-                    entry.write_range(write.start, &write.data)
-                })
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        tracing::warn!("写入密文缓存失败（不影响本次下载）: {error}")
-                    }
-                    Err(error) => {
-                        tracing::warn!("密文缓存写入任务异常（不影响本次下载）: {error}")
-                    }
+        // One dedicated blocking consumer avoids a spawn_blocking round-trip
+        // for every MiB while keeping all filesystem work off Tokio workers.
+        let handle = tokio::task::spawn_blocking(move || {
+            while let Some(write) = rx.blocking_recv() {
+                if let Err(error) = cache.write_range(write.start, &write.data) {
+                    tracing::warn!("写入密文缓存失败（不影响本次下载）: {error}");
                 }
             }
+            if let Err(error) = cache.persist_bitmap(true) {
+                tracing::warn!("缓存位图最终落盘失败: {error}");
+            }
         });
-        (Self { tx }, handle)
+        (
+            Self {
+                tx,
+                queue_wait_micros: Arc::new(AtomicU64::new(0)),
+            },
+            handle,
+        )
     }
 
     async fn enqueue(&self, start: u64, data: Bytes) {
+        let started = std::time::Instant::now();
         if self.tx.send(CacheWrite { start, data }).await.is_err() {
             tracing::warn!("密文缓存写回队列已关闭");
         }
+        self.queue_wait_micros.fetch_add(
+            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
     }
 }
 
 impl AdaptiveConcurrency {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new(cap: usize) -> Self {
+        Self::new_with_initial(cap, cap.clamp(1, 4))
+    }
+
+    fn new_with_initial(cap: usize, initial: usize) -> Self {
         Self {
-            current: cap.min(4).max(1),
+            current: initial.clamp(1, cap.max(1)),
             cap: cap.max(1),
             delivered_bytes: 0,
             delivery_started: std::time::Instant::now(),
@@ -451,6 +518,14 @@ impl AdaptiveConcurrency {
         }
         None
     }
+
+    fn stable_value(&self) -> usize {
+        if self.probing {
+            self.current.saturating_sub(1).max(1)
+        } else {
+            self.current
+        }
+    }
 }
 
 /// 按合并区间 [start, end] 流式产出解密后的明文字节，可选持久密文缓存。
@@ -520,14 +595,16 @@ pub fn stream_range_cached_mode(
     let max_threads = params.max_threads.max(1);
     let max_per_volume = params.max_per_volume.max(1);
     let mode = params.mode;
-    let memory_budget_chunks = (256 * 1024 * 1024u64 / max_split.max(1)) as usize;
-    let max_buffered_chunks = if mode == StreamMode::Playback {
-        max_threads
-    } else {
-        max_threads.max(memory_budget_chunks.min(max_threads.saturating_mul(4)))
-    };
-    // Only playback uses the fixed tiny head zone. Bulk/cache modes start with
-    // full-size ranges, while the scheduler below enforces per-volume limits.
+    let profile_key = storage.download_profile_key();
+    let initial_concurrency = load_learned_concurrency(profile_key.as_deref(), max_threads, mode);
+    let adapter_metrics = Arc::new(RangeTransferMetrics::default());
+    // One current serializer chunk plus one outstanding chunk per configured
+    // worker is enough to keep every connection busy. A larger completed
+    // prefetch window only inflates the working set when upstream outruns the
+    // client.
+    let max_buffered_chunks = max_threads.saturating_add(1);
+    // Playback alone uses the tiny head zone; bulk/cache modes keep full-size
+    // ranges while the scheduler below enforces their memory and volume caps.
     let plan = plan_chunks_with_head_count(
         &layout,
         start,
@@ -567,11 +644,15 @@ pub fn stream_range_cached_mode(
         }
         None => (None, None),
     };
+    let cache_queue_wait = cache_writeback
+        .as_ref()
+        .map(|writer| Arc::clone(&writer.queue_wait_micros));
 
     // Completion-driven scheduler + serializer. Playback only scans the near
     // window; bulk/cache modes may skip saturated volumes and fill the global
     // request budget from later volumes while the serializer still emits in order.
     tokio::spawn(async move {
+        let stream_started = std::time::Instant::now();
         let plan = Arc::new(plan);
         let (done_tx, mut done_rx) = mpsc::unbounded_channel::<FetchStats>();
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(total_chunks);
@@ -579,7 +660,16 @@ pub fn stream_range_cached_mode(
         let mut active = 0usize;
         let mut outstanding = 0usize;
         let mut active_per_volume = vec![0usize; layout.volumes.len()];
-        let mut adaptive = AdaptiveConcurrency::new(max_threads);
+        let mut adaptive = AdaptiveConcurrency::new_with_initial(max_threads, initial_concurrency);
+        let peak_active = AtomicUsize::new(0);
+        let peak_outstanding = AtomicUsize::new(0);
+        let mut delivered_total = 0u64;
+        let mut first_byte_ms = None;
+        let mut network_total = 0u64;
+        let mut cache_total = 0u64;
+        let mut retry_total = 0usize;
+        let mut timeout_total = 0usize;
+        let mut fetch_failures = 0usize;
 
         let spawn_one = |idx: usize, tx: mpsc::Sender<io::Result<Bytes>>| -> JoinHandle<()> {
             let c = plan[idx].clone();
@@ -589,26 +679,20 @@ pub fn stream_range_cached_mode(
             } else {
                 format!("{enc_folder}/{vol_name}")
             };
-            let st = Arc::clone(&storage);
-            let chunk_cache = cache.clone();
-            let writeback = cache_writeback.clone();
-            let progress = network_progress.clone();
+            let context = FetchContext {
+                mode,
+                storage: Arc::clone(&storage),
+                obj_path,
+                pw,
+                encrypted,
+                cache: cache.clone(),
+                cache_writeback: cache_writeback.clone(),
+                network_progress: network_progress.clone(),
+                transfer_metrics: Arc::clone(&adapter_metrics),
+            };
             let done = done_tx.clone();
             tokio::spawn(async move {
-                let stats = fetch_chunk(
-                    idx,
-                    mode,
-                    st,
-                    obj_path,
-                    pw,
-                    encrypted,
-                    c,
-                    tx,
-                    chunk_cache,
-                    writeback,
-                    progress,
-                )
-                .await;
+                let stats = fetch_chunk(context, idx, c, tx).await;
                 let _ = done.send(stats);
             })
         };
@@ -637,6 +721,8 @@ pub fn stream_range_cached_mode(
                 spawned[idx] = true;
                 *active += 1;
                 *outstanding += 1;
+                peak_active.fetch_max(*active, Ordering::Relaxed);
+                peak_outstanding.fetch_max(*outstanding, Ordering::Relaxed);
                 active_per_volume[vol] += 1;
                 handles.push(spawn_one(idx, tx));
             }
@@ -655,6 +741,8 @@ pub fn stream_range_cached_mode(
             spawned[0] = true;
             active = 1;
             outstanding = 1;
+            peak_active.store(1, Ordering::Relaxed);
+            peak_outstanding.store(1, Ordering::Relaxed);
             active_per_volume[plan[0].vol] = 1;
             handles.push(spawn_one(0, tx));
         } else {
@@ -690,6 +778,11 @@ pub fn stream_range_cached_mode(
                         Some(stats) = done_rx.recv() => {
                             active = active.saturating_sub(1);
                             active_per_volume[stats.volume] = active_per_volume[stats.volume].saturating_sub(1);
+                            network_total = network_total.saturating_add(stats.bytes);
+                            cache_total = cache_total.saturating_add(stats.cache_bytes);
+                            retry_total = retry_total.saturating_add(stats.retries);
+                            timeout_total = timeout_total.saturating_add(stats.timeouts);
+                            fetch_failures += usize::from(!stats.success);
                             if let Some((old, new, reason)) = adaptive.observe_failure(&stats) {
                                 tracing::info!(
                                     "adaptive download concurrency mode={} {}->{} reason={reason}",
@@ -697,11 +790,12 @@ pub fn stream_range_cached_mode(
                                 );
                             }
                             tracing::debug!(
-                                "fetch chunk={} vol={} mode={} bytes={} elapsed_ms={} attempts={} timeouts={} cache_hit={} success={}",
+                                "fetch chunk={} vol={} mode={} network_bytes={} cache_bytes={} elapsed_ms={} attempts={} timeouts={} cache_hit={} success={}",
                                 stats.index,
                                 stats.volume,
                                 mode.as_str(),
                                 stats.bytes,
+                                stats.cache_bytes,
                                 stats.elapsed.as_millis(),
                                 stats.attempts,
                                 stats.timeouts,
@@ -737,6 +831,8 @@ pub fn stream_range_cached_mode(
                             abort_all(&handles);
                             break 'outer;
                         }
+                        delivered_total = delivered_total.saturating_add(delivered);
+                        first_byte_ms.get_or_insert_with(|| stream_started.elapsed().as_millis());
                         if let Some((old, new, reason)) =
                             adaptive.delivered(delivered, mode != StreamMode::Playback)
                         {
@@ -803,257 +899,447 @@ pub fn stream_range_cached_mode(
                 &mut handles,
             );
         }
+        // Drain completion records that raced with the final ordered send.
+        while let Ok(stats) = done_rx.try_recv() {
+            network_total = network_total.saturating_add(stats.bytes);
+            cache_total = cache_total.saturating_add(stats.cache_bytes);
+            retry_total = retry_total.saturating_add(stats.retries);
+            timeout_total = timeout_total.saturating_add(stats.timeouts);
+            fetch_failures += usize::from(!stats.success);
+        }
+        let response_elapsed = stream_started.elapsed();
+        // The HTTP body may finish as soon as the final ordered byte is sent;
+        // cache metadata/writeback draining must not extend client-visible EOF.
+        drop(out_tx);
         for handle in handles {
             let _ = handle.await;
+        }
+        while let Ok(stats) = done_rx.try_recv() {
+            network_total = network_total.saturating_add(stats.bytes);
+            cache_total = cache_total.saturating_add(stats.cache_bytes);
+            retry_total = retry_total.saturating_add(stats.retries);
+            timeout_total = timeout_total.saturating_add(stats.timeouts);
+            fetch_failures += usize::from(!stats.success);
         }
         drop(cache_writeback);
         if let Some(writer) = cache_writer {
             let _ = writer.await;
         }
+        if mode != StreamMode::Playback {
+            save_learned_concurrency(profile_key.as_deref(), adaptive.stable_value());
+        }
+        let (hedges, candidate_failures, adapter_body_bytes, body_completions) =
+            adapter_metrics.snapshot();
+        let elapsed_secs = response_elapsed.as_secs_f64().max(0.001);
+        tracing::info!(
+            "stream summary mode={} delivered={} network={} cache={} cache_ratio_pct={:.1} first_byte_ms={} elapsed_ms={} client_mib_s={:.2} concurrency_start={} concurrency_final={} peak_active={} peak_outstanding={} retries={} timeouts={} failures={} hedges={} candidate_failures={} adapter_body_bytes={} body_completions={} cache_queue_wait_ms={}",
+            mode.as_str(),
+            delivered_total,
+            network_total,
+            cache_total,
+            if delivered_total == 0 {
+                0.0
+            } else {
+                cache_total as f64 * 100.0 / delivered_total as f64
+            },
+            first_byte_ms.unwrap_or(0),
+            response_elapsed.as_millis(),
+            delivered_total as f64 / 1024.0 / 1024.0 / elapsed_secs,
+            initial_concurrency,
+            adaptive.current,
+            peak_active.load(Ordering::Relaxed),
+            peak_outstanding.load(Ordering::Relaxed),
+            retry_total,
+            timeout_total,
+            fetch_failures,
+            hedges,
+            candidate_failures,
+            adapter_body_bytes,
+            body_completions,
+            cache_queue_wait
+                .as_ref()
+                .map_or(0, |value| value.load(Ordering::Relaxed) / 1_000),
+        );
     });
 
     out_rx
 }
 
-/// 拉取单个 chunk 的密文区间并按合并偏移解密。
+/// 拉取单个 chunk 的密文区间并按合并偏移解密。完整缓存块和缺失区间可以
+/// 在同一 chunk 内交替出现；输出仍严格按合并文件偏移连续解密。
 async fn fetch_chunk(
+    context: FetchContext,
     index: usize,
-    mode: StreamMode,
-    storage: Arc<dyn Storage>,
-    obj_path: String,
-    pw: [u8; crate::crypto::SECRET_LEN],
-    encrypted: bool,
     c: PlannedChunk,
     tx: mpsc::Sender<io::Result<Bytes>>,
-    cache: Option<Arc<crate::cache::CacheEntry>>,
-    cache_writeback: Option<CacheWriteback>,
-    network_progress: Option<crate::adapters::ProgressFn>,
 ) -> FetchStats {
+    let FetchContext {
+        mode,
+        storage,
+        obj_path,
+        pw,
+        encrypted,
+        cache,
+        cache_writeback,
+        network_progress,
+        transfer_metrics,
+    } = context;
     let started = std::time::Instant::now();
     let mut attempts = 0usize;
+    let mut retries = 0usize;
     let mut timeouts = 0usize;
     let mut network_bytes = 0u64;
+    let mut cache_bytes = 0u64;
     let merged_end = c.merged_start + c.len - 1;
-    if let Some(cache) = &cache
-        && cache.has_range(c.merged_start, merged_end)
-    {
-        // 稀疏文件读取和大块 ChaCha20 解密都是同步操作。放在 async
-        // worker 上会阻塞整个 Tokio runtime，表现为“缓存已满仍等很久”。
-        let hit_cache = Arc::clone(cache);
-        let hit_start = c.merged_start;
-        let hit = tokio::task::spawn_blocking(move || {
-            let cached_bytes = hit_cache.read_range(hit_start, merged_end)?;
-            let mut buf = cached_bytes.to_vec();
-            if encrypted {
-                crate::crypto::apply_content_keystream(&pw, hit_start, &mut buf);
-            }
-            Ok::<Bytes, io::Error>(Bytes::from(buf))
-        })
-        .await;
-        match hit {
-            Ok(Ok(bytes)) => {
-                let _ = tx.send(Ok(bytes)).await;
-                return FetchStats {
-                    index,
-                    volume: c.vol,
-                    bytes: c.len,
-                    elapsed: started.elapsed(),
-                    attempts,
-                    timeouts,
-                    cache_hit: true,
-                    success: true,
-                };
-            }
-            Ok(Err(e)) => tracing::warn!("读取密文缓存失败，回源: {e}"),
-            Err(e) => tracing::warn!("缓存读取任务异常，回源: {e}"),
-        }
-    }
-    if let Some(cache) = &cache {
-        cache.record_miss();
-    }
-    // 每 chunk 建一次 cipher，seek 到合并偏移后连续吐 keystream。
+    let cached_ranges = cache.as_ref().map_or_else(Vec::new, |entry| {
+        entry.cached_ranges(c.merged_start, merged_end)
+    });
+    let segments = split_cache_segments(c.merged_start, merged_end, &cached_ranges);
+
     let (key, nonce) = content_cipher_params(&pw);
     let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
     if encrypted && cipher.try_seek(c.merged_start).is_err() {
         let _ = tx.send(Err(io::Error::other("keystream 偏移越界"))).await;
-        return FetchStats {
-            index,
-            volume: c.vol,
-            bytes: 0,
-            elapsed: started.elapsed(),
-            attempts,
-            timeouts,
-            cache_hit: false,
-            success: false,
-        };
+        return failed_fetch_stats((index, c.vol), 0, 0, started, attempts, retries, timeouts);
     }
-    let mut remaining = c.len;
-    let mut last_error = String::new();
-    let mut cache_batch = if cache_writeback.is_some() {
-        BytesMut::with_capacity(CACHE_WRITE_BATCH)
-    } else {
-        BytesMut::new()
-    };
     let mut output_batch = BytesMut::with_capacity(OUTPUT_BATCH);
-    let mut cache_batch_start = c.merged_start;
-    while remaining > 0 && attempts < 4 {
-        attempts += 1;
-        let done = c.len - remaining;
-        let range_start = c.vol_off + done;
-        let range_end = c.vol_off + c.len - 1;
-        let mut stream = match tokio::time::timeout(
-            mode.first_byte_timeout(),
-            storage.get_range(&obj_path, range_start, range_end),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => {
-                last_error = e.to_string();
-                tokio::task::yield_now().await;
+    let mut miss_recorded = false;
+
+    for segment in segments {
+        let mut network_start = segment.start;
+        if segment.cached {
+            let cache_entry = cache.as_ref().expect("cached segment requires cache");
+            let mut cache_rx =
+                stream_cached_range(Arc::clone(cache_entry), segment.start, segment.end);
+            let mut cached_until = segment.start;
+            while let Some(item) = cache_rx.recv().await {
+                let bytes = match item {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::warn!(
+                            "读取密文缓存区间 {}-{} 失败，剩余部分回源: {error}",
+                            segment.start,
+                            segment.end,
+                        );
+                        break;
+                    }
+                };
+                let take =
+                    (bytes.len() as u64).min(segment.end.saturating_sub(cached_until) + 1) as usize;
+                if take == 0 {
+                    continue;
+                }
+                cache_bytes += take as u64;
+                cached_until += take as u64;
+                if !append_output(
+                    &tx,
+                    &mut output_batch,
+                    &mut cipher,
+                    encrypted,
+                    &bytes[..take],
+                )
+                .await
+                {
+                    return failed_fetch_stats(
+                        (index, c.vol),
+                        network_bytes,
+                        cache_bytes,
+                        started,
+                        attempts,
+                        retries,
+                        timeouts,
+                    );
+                }
+            }
+            if cached_until > segment.end {
                 continue;
             }
-            Err(_) => {
-                timeouts += 1;
-                last_error = format!("建立 Range 请求超时: {range_start}-{range_end}");
-                continue;
+            network_start = cached_until;
+        }
+
+        if !miss_recorded {
+            if let Some(cache) = &cache {
+                cache.record_miss();
             }
+            miss_recorded = true;
+        }
+        let segment_len = segment.end - network_start + 1;
+        let mut remaining = segment_len;
+        let mut segment_attempts = 0usize;
+        let mut last_error = String::new();
+        let mut cache_batch = if cache_writeback.is_some() {
+            BytesMut::with_capacity(CACHE_WRITE_BATCH)
+        } else {
+            BytesMut::new()
         };
-        let before = remaining;
-        let mut first_body = true;
-        loop {
-            let wait = if first_body {
-                mode.first_byte_timeout()
-            } else {
-                mode.idle_timeout()
-            };
-            let item = match tokio::time::timeout(wait, stream.next()).await {
-                Ok(Some(item)) => item,
-                Ok(None) => break,
+        let mut cache_batch_start = network_start;
+
+        while remaining > 0 && segment_attempts < 4 {
+            retries += usize::from(segment_attempts > 0);
+            segment_attempts += 1;
+            attempts += 1;
+            let done = segment_len - remaining;
+            let merged_position = network_start + done;
+            let range_start = c.vol_off + (merged_position - c.merged_start);
+            let range_end = c.vol_off + (segment.end - c.merged_start);
+            let mut range_read = match tokio::time::timeout(
+                mode.first_byte_timeout(),
+                storage.get_range_tracked(
+                    &obj_path,
+                    range_start,
+                    range_end,
+                    Arc::clone(&transfer_metrics),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    last_error = error.to_string();
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 Err(_) => {
                     timeouts += 1;
-                    last_error = format!(
-                        "Range 数据{}超时: {range_start}-{range_end}",
-                        if first_body { "首字节" } else { "空闲" }
+                    last_error = format!("建立 Range 请求超时: {range_start}-{range_end}");
+                    continue;
+                }
+            };
+            let before = remaining;
+            let mut first_body = true;
+            loop {
+                let wait = if first_body {
+                    mode.first_byte_timeout()
+                } else {
+                    mode.idle_timeout()
+                };
+                let item = match tokio::time::timeout(wait, range_read.stream.next()).await {
+                    Ok(Some(item)) => item,
+                    Ok(None) => break,
+                    Err(_) => {
+                        range_read.report_timeout();
+                        timeouts += 1;
+                        last_error = format!(
+                            "Range 数据{}超时: {range_start}-{range_end}",
+                            if first_body { "首字节" } else { "空闲" }
+                        );
+                        break;
+                    }
+                };
+                first_body = false;
+                let item = match item {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        last_error = error.to_string();
+                        break;
+                    }
+                };
+                if item.is_empty() {
+                    continue;
+                }
+                let take = (item.len() as u64).min(remaining) as usize;
+                if let Some(progress) = &network_progress {
+                    progress(take as u64);
+                }
+                network_bytes += take as u64;
+                let cache_offset = network_start + (segment_len - remaining);
+                if let Some(writeback) = &cache_writeback {
+                    if cache_batch.is_empty() {
+                        cache_batch_start = cache_offset;
+                    }
+                    cache_batch.extend_from_slice(&item[..take]);
+                    if cache_batch.len() >= CACHE_WRITE_BATCH {
+                        flush_cache_batch(writeback, cache_batch_start, &mut cache_batch).await;
+                    }
+                }
+                if !append_output(
+                    &tx,
+                    &mut output_batch,
+                    &mut cipher,
+                    encrypted,
+                    &item[..take],
+                )
+                .await
+                {
+                    return failed_fetch_stats(
+                        (index, c.vol),
+                        network_bytes,
+                        cache_bytes,
+                        started,
+                        attempts,
+                        retries,
+                        timeouts,
                     );
+                }
+                remaining -= take as u64;
+                if remaining == 0 {
                     break;
                 }
-            };
-            first_body = false;
-            let item = match item {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    last_error = e.to_string();
-                    break;
-                }
-            };
-            if item.is_empty() {
-                continue;
             }
-            // 上游多给的字节直接截掉（区间读语义以我们的计划为准）。
-            let take = (item.len() as u64).min(remaining) as usize;
-            if let Some(progress) = &network_progress {
-                progress(take as u64);
-            }
-            network_bytes += take as u64;
-            let cache_offset = c.merged_start + (c.len - remaining);
-            if cache_writeback.is_some() {
-                if cache_batch.is_empty() {
-                    cache_batch_start = cache_offset;
-                }
-                cache_batch.extend_from_slice(&item[..take]);
-                if cache_batch.len() >= CACHE_WRITE_BATCH {
-                    flush_cache_batch(
-                        cache_writeback.as_ref().expect("writeback checked above"),
-                        cache_batch_start,
-                        &mut cache_batch,
-                    )
-                    .await;
-                }
-            }
-            let output_start = output_batch.len();
-            output_batch.extend_from_slice(&item[..take]);
-            if encrypted {
-                cipher.apply_keystream(&mut output_batch[output_start..]);
-            }
-            remaining -= take as u64;
-            if !flush_output_batch(&tx, &mut output_batch, false).await {
-                return FetchStats {
-                    index,
-                    volume: c.vol,
-                    bytes: network_bytes,
-                    elapsed: started.elapsed(),
-                    attempts,
-                    timeouts,
-                    cache_hit: false,
-                    success: false,
-                }; // serializer 已放弃
+            if let Some(writeback) = &cache_writeback {
+                flush_cache_batch(writeback, cache_batch_start, &mut cache_batch).await;
             }
             if remaining == 0 {
-                if !flush_output_batch(&tx, &mut output_batch, true).await {
-                    return FetchStats {
-                        index,
-                        volume: c.vol,
-                        bytes: network_bytes,
-                        elapsed: started.elapsed(),
-                        attempts,
-                        timeouts,
-                        cache_hit: false,
-                        success: false,
-                    };
-                }
-                if let Some(writeback) = &cache_writeback {
-                    flush_cache_batch(writeback, cache_batch_start, &mut cache_batch).await;
-                }
-                return FetchStats {
-                    index,
-                    volume: c.vol,
-                    bytes: network_bytes,
-                    elapsed: started.elapsed(),
+                break;
+            }
+            if !flush_output_batch(&tx, &mut output_batch, true).await {
+                return failed_fetch_stats(
+                    (index, c.vol),
+                    network_bytes,
+                    cache_bytes,
+                    started,
                     attempts,
+                    retries,
                     timeouts,
-                    cache_hit: false,
-                    success: true,
+                );
+            }
+            if last_error.is_empty() {
+                last_error = if remaining == before {
+                    format!("上游未返回 range {range_start}-{range_end}")
+                } else {
+                    format!("上游提前结束 range {range_start}-{range_end}")
                 };
             }
+            tracing::debug!(
+                "分片网络区间重试 {segment_attempts}/4: path={obj_path} range={range_start}-{range_end} 剩余={remaining} err={last_error}",
+            );
+            tokio::task::yield_now().await;
         }
-        if !flush_output_batch(&tx, &mut output_batch, true).await {
-            return FetchStats {
-                index,
-                volume: c.vol,
-                bytes: network_bytes,
-                elapsed: started.elapsed(),
+        if remaining > 0 {
+            let _ = tx
+                .send(Err(io::Error::other(format!(
+                    "上游重试 {segment_attempts} 次后仍少 {remaining} 字节: {last_error}"
+                ))))
+                .await;
+            return failed_fetch_stats(
+                (index, c.vol),
+                network_bytes,
+                cache_bytes,
+                started,
                 attempts,
+                retries,
                 timeouts,
-                cache_hit: false,
-                success: false,
-            };
+            );
         }
-        // Preserve bytes received before a retry. This also keeps the staging
-        // buffer bounded when an upstream stream fails mid-range.
-        if let Some(writeback) = &cache_writeback {
-            flush_cache_batch(writeback, cache_batch_start, &mut cache_batch).await;
-        }
-        if remaining == before && last_error.is_empty() {
-            last_error = format!("上游未返回 range {range_start}-{range_end}");
-        }
-        tracing::debug!(
-            "分片重试 {attempts}/4: path={obj_path} 已完成={} 剩余={remaining} err={last_error}",
-            c.len - remaining,
-        );
-        tokio::task::yield_now().await;
     }
-    let _ = tx
-        .send(Err(io::Error::other(format!(
-            "上游重试 {attempts} 次后仍少 {remaining} 字节: {last_error}"
-        ))))
-        .await;
+
+    let success = flush_output_batch(&tx, &mut output_batch, true).await;
     FetchStats {
         index,
         volume: c.vol,
         bytes: network_bytes,
+        cache_bytes,
         elapsed: started.elapsed(),
         attempts,
+        retries,
+        timeouts,
+        cache_hit: cache_bytes == c.len,
+        success,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheSegment {
+    start: u64,
+    end: u64,
+    cached: bool,
+}
+
+fn split_cache_segments(start: u64, end: u64, cached: &[(u64, u64)]) -> Vec<CacheSegment> {
+    if end < start {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    let mut cursor = start;
+    for &(cached_start, cached_end) in cached {
+        let cached_start = cached_start.max(start);
+        let cached_end = cached_end.min(end);
+        if cached_end < cached_start || cached_end < cursor {
+            continue;
+        }
+        if cursor < cached_start {
+            result.push(CacheSegment {
+                start: cursor,
+                end: cached_start - 1,
+                cached: false,
+            });
+        }
+        let lo = cursor.max(cached_start);
+        result.push(CacheSegment {
+            start: lo,
+            end: cached_end,
+            cached: true,
+        });
+        cursor = cached_end.saturating_add(1);
+        if cursor > end {
+            break;
+        }
+    }
+    if cursor <= end {
+        result.push(CacheSegment {
+            start: cursor,
+            end,
+            cached: false,
+        });
+    }
+    result
+}
+
+fn stream_cached_range(
+    cache: Arc<crate::cache::CacheEntry>,
+    start: u64,
+    end: u64,
+) -> mpsc::Receiver<io::Result<Bytes>> {
+    let (tx, rx) = mpsc::channel(4);
+    tokio::task::spawn_blocking(move || {
+        let mut cursor = start;
+        while cursor <= end {
+            let chunk_end = end.min(cursor.saturating_add(CACHE_READ_BATCH - 1));
+            let item = cache.read_range_untracked(cursor, chunk_end);
+            let failed = item.is_err();
+            if tx.blocking_send(item).is_err() || failed {
+                return;
+            }
+            cursor = chunk_end.saturating_add(1);
+        }
+        cache.record_hit();
+    });
+    rx
+}
+
+async fn append_output(
+    tx: &mpsc::Sender<io::Result<Bytes>>,
+    output: &mut BytesMut,
+    cipher: &mut ChaCha20,
+    encrypted: bool,
+    ciphertext: &[u8],
+) -> bool {
+    let offset = output.len();
+    output.extend_from_slice(ciphertext);
+    if encrypted {
+        cipher.apply_keystream(&mut output[offset..]);
+    }
+    flush_output_batch(tx, output, false).await
+}
+
+fn failed_fetch_stats(
+    identity: (usize, usize),
+    bytes: u64,
+    cache_bytes: u64,
+    started: std::time::Instant,
+    attempts: usize,
+    retries: usize,
+    timeouts: usize,
+) -> FetchStats {
+    let (index, volume) = identity;
+    FetchStats {
+        index,
+        volume,
+        bytes,
+        cache_bytes,
+        elapsed: started.elapsed(),
+        attempts,
+        retries,
         timeouts,
         cache_hit: false,
         success: false,
@@ -1638,8 +1924,10 @@ mod tests {
             index: 0,
             volume: 0,
             bytes: 1_000_000,
+            cache_bytes: 0,
             elapsed: std::time::Duration::from_secs(elapsed_secs),
             attempts: 1,
+            retries: 0,
             timeouts,
             cache_hit: false,
             success: timeouts == 0,
@@ -1666,6 +1954,117 @@ mod tests {
             );
         }
         assert_eq!(capped.current, 4);
+    }
+
+    #[test]
+    fn learned_concurrency_is_reused_but_playback_stays_conservative() {
+        let key = "test-learned-concurrency";
+        LEARNED_DOWNLOAD_CONCURRENCY.lock().unwrap().remove(key);
+        save_learned_concurrency(Some(key), 7);
+        assert_eq!(
+            load_learned_concurrency(Some(key), 16, StreamMode::BulkDownload),
+            7
+        );
+        assert_eq!(
+            load_learned_concurrency(Some(key), 16, StreamMode::Playback),
+            4
+        );
+        assert_eq!(
+            load_learned_concurrency(Some(key), 5, StreamMode::CacheWarm),
+            5
+        );
+        LEARNED_DOWNLOAD_CONCURRENCY.lock().unwrap().remove(key);
+    }
+
+    #[test]
+    fn cache_segments_cover_only_true_gaps() {
+        assert_eq!(
+            split_cache_segments(100, 499, &[(100, 199), (300, 399)]),
+            vec![
+                CacheSegment {
+                    start: 100,
+                    end: 199,
+                    cached: true
+                },
+                CacheSegment {
+                    start: 200,
+                    end: 299,
+                    cached: false
+                },
+                CacheSegment {
+                    start: 300,
+                    end: 399,
+                    cached: true
+                },
+                CacheSegment {
+                    start: 400,
+                    end: 499,
+                    cached: false
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_cache_hit_fetches_only_missing_blocks() {
+        let total = 3 * crate::cache::BLOCK_SIZE;
+        let plaintext = Bytes::from(
+            (0..total)
+                .map(|offset| (offset % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let pw = [0x42; crate::crypto::SECRET_LEN];
+        let mut encrypted = plaintext.to_vec();
+        crate::crypto::apply_content_keystream(&pw, 0, &mut encrypted);
+        let source = Bytes::from(encrypted);
+        let storage = Arc::new(RecordingRangeStorage {
+            volumes: std::collections::HashMap::from([("vol00.bin".to_owned(), source.clone())]),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let cache_store = crate::cache::CacheStore::new(dir.path().join("cache")).unwrap();
+        let cache = cache_store.open("mixed", total).unwrap();
+        cache
+            .write_range(0, &source[..crate::cache::BLOCK_SIZE as usize])
+            .unwrap();
+        cache
+            .write_range(
+                2 * crate::cache::BLOCK_SIZE,
+                &source[(2 * crate::cache::BLOCK_SIZE) as usize..],
+            )
+            .unwrap();
+
+        let mut rx = stream_range_cached_mode(
+            storage.clone(),
+            String::new(),
+            pw,
+            true,
+            Arc::new(layout(&[total])),
+            0,
+            total - 1,
+            false,
+            &StreamParams {
+                max_split: total,
+                max_threads: 1,
+                max_per_volume: 1,
+                mode: StreamMode::BulkDownload,
+            },
+            Some(cache),
+            None,
+        );
+        let mut output = Vec::new();
+        while let Some(item) = rx.recv().await {
+            output.extend_from_slice(&item.unwrap());
+        }
+        assert_eq!(output, plaintext.as_ref());
+        assert_eq!(
+            storage.requests.lock().unwrap().as_slice(),
+            &[(
+                "vol00.bin".to_owned(),
+                crate::cache::BLOCK_SIZE,
+                2 * crate::cache::BLOCK_SIZE - 1,
+            )]
+        );
     }
 
     /// 客户端断开（播放器 seek 会立即弃掉旧请求）后，所有 in-flight
@@ -1717,12 +2116,18 @@ mod tests {
     async fn stalled_range_body_times_out_and_reports_diagnostics() {
         let (tx, mut rx) = mpsc::channel(8);
         let task = tokio::spawn(fetch_chunk(
+            FetchContext {
+                mode: StreamMode::Playback,
+                storage: Arc::new(HangingRangeStorage),
+                obj_path: "volume".into(),
+                pw: [0u8; crate::crypto::SECRET_LEN],
+                encrypted: false,
+                cache: None,
+                cache_writeback: None,
+                network_progress: None,
+                transfer_metrics: Arc::new(RangeTransferMetrics::default()),
+            },
             7,
-            StreamMode::Playback,
-            Arc::new(HangingRangeStorage),
-            "volume".into(),
-            [0u8; crate::crypto::SECRET_LEN],
-            false,
             PlannedChunk {
                 merged_start: 0,
                 len: 1024,
@@ -1730,9 +2135,6 @@ mod tests {
                 vol_off: 0,
             },
             tx,
-            None,
-            None,
-            None,
         ));
         let error = rx.recv().await.unwrap().unwrap_err();
         assert!(error.to_string().contains("超时"), "{error}");
@@ -1989,6 +2391,13 @@ mod tests {
             out.extend_from_slice(&item.unwrap());
         }
         assert_eq!(out, plain, "全量下载解密一致");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while cache_store.stats().bytes_cached != total {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("HTTP 输出结束后缓存写回应很快独立排空");
         assert_eq!(cache_store.stats().bytes_cached, total);
         storage.delete("ENCFOLDER").await.unwrap();
 
@@ -2103,12 +2512,18 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel(16);
         fetch_chunk(
+            FetchContext {
+                mode: StreamMode::BulkDownload,
+                storage: storage.clone(),
+                obj_path: "v".into(),
+                pw,
+                encrypted: true,
+                cache: None,
+                cache_writeback: None,
+                network_progress: None,
+                transfer_metrics: Arc::new(RangeTransferMetrics::default()),
+            },
             0,
-            StreamMode::BulkDownload,
-            storage.clone(),
-            "v".into(),
-            pw,
-            true,
             PlannedChunk {
                 merged_start: 0,
                 len: plain.len() as u64,
@@ -2116,9 +2531,6 @@ mod tests {
                 vol_off: 0,
             },
             tx,
-            None,
-            None,
-            None,
         )
         .await;
         let mut out = Vec::new();
