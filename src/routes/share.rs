@@ -3,16 +3,15 @@
 use axum::extract::{Path, State};
 use axum::routing::post;
 use axum::{Json, Router};
-use base64::Engine;
-use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::adapters::{CloudShare, sanitize};
-use crate::crypto::SECRET_LEN;
-use crate::crypto::names::{NameMeta, decode_name, encode_name};
+use crate::crypto::names::{decode_name, encode_name};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+
+use super::share_codec::{self as codec, DecodeError};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -26,29 +25,6 @@ pub fn routes() -> Router<AppState> {
 #[derive(Deserialize)]
 struct ShareBody {
     paths: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SharedItem {
-    storage_name: String,
-    name: String,
-    size: u64,
-    is_dir: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    secret: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SharePack {
-    version: u32,
-    source_type: String,
-    cloud: CloudShare,
-    encrypted: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    root_password: Option<String>,
-    items: Vec<SharedItem>,
 }
 
 async fn share_export(
@@ -65,7 +41,8 @@ async fn share_export(
     let datasource = state.datasource(&ds)?;
     let storage = state.adapter(&ds)?;
     let mut storage_paths = Vec::with_capacity(body.paths.len());
-    let mut items = Vec::with_capacity(body.paths.len());
+    let item_count = body.paths.len();
+    let mut parent_keys = Vec::new();
     for raw_path in body.paths {
         let path = sanitize(&raw_path)?;
         if path.is_empty() {
@@ -73,41 +50,29 @@ async fn share_export(
         }
         if datasource.encryption_enabled {
             let node = super::files::resolve(&state, storage.as_ref(), &ds, &path).await?;
-            let meta = decode_name(&node.parent_key, &node.nc)
-                .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("无法解码 {path} 的密文名")))?;
             storage_paths.push(node.enc_path);
-            items.push(SharedItem {
-                storage_name: node.nc,
-                name: meta.name,
-                size: meta.size,
-                is_dir: meta.is_dir,
-                secret: Some(B64.encode(meta.secret)),
-            });
+            if !parent_keys.contains(&node.parent_key) {
+                parent_keys.push(node.parent_key);
+            }
         } else {
-            let (entry, actual, _) = super::files::plain_locate(storage.as_ref(), &path).await?;
-            let storage_name = super::files::parent_and_name(&actual).1.to_owned();
+            let (_, actual, _) = super::files::plain_locate(storage.as_ref(), &path).await?;
             storage_paths.push(actual);
-            items.push(SharedItem {
-                storage_name,
-                name: super::files::parent_and_name(&path).1.to_owned(),
-                size: entry.size,
-                is_dir: entry.is_dir,
-                secret: None,
-            });
         }
     }
     let cloud = storage.share(&storage_paths).await?;
-    let pack = SharePack {
-        version: 1,
+    let share_id = codec::baidu_share_id(&cloud.url)
+        .ok_or_else(|| ApiError::Upstream("无法从百度分享短链提取分享 ID".into()))?;
+    let pack = codec::Pack {
         source_type: datasource.ds_type,
-        cloud,
+        share_id,
+        password: cloud.password,
         encrypted: datasource.encryption_enabled,
-        root_password: datasource.encryption_enabled.then_some(datasource.password),
-        items,
+        item_count,
+        parent_keys,
     };
-    let encoded = URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&pack).map_err(|e| ApiError::Internal(e.into()))?);
-    Ok(Json(json!({ "link": format!("sd://{encoded}") })))
+    let link =
+        codec::encode(&pack).map_err(|message| ApiError::Internal(anyhow::anyhow!(message)))?;
+    Ok(Json(json!({ "link": link })))
 }
 
 #[derive(Deserialize)]
@@ -127,22 +92,12 @@ async fn share_import(
     if body.link.len() > 64 * 1024 {
         return Err(ApiError::BadRequest("分享链接过长".into()));
     }
-    let encoded = body
-        .link
-        .trim()
-        .strip_prefix("sd://")
-        .ok_or_else(|| ApiError::BadRequest("分享链接必须以 sd:// 开头".into()))?;
-    let pack: SharePack = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .ok_or_else(|| ApiError::BadRequest("分享链接格式无效或已损坏".into()))?;
-    if pack.version != 1 {
-        return Err(ApiError::BadRequest(format!(
-            "不支持的分享协议版本: {}",
-            pack.version
-        )));
-    }
+    let pack = codec::decode(&body.link).map_err(|error| match error {
+        DecodeError::UnsupportedVersion(version) => {
+            ApiError::BadRequest(format!("不支持的分享协议版本: {version}"))
+        }
+        DecodeError::Invalid => ApiError::BadRequest("分享链接格式无效或已损坏".into()),
+    })?;
     let datasource = state.datasource(&ds)?;
     if datasource.ds_type != pack.source_type {
         return Err(ApiError::BadRequest(format!(
@@ -165,49 +120,45 @@ async fn share_import(
     let dest = parent
         .as_ref()
         .map_or(dir.as_str(), |node| node.enc_path.as_str());
-    let transferred = storage.import_share(&pack.cloud, dest).await?;
+    let cloud = CloudShare {
+        url: format!("https://pan.baidu.com/s/1{}", pack.share_id),
+        password: pack.password.clone(),
+    };
+    let transferred = storage.import_share(&cloud, dest).await?;
 
     // 两端均加密：内容无需重加密，只把每个根信封改用当前目录密钥封装；
     // 这正是一次存储端 rename，节点 secret 与整棵子树密码链保持不变。
     if pack.encrypted && datasource.encryption_enabled {
         let parent = parent.expect("加密数据源必有目标父节点");
-        if transferred.len() != pack.items.len() {
+        if transferred.len() != pack.item_count {
             return Err(ApiError::Upstream(format!(
                 "百度转存返回 {} 个条目，分享包包含 {} 个，无法安全重建加密文件名",
                 transferred.len(),
-                pack.items.len()
+                pack.item_count
             )));
         }
-        let transferred_names: std::collections::HashMap<&str, &str> = transferred
-            .iter()
-            .map(|entry| (entry.source_name.as_str(), entry.name.as_str()))
-            .collect();
-        for item in &pack.items {
-            let landed_name = transferred_names
-                .get(item.storage_name.as_str())
-                .ok_or_else(|| {
-                    ApiError::Upstream(format!(
-                        "百度转存结果缺少预期条目 {}，已停止重建加密文件名",
-                        item.storage_name
-                    ))
-                })?;
-            let secret: [u8; SECRET_LEN] = item
-                .secret
-                .as_deref()
-                .and_then(|secret| B64.decode(secret).ok())
-                .and_then(|bytes| bytes.try_into().ok())
-                .ok_or_else(|| ApiError::BadRequest("分享包的节点密钥无效".into()))?;
-            let meta = NameMeta {
-                name: item.name.clone(),
-                size: item.size,
-                is_dir: item.is_dir,
-                secret,
-            };
+        for entry in &transferred {
+            let mut matches = pack
+                .parent_keys
+                .iter()
+                .filter_map(|key| decode_name(key, &entry.source_name));
+            let meta = matches.next().ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "分享包无法解密转存条目 {} 的名称",
+                    entry.source_name
+                ))
+            })?;
+            if matches.next().is_some() {
+                return Err(ApiError::BadRequest(format!(
+                    "转存条目 {} 匹配了多个目录密钥",
+                    entry.source_name
+                )));
+            }
             let new_name = encode_name(&parent.secret, &meta)
-                .ok_or_else(|| ApiError::BadRequest(format!("名称过长: {}", item.name)))?;
+                .ok_or_else(|| ApiError::BadRequest(format!("名称过长: {}", meta.name)))?;
             storage
                 .rename(
-                    &super::files::join_enc(&parent.enc_path, landed_name),
+                    &super::files::join_enc(&parent.enc_path, &entry.name),
                     &super::files::join_enc(&parent.enc_path, &new_name),
                 )
                 .await?;

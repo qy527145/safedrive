@@ -14,12 +14,12 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{Stream, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -30,6 +30,11 @@ use crate::error::{ApiError, ApiResult};
 /// 开区间请求的首块小分片（加速播放器起播/seek 响应）。
 const HEAD_SMALL_SPLIT: u64 = 256 * 1024;
 const HEAD_SMALL_COUNT: usize = 4;
+/// Cache writes arrive from reqwest in small TLS/body frames. Writing every frame
+/// synchronously serializes all download workers on the cache file lock and can
+/// stall Tokio's I/O workers. Coalesce ciphertext to cache-block sized batches
+/// and perform the blocking positional write on the blocking pool.
+const CACHE_WRITE_BATCH: usize = crate::cache::BLOCK_SIZE as usize;
 
 // ---------------- 布局（≈ hydraria probe） ----------------
 
@@ -314,16 +319,12 @@ pub fn stream_range_cached_mode(
         .map_or(params.max_split, |limit| params.max_split.min(limit));
     let max_threads = params.max_threads.max(1);
     let max_per_volume = params.max_per_volume.max(1);
-    // 整个初始并发窗口都使用小分片；否则默认 16 线程会有 12 个线程
-    // 越过 Hydraria 固定的 4 块头部区，立即跑到播放点几十 MiB 之外。
-    let plan = plan_chunks_with_head_count(
-        &layout,
-        start,
-        end,
-        max_split,
-        open_ended,
-        max_threads.max(HEAD_SMALL_COUNT),
-    );
+    // Only the fixed head zone uses tiny ranges. Keeping an entire 16-thread
+    // window at 256 KiB creates excessive HTTP setup churn; the per-volume
+    // semaphore below already prevents the large followers from spreading too
+    // far ahead while the first four ranges establish playback promptly.
+    let plan =
+        plan_chunks_with_head_count(&layout, start, end, max_split, open_ended, HEAD_SMALL_COUNT);
     let total_chunks = plan.len();
 
     tracing::debug!(
@@ -351,10 +352,26 @@ pub fn stream_range_cached_mode(
     // 消费完一块才向前移动一格，不再因后台 fetch 已完成而无限预取。
     tokio::spawn(async move {
         let plan = Arc::new(plan);
+        // A volume is one upstream object. Too many simultaneous ranges against
+        // the same object commonly trigger server-side throttling and produce a
+        // saw-tooth aggregate rate. Keep the global window, but enforce the
+        // configured per-object cap independently for every volume.
+        let volume_slots: Arc<Vec<Arc<Semaphore>>> = Arc::new(
+            layout
+                .volumes
+                .iter()
+                .map(|_| Arc::new(Semaphore::new(max_per_volume)))
+                .collect(),
+        );
+        // Tasks are spawned quickly and Tokio may first-poll them out of order.
+        // Chain admission per volume so later chunks cannot take all permits
+        // while the serializer is waiting for an earlier chunk.
+        let mut volume_turns: Vec<Option<oneshot::Receiver<()>>> =
+            (0..layout.volumes.len()).map(|_| None).collect();
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(total_chunks);
         let mut next_to_spawn = 0usize;
 
-        let spawn_one = |idx: usize, tx: mpsc::Sender<io::Result<Bytes>>| -> JoinHandle<()> {
+        let mut spawn_one = |idx: usize, tx: mpsc::Sender<io::Result<Bytes>>| -> JoinHandle<()> {
             let c = plan[idx].clone();
             let vol_name = layout.volumes[c.vol].name.clone();
             let obj_path = if enc_folder.is_empty() {
@@ -365,7 +382,22 @@ pub fn stream_range_cached_mode(
             let st = Arc::clone(&storage);
             let chunk_cache = cache.clone();
             let progress = network_progress.clone();
+            let volume_slot = Arc::clone(&volume_slots[c.vol]);
+            let previous_turn = volume_turns[c.vol].take();
+            let (turn_tx, turn_rx) = oneshot::channel();
+            volume_turns[c.vol] = Some(turn_rx);
             tokio::spawn(async move {
+                if let Some(previous_turn) = previous_turn
+                    && previous_turn.await.is_err()
+                {
+                    return;
+                }
+                let Ok(_permit) = volume_slot.acquire_owned().await else {
+                    return;
+                };
+                // Queue the next chunk only after this chunk has secured its
+                // own place, preserving FIFO order in the semaphore wait list.
+                let _ = turn_tx.send(());
                 fetch_chunk(st, obj_path, pw, encrypted, c, tx, chunk_cache, progress).await;
             })
         };
@@ -504,6 +536,8 @@ async fn fetch_chunk(
     let mut remaining = c.len;
     let mut attempts = 0usize;
     let mut last_error = String::new();
+    let mut cache_batch = BytesMut::with_capacity(CACHE_WRITE_BATCH);
+    let mut cache_batch_start = c.merged_start;
     while remaining > 0 && attempts < 4 {
         attempts += 1;
         let done = c.len - remaining;
@@ -535,10 +569,19 @@ async fn fetch_chunk(
                 progress(take as u64);
             }
             let cache_offset = c.merged_start + (c.len - remaining);
-            if let Some(cache) = &cache
-                && let Err(e) = cache.write_range(cache_offset, &item[..take])
-            {
-                tracing::warn!("写入密文缓存失败（不影响本次下载）: {e}");
+            if cache.is_some() {
+                if cache_batch.is_empty() {
+                    cache_batch_start = cache_offset;
+                }
+                cache_batch.extend_from_slice(&item[..take]);
+                if cache_batch.len() >= CACHE_WRITE_BATCH {
+                    flush_cache_batch(
+                        cache.as_ref().expect("cache checked above"),
+                        cache_batch_start,
+                        &mut cache_batch,
+                    )
+                    .await;
+                }
             }
             let mut buf = item[..take].to_vec();
             if encrypted {
@@ -549,8 +592,16 @@ async fn fetch_chunk(
                 return; // serializer 已放弃
             }
             if remaining == 0 {
+                if let Some(cache) = &cache {
+                    flush_cache_batch(cache, cache_batch_start, &mut cache_batch).await;
+                }
                 return;
             }
+        }
+        // Preserve bytes received before a retry. This also keeps the staging
+        // buffer bounded when an upstream stream fails mid-range.
+        if let Some(cache) = &cache {
+            flush_cache_batch(cache, cache_batch_start, &mut cache_batch).await;
         }
         if remaining == before && last_error.is_empty() {
             last_error = format!("上游未返回 range {range_start}-{range_end}");
@@ -566,6 +617,23 @@ async fn fetch_chunk(
             "上游重试 {attempts} 次后仍少 {remaining} 字节: {last_error}"
         ))))
         .await;
+}
+
+async fn flush_cache_batch(
+    cache: &Arc<crate::cache::CacheEntry>,
+    start: u64,
+    batch: &mut BytesMut,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let data = batch.split().freeze();
+    let cache = Arc::clone(cache);
+    match tokio::task::spawn_blocking(move || cache.write_range(start, &data)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("写入密文缓存失败（不影响本次下载）: {e}"),
+        Err(e) => tracing::warn!("密文缓存写入任务异常（不影响本次下载）: {e}"),
+    }
 }
 
 // ---------------- 上传：流式加密 + 分卷切写 ----------------
@@ -1024,6 +1092,11 @@ mod tests {
         assert_eq!(out, &all[seek as usize..]);
         let requests = storage.requests.lock().unwrap();
         assert!(!requests.is_empty());
+        assert_eq!(
+            requests[0].1,
+            seek - vol_size,
+            "同一分卷必须让播放点对应的首块最先进入上游"
+        );
         for (path, start, _) in requests.iter() {
             assert_eq!(path, "vol01.bin", "seek 点之前的分卷不应被请求");
             assert!(
@@ -1031,7 +1104,7 @@ mod tests {
                 "不应回头补 seek 点之前的空档: 请求了卷内偏移 {start}"
             );
         }
-        // 最早的请求恰好落在 seek 点上（并发下顺序不定，看最小偏移）
+        // 所有请求的最小偏移也必须恰好落在 seek 点上。
         let min_start = requests.iter().map(|(_, start, _)| *start).min().unwrap();
         assert_eq!(min_start, seek - vol_size);
     }
@@ -1057,7 +1130,7 @@ mod tests {
             &StreamParams {
                 max_split: 1024 * 1024,
                 max_threads: 4,
-                max_per_volume: 4,
+                max_per_volume: 2,
             },
             None,
             None,
@@ -1069,8 +1142,8 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let after_drop = storage.calls.load(Ordering::SeqCst);
         assert!(
-            after_drop <= 4,
-            "断开前的在途请求数不应超过并发上限: {after_drop}"
+            after_drop <= 2,
+            "断开前的在途请求数不应超过单卷并发上限: {after_drop}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(
@@ -1149,21 +1222,28 @@ mod tests {
     }
 
     #[test]
-    fn open_ended_initial_window_stays_close_to_playback_point() {
+    fn open_ended_uses_fixed_small_head_zone_then_full_splits() {
         let threads = 16;
         let l = layout(&[256 * 1024 * 1024]);
-        let plan = plan_chunks_with_head_count(&l, 0, l.total - 1, 5 * 1024 * 1024, true, threads);
+        let plan = plan_chunks_with_head_count(
+            &l,
+            0,
+            l.total - 1,
+            5 * 1024 * 1024,
+            true,
+            HEAD_SMALL_COUNT,
+        );
         assert!(plan.len() > threads);
         assert!(
-            plan[..threads]
+            plan[..HEAD_SMALL_COUNT]
                 .iter()
                 .all(|chunk| chunk.len == HEAD_SMALL_SPLIT),
-            "初始线程窗口必须全部使用小分片"
+            "播放头部区必须使用小分片"
         );
         assert_eq!(
-            plan[threads - 1].merged_start + plan[threads - 1].len,
-            threads as u64 * HEAD_SMALL_SPLIT,
-            "默认 16 线程只覆盖播放点附近 4 MiB，而非散到远端"
+            plan[HEAD_SMALL_COUNT].len,
+            5 * 1024 * 1024,
+            "头部区之后应立即恢复大分片以维持吞吐"
         );
     }
 

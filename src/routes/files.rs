@@ -1008,7 +1008,9 @@ async fn adopt_foreign(
             dir: meta.is_dir,
         },
     );
-    Ok(Json(json!({ "ok": true, "name": meta.name, "isDir": meta.is_dir })))
+    Ok(Json(
+        json!({ "ok": true, "name": meta.name, "isDir": meta.is_dir }),
+    ))
 }
 
 async fn cache_identity(
@@ -1901,7 +1903,11 @@ mod adopt_foreign_tests {
             }
             None => Body::empty(),
         };
-        let resp = app.clone().oneshot(builder.body(body).unwrap()).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap();
         let (parts, body) = resp.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes().to_vec();
         let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
@@ -2000,7 +2006,10 @@ mod adopt_foreign_tests {
         )
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
-        assert!(json["error"].as_str().unwrap().contains("同名条目"), "{json}");
+        assert!(
+            json["error"].as_str().unwrap().contains("同名条目"),
+            "{json}"
+        );
         assert!(cloud.join(&nc).exists());
 
         // 受管条目本身不允许走 adopt
@@ -2012,6 +2021,9 @@ mod adopt_foreign_tests {
         )
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
-        assert!(json["error"].as_str().unwrap().contains("无需操作"), "{json}");
+        assert!(
+            json["error"].as_str().unwrap().contains("无需操作"),
+            "{json}"
+        );
     }
 }

@@ -1,6 +1,7 @@
 pub mod ds;
 pub mod files;
 pub mod share;
+mod share_codec;
 mod system;
 pub mod webdav;
 
