@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::adapters::sanitize;
 use crate::crypto::names::{NameMeta, decode_name, encode_name};
 use crate::crypto::{SECRET_LEN, gen_chunk_names, gen_secret};
-use crate::engine::{self, RangeSpec, StreamParams};
+use crate::engine::{self, RangeSpec, StreamMode, StreamParams};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::vault::CachedNode;
@@ -1163,6 +1163,7 @@ async fn file_cache_warm(
             max_split: transfer.max_split,
             max_threads: transfer.max_threads,
             max_per_volume: transfer.max_per_volume,
+            mode: StreamMode::CacheWarm,
         },
         Some(cache),
         Some(progress),
@@ -1632,6 +1633,11 @@ pub(crate) async fn stream_file(
             max_split: transfer.max_split,
             max_threads: transfer.max_threads,
             max_per_volume: transfer.max_per_volume,
+            mode: if download {
+                StreamMode::BulkDownload
+            } else {
+                StreamMode::Playback
+            },
         },
         content_cache,
         Some(network_progress),
@@ -1799,6 +1805,11 @@ async fn stream_plain(
             max_split: transfer.max_split,
             max_threads: transfer.max_threads,
             max_per_volume: transfer.max_per_volume,
+            mode: if download {
+                StreamMode::BulkDownload
+            } else {
+                StreamMode::Playback
+            },
         },
         cache,
         Some(progress),

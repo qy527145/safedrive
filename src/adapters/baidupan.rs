@@ -17,7 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use futures_util::{StreamExt, TryStreamExt, stream};
+use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt, TryStreamExt, stream};
 use md5::{Digest, Md5};
 use reqwest::header::{
     CONTENT_RANGE, CONTENT_TYPE, COOKIE, HeaderValue, RANGE, REFERER, USER_AGENT,
@@ -62,6 +63,11 @@ const VOLUME_RETRY_BACKOFF_MS: u64 = if cfg!(test) { 50 } else { 5_000 };
 /// 后并发稳定。仍以账号级信号量限制同账号总并发。
 const DEFAULT_UPLOAD_THREADS: usize = 3;
 const LINK_TTL: Duration = Duration::from_secs(10 * 60);
+const DOWNLOAD_HEDGE_DELAY: Duration = if cfg!(test) {
+    Duration::from_millis(40)
+} else {
+    Duration::from_millis(1_200)
+};
 
 /// 账号级（BDUSS 维度）superfile2 并发槽：同一账号哪怕来自不同适配器
 /// 实例（并发上传多个文件时每个请求各建一个实例）也共享同一配额，
@@ -74,6 +80,60 @@ static UPLOAD_SLOTS: std::sync::LazyLock<std::sync::Mutex<SlotMap>> =
 /// 账号级会员类型缓存（决定分片大小；进程生命周期内成功查询一次即复用）。
 static VIP_TYPES: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, i64>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[derive(Debug, Clone)]
+struct DownloadUrlHealth {
+    ewma_ttfb_ms: f64,
+    successes: u64,
+    failures: u64,
+    last_failure: Option<Instant>,
+}
+
+impl Default for DownloadUrlHealth {
+    fn default() -> Self {
+        Self {
+            ewma_ttfb_ms: 500.0,
+            successes: 0,
+            failures: 0,
+            last_failure: None,
+        }
+    }
+}
+
+type DownloadHealthMap = HashMap<(u64, String), DownloadUrlHealth>;
+static DOWNLOAD_URL_HEALTH: std::sync::LazyLock<std::sync::Mutex<DownloadHealthMap>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn download_host(url: &Url) -> String {
+    url.host_str().unwrap_or(url.as_str()).to_ascii_lowercase()
+}
+
+fn download_health_score(account: u64, url: &Url) -> f64 {
+    let health = DOWNLOAD_URL_HEALTH.lock().unwrap();
+    let Some(value) = health.get(&(account, download_host(url))) else {
+        return 500.0;
+    };
+    let recent_penalty = value
+        .last_failure
+        .filter(|at| at.elapsed() < Duration::from_secs(60))
+        .map_or(0.0, |_| 2_000.0);
+    value.ewma_ttfb_ms
+        + recent_penalty
+        + value.failures.saturating_sub(value.successes) as f64 * 250.0
+}
+
+fn record_download_health(account: u64, url: &Url, elapsed: Duration, success: bool) {
+    let mut health = DOWNLOAD_URL_HEALTH.lock().unwrap();
+    let value = health.entry((account, download_host(url))).or_default();
+    if success {
+        let sample = elapsed.as_secs_f64() * 1_000.0;
+        value.ewma_ttfb_ms = value.ewma_ttfb_ms * 0.75 + sample * 0.25;
+        value.successes = value.successes.saturating_add(1);
+    } else {
+        value.failures = value.failures.saturating_add(1);
+        value.last_failure = Some(Instant::now());
+    }
+}
 
 fn account_key(bduss: &HeaderValue) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -157,6 +217,10 @@ pub struct BaiduPanFs {
     http: Client,
     links: Mutex<HashMap<String, CachedLinks>>,
     link_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Per-adapter retry rotation. If a response returned headers but its body
+    /// later stalled, the engine retries the same range and this bias forces a
+    /// different candidate to lead the next controlled race.
+    range_attempts: Mutex<HashMap<(String, u64, u64), (usize, Instant)>>,
     /// 账号级 superfile2 并发槽（见 UPLOAD_SLOTS）。
     upload_slots: Arc<tokio::sync::Semaphore>,
     /// superfile2 分片并发数（uploadThreads，1..=32，默认 3）。
@@ -294,6 +358,7 @@ impl BaiduPanFs {
             http,
             links: Mutex::new(HashMap::new()),
             link_locks: Mutex::new(HashMap::new()),
+            range_attempts: Mutex::new(HashMap::new()),
             upload_slots,
             upload_threads,
             account_key,
@@ -773,43 +838,119 @@ impl BaiduPanFs {
         }
     }
 
+    fn ordered_download_urls(
+        &self,
+        urls: &[String],
+        range: Option<(u64, u64)>,
+        retry_bias: usize,
+    ) -> ApiResult<Vec<Url>> {
+        let mut parsed = urls
+            .iter()
+            .map(|url| {
+                Url::parse(url)
+                    .map_err(|error| ApiError::Upstream(format!("百度返回非法下载链接: {error}")))
+            })
+            .collect::<ApiResult<Vec<_>>>()?;
+        if !parsed.is_empty() {
+            let rotate = range.map_or(0, |(start, _)| {
+                (start / MAX_PREVIEW_RANGE) as usize % parsed.len()
+            });
+            parsed.rotate_left(rotate);
+        }
+        // Stable sorting preserves range-based distribution between equally
+        // healthy candidates, while bad/slow hosts are moved behind healthy ones.
+        parsed.sort_by(|left, right| {
+            download_health_score(self.account_key, left)
+                .total_cmp(&download_health_score(self.account_key, right))
+        });
+        if !parsed.is_empty() && retry_bias > 0 {
+            let len = parsed.len();
+            parsed.rotate_left(retry_bias % len);
+        }
+        Ok(parsed)
+    }
+
+    async fn next_range_retry_bias(&self, path: &str, start: u64, end: u64) -> usize {
+        let mut attempts = self.range_attempts.lock().await;
+        if attempts.len() > 4096 {
+            attempts.retain(|_, (_, touched)| touched.elapsed() < Duration::from_secs(5 * 60));
+        }
+        let entry = attempts
+            .entry((path.to_owned(), start, end))
+            .or_insert((0, Instant::now()));
+        let bias = entry.0;
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = Instant::now();
+        bias
+    }
+
     async fn download_response(
         &self,
         remote_path: &str,
         range: Option<(u64, u64)>,
+        retry_bias: usize,
     ) -> ApiResult<reqwest::Response> {
         for attempt in 0..2 {
             let urls = self.locatedownload(remote_path).await?;
-            let pick =
-                range.map_or(0, |(start, _)| (start / MAX_PREVIEW_RANGE) as usize) % urls.len();
-            let url = Url::parse(&urls[pick])
-                .map_err(|e| ApiError::Upstream(format!("百度返回非法下载链接: {e}")))?;
-            let mut request = self
-                .http
-                .get(url)
-                .header(USER_AGENT, self.download_user_agent.clone())
-                .header(COOKIE, self.download_cookie.clone());
-            if let Some((start, end)) = range {
-                request = request.header(RANGE, format!("bytes={start}-{end}"));
+            let candidates = self.ordered_download_urls(&urls, range, retry_bias)?;
+            let mut requests = FuturesUnordered::new();
+            for (rank, url) in candidates.into_iter().take(2).enumerate() {
+                let http = self.http.clone();
+                let user_agent = self.download_user_agent.clone();
+                let cookie = self.download_cookie.clone();
+                requests.push(
+                    async move {
+                        if rank > 0 {
+                            tokio::time::sleep(DOWNLOAD_HEDGE_DELAY).await;
+                        }
+                        let started = Instant::now();
+                        let mut request = http
+                            .get(url.clone())
+                            .header(USER_AGENT, user_agent)
+                            .header(COOKIE, cookie);
+                        if let Some((start, end)) = range {
+                            request = request.header(RANGE, format!("bytes={start}-{end}"));
+                        }
+                        let result = request.send().await;
+                        (rank, url, started.elapsed(), result)
+                    }
+                    .boxed(),
+                );
             }
-            let resp = request
-                .send()
-                .await
-                .map_err(|e| ApiError::Upstream(format!("百度网盘下载请求失败: {e}")))?;
-            if resp.status().is_success() {
-                return Ok(resp);
+
+            let mut stale_links = false;
+            let mut last_error = String::from("没有可用下载候选");
+            while let Some((winner_rank, url, elapsed, result)) = requests.next().await {
+                match result {
+                    Ok(resp) if resp.status().is_success() => {
+                        record_download_health(self.account_key, &url, elapsed, true);
+                        tracing::debug!(
+                            "百度下载候选命中: host={} ttfb_ms={} winner_rank={} range={range:?}",
+                            download_host(&url),
+                            elapsed.as_millis(),
+                            winner_rank,
+                        );
+                        return Ok(resp);
+                    }
+                    Ok(resp) => {
+                        record_download_health(self.account_key, &url, elapsed, false);
+                        let status = resp.status();
+                        stale_links |=
+                            matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND);
+                        last_error = format!("host={} status={status}", download_host(&url));
+                    }
+                    Err(error) => {
+                        record_download_health(self.account_key, &url, elapsed, false);
+                        last_error = format!("host={} error={error}", download_host(&url));
+                    }
+                }
             }
-            if attempt == 0
-                && matches!(resp.status(), StatusCode::FORBIDDEN | StatusCode::NOT_FOUND)
-            {
+            if attempt == 0 && stale_links {
                 self.invalidate_links_if_same(remote_path, &urls).await;
                 continue;
             }
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
             return Err(ApiError::Upstream(format!(
-                "百度网盘下载失败 ({status}): {}",
-                body.chars().take(300).collect::<String>()
+                "百度网盘下载候选全部失败: {last_error}"
             )));
         }
         unreachable!()
@@ -1639,7 +1780,7 @@ impl Storage for BaiduPanFs {
 
     async fn get(&self, path: &str) -> ApiResult<(Option<u64>, ByteStream)> {
         let resp = self
-            .download_response(&self.remote_path(path), None)
+            .download_response(&self.remote_path(path), None, 0)
             .await?;
         let size = resp.content_length();
         Ok((
@@ -1654,8 +1795,10 @@ impl Storage for BaiduPanFs {
                 "百度网盘单个下载分片必须在 1..=5MiB".into(),
             ));
         }
+        let remote = self.remote_path(path);
+        let retry_bias = self.next_range_retry_bias(&remote, start, end).await;
         let resp = self
-            .download_response(&self.remote_path(path), Some((start, end)))
+            .download_response(&remote, Some((start, end)), retry_bias)
             .await?;
         if resp.status() != StatusCode::PARTIAL_CONTENT {
             return Err(ApiError::Upstream(format!(
@@ -1933,6 +2076,68 @@ mod tests {
         half_client["clientId"] = "custom-client".into();
         assert!(BaiduPanFs::from_config_with_persister(&half_client, Client::new(), None).is_err());
         assert!(normalize_root("/a/../b").is_err());
+    }
+
+    #[test]
+    fn download_health_penalizes_recent_failures() {
+        let account = 0x5afe_d11eu64;
+        let fast = Url::parse("https://fast.example/file").unwrap();
+        let failed = Url::parse("https://failed.example/file").unwrap();
+        record_download_health(account, &fast, Duration::from_millis(80), true);
+        record_download_health(account, &failed, Duration::from_millis(80), false);
+        assert!(
+            download_health_score(account, &fast) < download_health_score(account, &failed),
+            "近期失败的下载 host 必须被降权"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_primary_download_is_hedged_to_second_candidate() {
+        #[derive(Clone)]
+        struct HedgeState {
+            base: String,
+        }
+
+        async fn locate(State(state): State<HedgeState>) -> Json<Value> {
+            Json(json!({
+                "urls": [
+                    {"url": format!("{}/slow", state.base)},
+                    {"url": format!("{}/fast", state.base)}
+                ]
+            }))
+        }
+
+        async fn slow() -> impl IntoResponse {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            (StatusCode::PARTIAL_CONTENT, "slow")
+        }
+
+        async fn fast() -> impl IntoResponse {
+            (StatusCode::PARTIAL_CONTENT, "fast")
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/locate", get(locate))
+            .route("/slow", get(slow))
+            .route("/fast", get(fast))
+            .with_state(HedgeState { base: base.clone() });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut cfg = config(&base);
+        cfg["pcsApiBase"] = format!("{base}/locate").into();
+        let fs = BaiduPanFs::from_config_with_persister(&cfg, Client::new(), None).unwrap();
+        let started = Instant::now();
+        let response = fs
+            .download_response("/safe/hedge", Some((0, 1)), 0)
+            .await
+            .unwrap();
+        assert_eq!(response.url().path(), "/fast");
+        assert!(
+            started.elapsed() < Duration::from_millis(180),
+            "第二候选应在慢主请求完成前胜出"
+        );
     }
 
     #[tokio::test]

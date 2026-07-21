@@ -385,4 +385,12 @@ mod tests {
         let changed = format!("sd://{}", URL_SAFE_NO_PAD.encode(wire));
         assert_eq!(decode(&changed), Err(DecodeError::UnsupportedVersion(2)));
     }
+
+    #[test]
+    fn uses_standard_unpadded_url_safe_base64() {
+        assert_eq!(URL_SAFE_NO_PAD.encode([0xfb]), "-w");
+        assert_eq!(URL_SAFE_NO_PAD.encode([0xff]), "_w");
+        assert_eq!(URL_SAFE_NO_PAD.decode("-w"), Ok(vec![0xfb]));
+        assert_eq!(URL_SAFE_NO_PAD.decode("_w"), Ok(vec![0xff]));
+    }
 }

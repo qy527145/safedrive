@@ -19,7 +19,7 @@ use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{Stream, StreamExt};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -30,6 +30,7 @@ use crate::error::{ApiError, ApiResult};
 /// 开区间请求的首块小分片（加速播放器起播/seek 响应）。
 const HEAD_SMALL_SPLIT: u64 = 256 * 1024;
 const HEAD_SMALL_COUNT: usize = 4;
+const OUTPUT_BATCH: usize = 64 * 1024;
 /// Cache writes arrive from reqwest in small TLS/body frames. Writing every frame
 /// synchronously serializes all download workers on the cache file lock and can
 /// stall Tokio's I/O workers. Coalesce ciphertext to cache-block sized batches
@@ -251,6 +252,205 @@ pub struct StreamParams {
     pub max_split: u64,
     pub max_threads: usize,
     pub max_per_volume: usize,
+    pub mode: StreamMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamMode {
+    /// Low-latency, playback-point-centered scheduling for inline media and Range seeks.
+    Playback,
+    /// Throughput-first scheduling for an explicit attachment download.
+    BulkDownload,
+    /// Background cache population; throughput-oriented but separately observable.
+    CacheWarm,
+}
+
+impl StreamMode {
+    fn head_count(self, open_ended: bool) -> usize {
+        if self == Self::Playback && open_ended {
+            HEAD_SMALL_COUNT
+        } else {
+            0
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Playback => "playback",
+            Self::BulkDownload => "bulk",
+            Self::CacheWarm => "cache_warm",
+        }
+    }
+
+    fn first_byte_timeout(self) -> std::time::Duration {
+        if cfg!(test) {
+            return std::time::Duration::from_millis(120);
+        }
+        match self {
+            Self::Playback => std::time::Duration::from_secs(3),
+            Self::BulkDownload => std::time::Duration::from_secs(8),
+            Self::CacheWarm => std::time::Duration::from_secs(15),
+        }
+    }
+
+    fn idle_timeout(self) -> std::time::Duration {
+        if cfg!(test) {
+            return std::time::Duration::from_millis(150);
+        }
+        match self {
+            Self::Playback => std::time::Duration::from_secs(5),
+            Self::BulkDownload => std::time::Duration::from_secs(10),
+            Self::CacheWarm => std::time::Duration::from_secs(20),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FetchStats {
+    index: usize,
+    volume: usize,
+    bytes: u64,
+    elapsed: std::time::Duration,
+    attempts: usize,
+    timeouts: usize,
+    cache_hit: bool,
+    success: bool,
+}
+
+struct AdaptiveConcurrency {
+    current: usize,
+    cap: usize,
+    delivered_bytes: u64,
+    delivery_started: std::time::Instant,
+    baseline_bps: Option<f64>,
+    cooldown_epochs: usize,
+    probing: bool,
+}
+
+struct CacheWrite {
+    start: u64,
+    data: Bytes,
+}
+
+#[derive(Clone)]
+struct CacheWriteback {
+    tx: mpsc::Sender<CacheWrite>,
+}
+
+impl CacheWriteback {
+    fn new(cache: Arc<crate::cache::CacheEntry>, capacity: usize) -> (Self, JoinHandle<()>) {
+        let (tx, mut rx) = mpsc::channel::<CacheWrite>(capacity.max(2));
+        let handle = tokio::spawn(async move {
+            while let Some(write) = rx.recv().await {
+                let entry = Arc::clone(&cache);
+                match tokio::task::spawn_blocking(move || {
+                    entry.write_range(write.start, &write.data)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!("写入密文缓存失败（不影响本次下载）: {error}")
+                    }
+                    Err(error) => {
+                        tracing::warn!("密文缓存写入任务异常（不影响本次下载）: {error}")
+                    }
+                }
+            }
+        });
+        (Self { tx }, handle)
+    }
+
+    async fn enqueue(&self, start: u64, data: Bytes) {
+        if self.tx.send(CacheWrite { start, data }).await.is_err() {
+            tracing::warn!("密文缓存写回队列已关闭");
+        }
+    }
+}
+
+impl AdaptiveConcurrency {
+    fn new(cap: usize) -> Self {
+        Self {
+            current: cap.min(4).max(1),
+            cap: cap.max(1),
+            delivered_bytes: 0,
+            delivery_started: std::time::Instant::now(),
+            baseline_bps: None,
+            cooldown_epochs: 0,
+            probing: false,
+        }
+    }
+
+    fn observe_failure(&mut self, stats: &FetchStats) -> Option<(usize, usize, &'static str)> {
+        if stats.cache_hit || (stats.success && stats.timeouts == 0) {
+            return None;
+        }
+        let old = self.current;
+        self.current = (self.current / 2).max(1);
+        self.delivered_bytes = 0;
+        self.delivery_started = std::time::Instant::now();
+        self.baseline_bps = None;
+        self.cooldown_epochs = 2;
+        self.probing = false;
+        (old != self.current).then_some((old, self.current, "timeout_or_failure"))
+    }
+
+    fn delivered(
+        &mut self,
+        bytes: u64,
+        allow_upward_probe: bool,
+    ) -> Option<(usize, usize, &'static str)> {
+        self.delivered_bytes = self.delivered_bytes.saturating_add(bytes);
+        let elapsed = self.delivery_started.elapsed();
+        if elapsed < std::time::Duration::from_secs(10) {
+            return None;
+        }
+        let bps = self.delivered_bytes as f64 / elapsed.as_secs_f64().max(0.001);
+        self.delivered_bytes = 0;
+        self.delivery_started = std::time::Instant::now();
+        self.observe_delivery_rate(bps, allow_upward_probe)
+    }
+
+    fn observe_delivery_rate(
+        &mut self,
+        bps: f64,
+        allow_upward_probe: bool,
+    ) -> Option<(usize, usize, &'static str)> {
+        if self.cooldown_epochs > 0 {
+            self.cooldown_epochs -= 1;
+            self.baseline_bps = Some(bps);
+            return None;
+        }
+        if self.baseline_bps.is_none() {
+            self.baseline_bps = Some(bps);
+            return None;
+        }
+
+        let old = self.current;
+        if self.probing {
+            self.probing = false;
+            if self
+                .baseline_bps
+                .is_some_and(|baseline| bps < baseline * 1.03)
+            {
+                self.current = self.current.saturating_sub(1).max(1);
+                self.cooldown_epochs = 2;
+                self.baseline_bps = None;
+                return (old != self.current).then_some((
+                    old,
+                    self.current,
+                    "throughput_probe_no_gain",
+                ));
+            }
+        }
+        self.baseline_bps = Some(bps);
+        if allow_upward_probe && self.current < self.cap {
+            self.current += 1;
+            self.probing = true;
+            return Some((old, self.current, "throughput_probe"));
+        }
+        None
+    }
 }
 
 /// 按合并区间 [start, end] 流式产出解密后的明文字节，可选持久密文缓存。
@@ -319,24 +519,36 @@ pub fn stream_range_cached_mode(
         .map_or(params.max_split, |limit| params.max_split.min(limit));
     let max_threads = params.max_threads.max(1);
     let max_per_volume = params.max_per_volume.max(1);
-    // Only the fixed head zone uses tiny ranges. Keeping an entire 16-thread
-    // window at 256 KiB creates excessive HTTP setup churn; the per-volume
-    // semaphore below already prevents the large followers from spreading too
-    // far ahead while the first four ranges establish playback promptly.
-    let plan =
-        plan_chunks_with_head_count(&layout, start, end, max_split, open_ended, HEAD_SMALL_COUNT);
+    let mode = params.mode;
+    let memory_budget_chunks = (256 * 1024 * 1024u64 / max_split.max(1)) as usize;
+    let max_buffered_chunks = if mode == StreamMode::Playback {
+        max_threads
+    } else {
+        max_threads.max(memory_budget_chunks.min(max_threads.saturating_mul(4)))
+    };
+    // Only playback uses the fixed tiny head zone. Bulk/cache modes start with
+    // full-size ranges, while the scheduler below enforces per-volume limits.
+    let plan = plan_chunks_with_head_count(
+        &layout,
+        start,
+        end,
+        max_split,
+        open_ended,
+        params.mode.head_count(open_ended),
+    );
     let total_chunks = plan.len();
 
     tracing::debug!(
-        "stream_range [{start},{end}] chunks={total_chunks} split={} threads={max_threads} per_vol={max_per_volume} open_ended={open_ended} window={max_threads}",
+        "stream_range mode={} [{start},{end}] chunks={total_chunks} split={} threads={max_threads} per_vol={max_per_volume} open_ended={open_ended} buffered_chunks={max_buffered_chunks}",
+        params.mode.as_str(),
         max_split,
     );
 
     // 每 chunk 一条通道，缓冲足以吸收整个 chunk —— fetcher 不必等
     // serializer 消费即可跑完并释放并发额度（hydraria 的教训：缓冲不足
     // 会让预取的下一卷首块把上游带宽压成 0）。
-    let item_estimate = 16 * 1024u64;
-    let chan_buffer = ((max_split / item_estimate) as usize).clamp(8, 512);
+    let item_estimate = OUTPUT_BATCH as u64;
+    let chan_buffer = ((max_split / item_estimate) as usize).clamp(8, 128);
     let mut senders: Vec<Option<mpsc::Sender<io::Result<Bytes>>>> =
         Vec::with_capacity(total_chunks);
     let mut receivers: Vec<mpsc::Receiver<io::Result<Bytes>>> = Vec::with_capacity(total_chunks);
@@ -347,31 +559,29 @@ pub fn stream_range_cached_mode(
     }
 
     let (out_tx, out_rx) = mpsc::channel::<io::Result<Bytes>>(8);
+    let (cache_writeback, cache_writer) = match cache.as_ref() {
+        Some(entry) => {
+            let (writer, task) =
+                CacheWriteback::new(Arc::clone(entry), max_threads.saturating_mul(2));
+            (Some(writer), Some(task))
+        }
+        None => (None, None),
+    };
 
-    // 调度器与 serializer 合并：窗口锚定当前输出块，只有播放器真正
-    // 消费完一块才向前移动一格，不再因后台 fetch 已完成而无限预取。
+    // Completion-driven scheduler + serializer. Playback only scans the near
+    // window; bulk/cache modes may skip saturated volumes and fill the global
+    // request budget from later volumes while the serializer still emits in order.
     tokio::spawn(async move {
         let plan = Arc::new(plan);
-        // A volume is one upstream object. Too many simultaneous ranges against
-        // the same object commonly trigger server-side throttling and produce a
-        // saw-tooth aggregate rate. Keep the global window, but enforce the
-        // configured per-object cap independently for every volume.
-        let volume_slots: Arc<Vec<Arc<Semaphore>>> = Arc::new(
-            layout
-                .volumes
-                .iter()
-                .map(|_| Arc::new(Semaphore::new(max_per_volume)))
-                .collect(),
-        );
-        // Tasks are spawned quickly and Tokio may first-poll them out of order.
-        // Chain admission per volume so later chunks cannot take all permits
-        // while the serializer is waiting for an earlier chunk.
-        let mut volume_turns: Vec<Option<oneshot::Receiver<()>>> =
-            (0..layout.volumes.len()).map(|_| None).collect();
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<FetchStats>();
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(total_chunks);
-        let mut next_to_spawn = 0usize;
+        let mut spawned = vec![false; total_chunks];
+        let mut active = 0usize;
+        let mut outstanding = 0usize;
+        let mut active_per_volume = vec![0usize; layout.volumes.len()];
+        let mut adaptive = AdaptiveConcurrency::new(max_threads);
 
-        let mut spawn_one = |idx: usize, tx: mpsc::Sender<io::Result<Bytes>>| -> JoinHandle<()> {
+        let spawn_one = |idx: usize, tx: mpsc::Sender<io::Result<Bytes>>| -> JoinHandle<()> {
             let c = plan[idx].clone();
             let vol_name = layout.volumes[c.vol].name.clone();
             let obj_path = if enc_folder.is_empty() {
@@ -381,25 +591,55 @@ pub fn stream_range_cached_mode(
             };
             let st = Arc::clone(&storage);
             let chunk_cache = cache.clone();
+            let writeback = cache_writeback.clone();
             let progress = network_progress.clone();
-            let volume_slot = Arc::clone(&volume_slots[c.vol]);
-            let previous_turn = volume_turns[c.vol].take();
-            let (turn_tx, turn_rx) = oneshot::channel();
-            volume_turns[c.vol] = Some(turn_rx);
+            let done = done_tx.clone();
             tokio::spawn(async move {
-                if let Some(previous_turn) = previous_turn
-                    && previous_turn.await.is_err()
-                {
-                    return;
-                }
-                let Ok(_permit) = volume_slot.acquire_owned().await else {
-                    return;
-                };
-                // Queue the next chunk only after this chunk has secured its
-                // own place, preserving FIFO order in the semaphore wait list.
-                let _ = turn_tx.send(());
-                fetch_chunk(st, obj_path, pw, encrypted, c, tx, chunk_cache, progress).await;
+                let stats = fetch_chunk(
+                    idx,
+                    mode,
+                    st,
+                    obj_path,
+                    pw,
+                    encrypted,
+                    c,
+                    tx,
+                    chunk_cache,
+                    writeback,
+                    progress,
+                )
+                .await;
+                let _ = done.send(stats);
             })
+        };
+        let fill_window = |current: usize,
+                           active: &mut usize,
+                           outstanding: &mut usize,
+                           active_per_volume: &mut [usize],
+                           global_limit: usize,
+                           per_volume_limit: usize,
+                           spawned: &mut [bool],
+                           senders: &mut [Option<mpsc::Sender<io::Result<Bytes>>>],
+                           handles: &mut Vec<JoinHandle<()>>| {
+            let scan_end = if mode == StreamMode::Playback {
+                total_chunks.min(current.saturating_add(max_threads))
+            } else {
+                total_chunks
+            };
+            while *active < global_limit && *outstanding < max_buffered_chunks {
+                let Some(idx) = (current..scan_end).find(|&idx| {
+                    !spawned[idx] && active_per_volume[plan[idx].vol] < per_volume_limit
+                }) else {
+                    break;
+                };
+                let vol = plan[idx].vol;
+                let tx = senders[idx].take().expect("chunk sender 仅使用一次");
+                spawned[idx] = true;
+                *active += 1;
+                *outstanding += 1;
+                active_per_volume[vol] += 1;
+                handles.push(spawn_one(idx, tx));
+            }
         };
         let abort_all = |handles: &[JoinHandle<()>]| {
             for handle in handles {
@@ -407,34 +647,88 @@ pub fn stream_range_cached_mode(
             }
         };
 
-        // 首块独占启动，保证云端连接、缓存磁盘锁和解密 CPU 优先服务
-        // 播放点；首字节进入 HTTP body 后再展开其余并发。
-        if total_chunks > 0 {
+        // Client-facing modes start the exact requested chunk alone for low TTFB
+        // and strict position priority. Cache warming has no client latency and
+        // may fill its initial budget immediately.
+        if total_chunks > 0 && mode != StreamMode::CacheWarm {
             let tx = senders[0].take().expect("首块 sender 仅使用一次");
+            spawned[0] = true;
+            active = 1;
+            outstanding = 1;
+            active_per_volume[plan[0].vol] = 1;
             handles.push(spawn_one(0, tx));
-            next_to_spawn = 1;
+        } else {
+            fill_window(
+                0,
+                &mut active,
+                &mut outstanding,
+                &mut active_per_volume,
+                adaptive.current,
+                max_per_volume,
+                &mut spawned,
+                &mut senders,
+                &mut handles,
+            );
         }
-        let mut initial_window_opened = false;
+        let mut client_window_opened = mode == StreamMode::CacheWarm;
 
         'outer: for (i, mut rx) in receivers.into_iter().enumerate() {
             let expect = plan[i].len;
             let mut got = 0u64;
             while got < expect {
-                let item = tokio::select! {
-                    biased;
-                    _ = out_tx.closed() => {
-                        tracing::debug!(
-                            "客户端在 chunk {i} 等待期间断开，abort {} 个 fetcher",
-                            handles.len()
-                        );
-                        abort_all(&handles);
-                        break 'outer;
+                let item = loop {
+                    tokio::select! {
+                        biased;
+                        _ = out_tx.closed() => {
+                            tracing::debug!(
+                                "客户端在 chunk {i} 等待期间断开，abort {} 个 fetcher",
+                                handles.len()
+                            );
+                            abort_all(&handles);
+                            break 'outer;
+                        }
+                        Some(stats) = done_rx.recv() => {
+                            active = active.saturating_sub(1);
+                            active_per_volume[stats.volume] = active_per_volume[stats.volume].saturating_sub(1);
+                            if let Some((old, new, reason)) = adaptive.observe_failure(&stats) {
+                                tracing::info!(
+                                    "adaptive download concurrency mode={} {}->{} reason={reason}",
+                                    mode.as_str(), old, new,
+                                );
+                            }
+                            tracing::debug!(
+                                "fetch chunk={} vol={} mode={} bytes={} elapsed_ms={} attempts={} timeouts={} cache_hit={} success={}",
+                                stats.index,
+                                stats.volume,
+                                mode.as_str(),
+                                stats.bytes,
+                                stats.elapsed.as_millis(),
+                                stats.attempts,
+                                stats.timeouts,
+                                stats.cache_hit,
+                                stats.success,
+                            );
+                            if client_window_opened {
+                                fill_window(
+                                    i,
+                                    &mut active,
+                                    &mut outstanding,
+                                    &mut active_per_volume,
+                                    adaptive.current,
+                                    max_per_volume,
+                                    &mut spawned,
+                                    &mut senders,
+                                    &mut handles,
+                                );
+                            }
+                        },
+                        item = rx.recv() => break item,
                     }
-                    item = rx.recv() => item,
                 };
                 match item {
                     Some(Ok(b)) => {
                         got += b.len() as u64;
+                        let delivered = b.len() as u64;
                         if out_tx.send(Ok(b)).await.is_err() {
                             tracing::debug!(
                                 "客户端在 chunk {i} 输出期间断开，abort {} 个 fetcher",
@@ -443,15 +737,40 @@ pub fn stream_range_cached_mode(
                             abort_all(&handles);
                             break 'outer;
                         }
-                        if !initial_window_opened {
-                            let target = total_chunks.min(max_threads);
-                            while next_to_spawn < target {
-                                let idx = next_to_spawn;
-                                let tx = senders[idx].take().expect("chunk sender 仅使用一次");
-                                handles.push(spawn_one(idx, tx));
-                                next_to_spawn += 1;
-                            }
-                            initial_window_opened = true;
+                        if let Some((old, new, reason)) =
+                            adaptive.delivered(delivered, mode != StreamMode::Playback)
+                        {
+                            tracing::info!(
+                                "adaptive download concurrency mode={} {}->{} reason={reason}",
+                                mode.as_str(),
+                                old,
+                                new,
+                            );
+                            fill_window(
+                                i,
+                                &mut active,
+                                &mut outstanding,
+                                &mut active_per_volume,
+                                adaptive.current,
+                                max_per_volume,
+                                &mut spawned,
+                                &mut senders,
+                                &mut handles,
+                            );
+                        }
+                        if !client_window_opened {
+                            client_window_opened = true;
+                            fill_window(
+                                i,
+                                &mut active,
+                                &mut outstanding,
+                                &mut active_per_volume,
+                                adaptive.current,
+                                max_per_volume,
+                                &mut spawned,
+                                &mut senders,
+                                &mut handles,
+                            );
                         }
                     }
                     Some(Err(e)) => {
@@ -471,15 +790,25 @@ pub fn stream_range_cached_mode(
                 }
             }
 
-            // 当前块已实际交付，播放窗口只前进一格。max_per_volume 保持
-            // 软限制语义，但绝不跳去远卷寻找配额，因此线程集中在播放点。
-            let target = total_chunks.min(i.saturating_add(1).saturating_add(max_threads));
-            while next_to_spawn < target {
-                let idx = next_to_spawn;
-                let tx = senders[idx].take().expect("chunk sender 仅使用一次");
-                handles.push(spawn_one(idx, tx));
-                next_to_spawn += 1;
-            }
+            outstanding = outstanding.saturating_sub(1);
+            fill_window(
+                i.saturating_add(1),
+                &mut active,
+                &mut outstanding,
+                &mut active_per_volume,
+                adaptive.current,
+                max_per_volume,
+                &mut spawned,
+                &mut senders,
+                &mut handles,
+            );
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+        drop(cache_writeback);
+        if let Some(writer) = cache_writer {
+            let _ = writer.await;
         }
     });
 
@@ -488,6 +817,8 @@ pub fn stream_range_cached_mode(
 
 /// 拉取单个 chunk 的密文区间并按合并偏移解密。
 async fn fetch_chunk(
+    index: usize,
+    mode: StreamMode,
     storage: Arc<dyn Storage>,
     obj_path: String,
     pw: [u8; crate::crypto::SECRET_LEN],
@@ -495,8 +826,13 @@ async fn fetch_chunk(
     c: PlannedChunk,
     tx: mpsc::Sender<io::Result<Bytes>>,
     cache: Option<Arc<crate::cache::CacheEntry>>,
+    cache_writeback: Option<CacheWriteback>,
     network_progress: Option<crate::adapters::ProgressFn>,
-) {
+) -> FetchStats {
+    let started = std::time::Instant::now();
+    let mut attempts = 0usize;
+    let mut timeouts = 0usize;
+    let mut network_bytes = 0u64;
     let merged_end = c.merged_start + c.len - 1;
     if let Some(cache) = &cache
         && cache.has_range(c.merged_start, merged_end)
@@ -517,7 +853,16 @@ async fn fetch_chunk(
         match hit {
             Ok(Ok(bytes)) => {
                 let _ = tx.send(Ok(bytes)).await;
-                return;
+                return FetchStats {
+                    index,
+                    volume: c.vol,
+                    bytes: c.len,
+                    elapsed: started.elapsed(),
+                    attempts,
+                    timeouts,
+                    cache_hit: true,
+                    success: true,
+                };
             }
             Ok(Err(e)) => tracing::warn!("读取密文缓存失败，回源: {e}"),
             Err(e) => tracing::warn!("缓存读取任务异常，回源: {e}"),
@@ -531,28 +876,70 @@ async fn fetch_chunk(
     let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
     if encrypted && cipher.try_seek(c.merged_start).is_err() {
         let _ = tx.send(Err(io::Error::other("keystream 偏移越界"))).await;
-        return;
+        return FetchStats {
+            index,
+            volume: c.vol,
+            bytes: 0,
+            elapsed: started.elapsed(),
+            attempts,
+            timeouts,
+            cache_hit: false,
+            success: false,
+        };
     }
     let mut remaining = c.len;
-    let mut attempts = 0usize;
     let mut last_error = String::new();
-    let mut cache_batch = BytesMut::with_capacity(CACHE_WRITE_BATCH);
+    let mut cache_batch = if cache_writeback.is_some() {
+        BytesMut::with_capacity(CACHE_WRITE_BATCH)
+    } else {
+        BytesMut::new()
+    };
+    let mut output_batch = BytesMut::with_capacity(OUTPUT_BATCH);
     let mut cache_batch_start = c.merged_start;
     while remaining > 0 && attempts < 4 {
         attempts += 1;
         let done = c.len - remaining;
         let range_start = c.vol_off + done;
         let range_end = c.vol_off + c.len - 1;
-        let mut stream = match storage.get_range(&obj_path, range_start, range_end).await {
-            Ok(stream) => stream,
-            Err(e) => {
+        let mut stream = match tokio::time::timeout(
+            mode.first_byte_timeout(),
+            storage.get_range(&obj_path, range_start, range_end),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
                 last_error = e.to_string();
                 tokio::task::yield_now().await;
                 continue;
             }
+            Err(_) => {
+                timeouts += 1;
+                last_error = format!("建立 Range 请求超时: {range_start}-{range_end}");
+                continue;
+            }
         };
         let before = remaining;
-        while let Some(item) = stream.next().await {
+        let mut first_body = true;
+        loop {
+            let wait = if first_body {
+                mode.first_byte_timeout()
+            } else {
+                mode.idle_timeout()
+            };
+            let item = match tokio::time::timeout(wait, stream.next()).await {
+                Ok(Some(item)) => item,
+                Ok(None) => break,
+                Err(_) => {
+                    timeouts += 1;
+                    last_error = format!(
+                        "Range 数据{}超时: {range_start}-{range_end}",
+                        if first_body { "首字节" } else { "空闲" }
+                    );
+                    break;
+                }
+            };
+            first_body = false;
             let item = match item {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -568,40 +955,84 @@ async fn fetch_chunk(
             if let Some(progress) = &network_progress {
                 progress(take as u64);
             }
+            network_bytes += take as u64;
             let cache_offset = c.merged_start + (c.len - remaining);
-            if cache.is_some() {
+            if cache_writeback.is_some() {
                 if cache_batch.is_empty() {
                     cache_batch_start = cache_offset;
                 }
                 cache_batch.extend_from_slice(&item[..take]);
                 if cache_batch.len() >= CACHE_WRITE_BATCH {
                     flush_cache_batch(
-                        cache.as_ref().expect("cache checked above"),
+                        cache_writeback.as_ref().expect("writeback checked above"),
                         cache_batch_start,
                         &mut cache_batch,
                     )
                     .await;
                 }
             }
-            let mut buf = item[..take].to_vec();
+            let output_start = output_batch.len();
+            output_batch.extend_from_slice(&item[..take]);
             if encrypted {
-                cipher.apply_keystream(&mut buf);
+                cipher.apply_keystream(&mut output_batch[output_start..]);
             }
             remaining -= take as u64;
-            if tx.send(Ok(Bytes::from(buf))).await.is_err() {
-                return; // serializer 已放弃
+            if !flush_output_batch(&tx, &mut output_batch, false).await {
+                return FetchStats {
+                    index,
+                    volume: c.vol,
+                    bytes: network_bytes,
+                    elapsed: started.elapsed(),
+                    attempts,
+                    timeouts,
+                    cache_hit: false,
+                    success: false,
+                }; // serializer 已放弃
             }
             if remaining == 0 {
-                if let Some(cache) = &cache {
-                    flush_cache_batch(cache, cache_batch_start, &mut cache_batch).await;
+                if !flush_output_batch(&tx, &mut output_batch, true).await {
+                    return FetchStats {
+                        index,
+                        volume: c.vol,
+                        bytes: network_bytes,
+                        elapsed: started.elapsed(),
+                        attempts,
+                        timeouts,
+                        cache_hit: false,
+                        success: false,
+                    };
                 }
-                return;
+                if let Some(writeback) = &cache_writeback {
+                    flush_cache_batch(writeback, cache_batch_start, &mut cache_batch).await;
+                }
+                return FetchStats {
+                    index,
+                    volume: c.vol,
+                    bytes: network_bytes,
+                    elapsed: started.elapsed(),
+                    attempts,
+                    timeouts,
+                    cache_hit: false,
+                    success: true,
+                };
             }
+        }
+        if !flush_output_batch(&tx, &mut output_batch, true).await {
+            return FetchStats {
+                index,
+                volume: c.vol,
+                bytes: network_bytes,
+                elapsed: started.elapsed(),
+                attempts,
+                timeouts,
+                cache_hit: false,
+                success: false,
+            };
         }
         // Preserve bytes received before a retry. This also keeps the staging
         // buffer bounded when an upstream stream fails mid-range.
-        if let Some(cache) = &cache {
-            flush_cache_batch(cache, cache_batch_start, &mut cache_batch).await;
+        if let Some(writeback) = &cache_writeback {
+            flush_cache_batch(writeback, cache_batch_start, &mut cache_batch).await;
         }
         if remaining == before && last_error.is_empty() {
             last_error = format!("上游未返回 range {range_start}-{range_end}");
@@ -617,23 +1048,38 @@ async fn fetch_chunk(
             "上游重试 {attempts} 次后仍少 {remaining} 字节: {last_error}"
         ))))
         .await;
+    FetchStats {
+        index,
+        volume: c.vol,
+        bytes: network_bytes,
+        elapsed: started.elapsed(),
+        attempts,
+        timeouts,
+        cache_hit: false,
+        success: false,
+    }
 }
 
-async fn flush_cache_batch(
-    cache: &Arc<crate::cache::CacheEntry>,
-    start: u64,
+async fn flush_output_batch(
+    tx: &mpsc::Sender<io::Result<Bytes>>,
     batch: &mut BytesMut,
-) {
+    flush_partial: bool,
+) -> bool {
+    while batch.len() >= OUTPUT_BATCH || (flush_partial && !batch.is_empty()) {
+        let take = batch.len().min(OUTPUT_BATCH);
+        if tx.send(Ok(batch.split_to(take).freeze())).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+async fn flush_cache_batch(writeback: &CacheWriteback, start: u64, batch: &mut BytesMut) {
     if batch.is_empty() {
         return;
     }
     let data = batch.split().freeze();
-    let cache = Arc::clone(cache);
-    match tokio::task::spawn_blocking(move || cache.write_range(start, &data)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!("写入密文缓存失败（不影响本次下载）: {e}"),
-        Err(e) => tracing::warn!("密文缓存写入任务异常（不影响本次下载）: {e}"),
-    }
+    writeback.enqueue(start, data).await;
 }
 
 // ---------------- 上传：流式加密 + 分卷切写 ----------------
@@ -1018,6 +1464,8 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct HangingRangeStorage;
+
     #[async_trait::async_trait]
     impl Storage for SlowEndlessStorage {
         async fn list(&self, _: &str) -> ApiResult<Vec<Entry>> {
@@ -1042,6 +1490,31 @@ mod tests {
                 Some((Ok(Bytes::from(vec![0u8; 4096])), ()))
             })
             .boxed())
+        }
+        async fn put(&self, _: &str, _: ByteStream) -> ApiResult<()> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for HangingRangeStorage {
+        async fn list(&self, _: &str) -> ApiResult<Vec<Entry>> {
+            unreachable!()
+        }
+        async fn mkdir(&self, _: &str) -> ApiResult<()> {
+            unreachable!()
+        }
+        async fn delete(&self, _: &str) -> ApiResult<()> {
+            unreachable!()
+        }
+        async fn rename(&self, _: &str, _: &str) -> ApiResult<()> {
+            unreachable!()
+        }
+        async fn get(&self, _: &str) -> ApiResult<(Option<u64>, ByteStream)> {
+            unreachable!()
+        }
+        async fn get_range(&self, _: &str, _: u64, _: u64) -> ApiResult<ByteStream> {
+            Ok(stream::pending().boxed())
         }
         async fn put(&self, _: &str, _: ByteStream) -> ApiResult<()> {
             unreachable!()
@@ -1081,6 +1554,7 @@ mod tests {
                 max_split: 256 * 1024,
                 max_threads: 4,
                 max_per_volume: 2,
+                mode: StreamMode::Playback,
             },
             None,
             None,
@@ -1109,6 +1583,91 @@ mod tests {
         assert_eq!(min_start, seek - vol_size);
     }
 
+    #[tokio::test]
+    async fn bulk_mode_fills_global_budget_across_volumes() {
+        let volume_size = 4 * 1024 * 1024usize;
+        let mut volumes = std::collections::HashMap::new();
+        for index in 0..4 {
+            volumes.insert(
+                format!("vol{index:02}.bin"),
+                Bytes::from(vec![index as u8; volume_size]),
+            );
+        }
+        let storage = Arc::new(RecordingRangeStorage {
+            volumes,
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let rx = stream_range_cached_mode(
+            Arc::clone(&storage) as Arc<dyn Storage>,
+            String::new(),
+            [0u8; crate::crypto::SECRET_LEN],
+            false,
+            Arc::new(layout(&[volume_size as u64; 4])),
+            0,
+            volume_size as u64 * 4 - 1,
+            true,
+            &StreamParams {
+                max_split: 1024 * 1024,
+                max_threads: 4,
+                max_per_volume: 1,
+                mode: StreamMode::BulkDownload,
+            },
+            None,
+            None,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let requested_volumes = storage
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, ..)| path.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            requested_volumes.len(),
+            4,
+            "bulk 模式应跳过单卷满额状态并从后续分卷补满总并发"
+        );
+        drop(rx);
+    }
+
+    #[test]
+    fn adaptive_concurrency_probes_then_backs_off() {
+        let mut adaptive = AdaptiveConcurrency::new(8);
+        let stats = |elapsed_secs: u64, timeouts: usize| FetchStats {
+            index: 0,
+            volume: 0,
+            bytes: 1_000_000,
+            elapsed: std::time::Duration::from_secs(elapsed_secs),
+            attempts: 1,
+            timeouts,
+            cache_hit: false,
+            success: timeouts == 0,
+        };
+        assert!(adaptive.observe_delivery_rate(10_000_000.0, true).is_none());
+        assert_eq!(
+            adaptive.observe_delivery_rate(10_200_000.0, true),
+            Some((4, 5, "throughput_probe"))
+        );
+        assert_eq!(
+            adaptive.observe_delivery_rate(10_100_000.0, true),
+            Some((5, 4, "throughput_probe_no_gain"))
+        );
+        assert_eq!(
+            adaptive.observe_failure(&stats(1, 1)),
+            Some((4, 2, "timeout_or_failure"))
+        );
+
+        let mut capped = AdaptiveConcurrency::new(4);
+        for rate in [10_000_000.0, 4_000_000.0, 12_000_000.0] {
+            assert!(
+                capped.observe_delivery_rate(rate, true).is_none(),
+                "硬上限处的普通吞吐波动不应触发降档"
+            );
+        }
+        assert_eq!(capped.current, 4);
+    }
+
     /// 客户端断开（播放器 seek 会立即弃掉旧请求）后，所有 in-flight
     /// fetcher 被 abort，不再向上游发起新的区间请求 —— 与 hydraria 的
     /// bandwidth claw-back 行为一致，保证 seek 不与遗留流量抢带宽。
@@ -1131,6 +1690,7 @@ mod tests {
                 max_split: 1024 * 1024,
                 max_threads: 4,
                 max_per_volume: 2,
+                mode: StreamMode::Playback,
             },
             None,
             None,
@@ -1151,6 +1711,36 @@ mod tests {
             after_drop,
             "断开后不应再发起新的区间请求"
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_range_body_times_out_and_reports_diagnostics() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let task = tokio::spawn(fetch_chunk(
+            7,
+            StreamMode::Playback,
+            Arc::new(HangingRangeStorage),
+            "volume".into(),
+            [0u8; crate::crypto::SECRET_LEN],
+            false,
+            PlannedChunk {
+                merged_start: 0,
+                len: 1024,
+                vol: 0,
+                vol_off: 0,
+            },
+            tx,
+            None,
+            None,
+            None,
+        ));
+        let error = rx.recv().await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("超时"), "{error}");
+        let stats = task.await.unwrap();
+        assert_eq!(stats.index, 7);
+        assert_eq!(stats.attempts, 4);
+        assert_eq!(stats.timeouts, 4);
+        assert!(!stats.success);
     }
 
     #[test]
@@ -1377,6 +1967,7 @@ mod tests {
             max_split: 100_000,
             max_threads: 8,
             max_per_volume: 2,
+            mode: StreamMode::BulkDownload,
         };
         let cache_store = crate::cache::CacheStore::new(dir.path().join(".cache")).unwrap();
         let cache = cache_store.open("roundtrip", total).unwrap();
@@ -1512,6 +2103,8 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel(16);
         fetch_chunk(
+            0,
+            StreamMode::BulkDownload,
             storage.clone(),
             "v".into(),
             pw,
@@ -1523,6 +2116,7 @@ mod tests {
                 vol_off: 0,
             },
             tx,
+            None,
             None,
             None,
         )

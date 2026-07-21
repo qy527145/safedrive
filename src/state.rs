@@ -19,8 +19,12 @@ pub struct HttpClientOptions {
 }
 
 fn build_http_client(options: &HttpClientOptions) -> anyhow::Result<reqwest::Client> {
-    let mut builder =
-        reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(64)
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .tcp_nodelay(true);
     if let Some(proxy) = options.proxy.as_deref() {
         builder = builder.proxy(reqwest::Proxy::all(proxy)?);
     }
