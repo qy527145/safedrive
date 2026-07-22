@@ -7,12 +7,16 @@
 ## 快速开始
 
 ```bash
-# 构建（需要 Rust 工具链 + Bun）
+# 安装（仅需 Rust 工具链，前端产物已随仓库预构建，无需 bun/npm）
+cargo install safedrive                                      # crates.io 稳定版
+cargo install --git https://github.com/qy527145/safedrive   # 最新开发版
+
+# 或从源码构建（需要 Rust 工具链 + Bun）
 bun install
 bun run build   # turbo：web 构建 → cargo release，内容哈希缓存，无变更时秒级完成
 
 # 运行
-./target/release/safedrive --bind 0.0.0.0:5266 --admin-password <管理密码>
+safedrive --bind 0.0.0.0:5266 --admin-password <管理密码>
 ```
 
 打开 `http://<host>:5266`：
@@ -118,5 +122,7 @@ cd web && bun run test     # 前端单测
 cd web && bun run test:e2e # 集成 E2E（真实二进制 + 真实 WebDAV 服务，前置 bun run build）
 cd web && bun run test:ui  # 浏览器 E2E
 ```
+
+> 前端产物 `web/dist` 已随仓库提交（供 `cargo install` 直接嵌入，用户无需 bun）。改动 `web/` 后请执行 `bun run --cwd web build` 并将 `web/dist` 一并提交。
 
 设计细节见 [docs/DESIGN.md](docs/DESIGN.md)。

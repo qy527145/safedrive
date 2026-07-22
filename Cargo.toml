@@ -5,7 +5,8 @@ edition = "2024"
 description = "端到端零知识加密的数据源管理 Web 客户端（单二进制，前端嵌入）"
 license = "MIT"
 repository = "https://github.com/qy527145/safedrive"
-# 前端产物随包发布，cargo install 不依赖 bun/npm；发布前需先执行 bun run --cwd web build
+# 前端产物 web/dist 随仓库提交并随包发布，cargo install（crates.io / --git）均不依赖 bun/npm；
+# 改动 web/ 后需执行 bun run --cwd web build 并将 dist 一并提交
 include = ["/src/**", "/build.rs", "/web/dist/**", "/README.md", "/LICENSE"]
 
 [dependencies]

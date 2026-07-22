@@ -23,7 +23,9 @@ target
 # Node / Bun / Turbo（前端与任务编排）
 node_modules/
 .turbo/
-web/dist/
+# 注意：web/dist 不忽略——它是 rust-embed 嵌入二进制的前端构建产物，随仓库提交，
+# 保证 cargo install --git 与 cargo publish（include 基于文件存在）都无需 bun/npm。
+# 改动 web/ 后请执行 bun run --cwd web build 并将 dist 一并提交。
 web/test-results/
 web/playwright-report/
 *.tsbuildinfo
