@@ -626,6 +626,194 @@ impl BaiduPanFs {
         }
     }
 
+    /// 发送 OAuth 令牌请求并解析响应体。OAuth 错误（authorization_pending /
+    /// slow_down / expired_token / invalid_grant 等）常以 HTTP 400 返回、body 仍是
+    /// JSON，故这里不走 response_json 的状态码硬校验，让调用方按 `error` 字段判断。
+    async fn oauth_token_json(&self, url: Url, what: &str) -> ApiResult<Value> {
+        tracing::debug!("百度{what}请求: GET {}", log_url(&url));
+        let resp = self
+            .web_request(Method::GET, url)
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(format!("百度{what}失败: {}", mask_err(&e))))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| ApiError::Upstream(format!("读取百度{what}响应失败: {e}")))?;
+        tracing::debug!("百度{what}响应: HTTP {status} body: {}", mask_oauth_body(&text));
+        serde_json::from_str(&text).map_err(|e| {
+            ApiError::Upstream(format!(
+                "解析百度{what}响应失败 (HTTP {status}): {e}; {}",
+                truncate_chars(&text, LOG_BODY_MAX)
+            ))
+        })
+    }
+
+    /// 用 refresh_token 换取新令牌。返回原始响应（可能含 `error`，交由调用方决定
+    /// 是否回退设备码授权）。
+    async fn refresh_token_grant(&self, refresh_token: &str) -> ApiResult<Value> {
+        let mut url = self.oauth_token_api.clone();
+        url.query_pairs_mut()
+            .append_pair("grant_type", "refresh_token")
+            .append_pair("refresh_token", refresh_token)
+            .append_pair("client_id", &self.client_id)
+            .append_pair("client_secret", &self.client_secret);
+        self.oauth_token_json(url, "刷新开放平台令牌").await
+    }
+
+    /// 用 BDUSS 走「device/code → 静默授权 → 轮询 device_token」一次性换取一对新
+    /// 令牌（access_token + refresh_token），拿到即可直接用。返回授权响应。
+    async fn device_code_grant(&self) -> ApiResult<Value> {
+        let mut code_url = self.oauth_device_code_api.clone();
+        code_url
+            .query_pairs_mut()
+            .append_pair("response_type", "device_code")
+            .append_pair("client_id", &self.client_id)
+            .append_pair("client_secret", &self.client_secret)
+            .append_pair("scope", "basic,netdisk");
+        tracing::debug!("百度获取设备码请求: GET {}", log_url(&code_url));
+        let code_resp = self
+            .http
+            .get(code_url)
+            .header(USER_AGENT, "pan.baidu.com")
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(format!("获取百度设备码失败: {}", mask_err(&e))))?;
+        let code_info = Self::response_json(code_resp, "获取设备码").await?;
+        tracing::debug!("百度获取设备码响应: {}", mask_oauth_value(&code_info));
+        let device_code = code_info
+            .get("device_code")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ApiError::Upstream(format!("设备码响应无 device_code: {code_info}")))?;
+        let user_code = code_info
+            .get("user_code")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ApiError::Upstream(format!("设备码响应无 user_code: {code_info}")))?;
+
+        let mut approve_url = self.oauth_device_approve_api.clone();
+        approve_url
+            .query_pairs_mut()
+            .append_pair("code", user_code)
+            .append_pair("display", "page")
+            .append_pair("redirect_uri", "")
+            .append_pair("force_login", "");
+        // GET 授权页：BDUSS 已登录时百度可能返回「确认授权」表单（首次，含 bdstoken）
+        // 或「您已成功…授权」成功页（已授权过该应用，无 bdstoken）。两种形态在下面
+        // 分别处理，最终都以 device_token 轮询为授权是否成功的判据。
+        tracing::debug!(
+            "百度 BDUSS 授权设备码请求(GET 授权页): {} (Cookie: BDUSS=…)",
+            log_url(&approve_url),
+        );
+        let approve = self
+            .http
+            .get(approve_url.clone())
+            .header(USER_AGENT, HeaderValue::from_static("pan.baidu.com"))
+            .header(COOKIE, self.download_cookie.clone())
+            .send()
+            .await
+            .map_err(|e| {
+                ApiError::Upstream(format!("使用 BDUSS 授权设备码失败: {}", mask_err(&e)))
+            })?;
+        let approve_status = approve.status();
+        let approve_body = approve.text().await.unwrap_or_default();
+        if !approve_status.is_success() {
+            tracing::error!(
+                "百度 BDUSS 授权页返回非 2xx: HTTP {approve_status} body: {}",
+                log_body(&approve_body),
+            );
+            return Err(ApiError::Upstream(format!(
+                "使用 BDUSS 授权设备码失败: HTTP {approve_status}"
+            )));
+        }
+        // 授权页有两种形态：
+        //   1) 首次授权：返回含 bdstoken 的确认表单，仅 GET 不会完成授权，必须再
+        //      POST 提交表单（等价于浏览器点「允许」），否则轮询停在 pending。
+        //   2) 已授权过该应用：GET 直接返回「您已成功…授权」成功页，无 bdstoken，
+        //      此时无需 POST，直接轮询即可拿到令牌。
+        // 因此 bdstoken 缺失不是错误——是否真正授权，以后续 device_token 轮询为准。
+        if let Some(bdstoken) = extract_input_value(&approve_body, "bdstoken") {
+            let granted = extract_granted_scopes(&approve_body);
+            tracing::debug!(
+                "百度 BDUSS 授权设备码：检测到确认表单，提交(POST) scopes={granted} bdstoken={}",
+                mask_secret(&bdstoken),
+            );
+            let confirm = self
+                .http
+                .post(approve_url)
+                .header(USER_AGENT, HeaderValue::from_static("pan.baidu.com"))
+                .header(COOKIE, self.download_cookie.clone())
+                .form(&[
+                    ("grant_permissions_arr", granted.as_str()),
+                    ("grant_permissions", granted.as_str()),
+                    ("bdstoken", bdstoken.as_str()),
+                    ("client_id", ""),
+                    ("response_type", ""),
+                    ("display", "page"),
+                    ("code", user_code),
+                ])
+                .send()
+                .await
+                .map_err(|e| {
+                    ApiError::Upstream(format!("提交 BDUSS 设备码授权失败: {}", mask_err(&e)))
+                })?;
+            let confirm_status = confirm.status();
+            let confirm_body = confirm.text().await.unwrap_or_default();
+            // 授权成功页含「已成功…授权」字样；据此确认，失败则打印页面便于排查。
+            let confirmed = confirm_body.contains("成功") && confirm_body.contains("授权");
+            tracing::debug!(
+                "百度 BDUSS 授权设备码确认响应: HTTP {confirm_status} confirmed={confirmed} body: {}",
+                log_body(&confirm_body),
+            );
+            if !confirm_status.is_success() {
+                return Err(ApiError::Upstream(format!(
+                    "提交 BDUSS 设备码授权失败: HTTP {confirm_status}"
+                )));
+            }
+        } else {
+            // 无确认表单：已授权过（成功页）或页面异常。均直接轮询，让 token 定夺。
+            let already_authorized = approve_body.contains("成功") && approve_body.contains("授权");
+            tracing::debug!(
+                "百度 BDUSS 授权设备码：未见确认表单(already_authorized={already_authorized})，直接轮询 device_token",
+            );
+        }
+
+        let interval = code_info
+            .get("interval")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .clamp(1, 5);
+        let mut token_url = self.oauth_token_api.clone();
+        token_url
+            .query_pairs_mut()
+            .append_pair("grant_type", "device_token")
+            .append_pair("code", device_code)
+            .append_pair("client_id", &self.client_id)
+            .append_pair("client_secret", &self.client_secret);
+        for attempt in 0..6 {
+            let candidate = self
+                .oauth_token_json(token_url.clone(), "设备码换取令牌")
+                .await?;
+            let pending = candidate
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| matches!(error, "authorization_pending" | "slow_down"));
+            if !pending {
+                return Ok(candidate);
+            }
+            tracing::debug!(
+                "百度设备码尚未授权，{interval}s 后重试(第 {}/6 次)",
+                attempt + 1,
+            );
+            if attempt < 5 {
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+            }
+        }
+        Err(ApiError::Upstream("BDUSS 设备授权超时，请确认 BDUSS 有效".into()))
+    }
+
     async fn refresh_access_token(&self, invalid_token: Option<&str>) -> ApiResult<String> {
         let mut tokens = self.tokens.lock().await;
         if let Some(invalid) = invalid_token
@@ -635,113 +823,24 @@ impl BaiduPanFs {
             return Ok(tokens.access_token.clone());
         }
         let now = unix_time_secs();
-        let value = if tokens.refresh_token.is_empty() {
-            let mut code_url = self.oauth_device_code_api.clone();
-            code_url
-                .query_pairs_mut()
-                .append_pair("response_type", "device_code")
-                .append_pair("openapi", "xpansdk")
-                .append_pair("client_id", &self.client_id)
-                .append_pair("client_secret", &self.client_secret)
-                .append_pair("scope", "basic,netdisk");
-            let code_resp = self
-                .http
-                .get(code_url)
-                .header(USER_AGENT, "pan.baidu.com")
-                .send()
-                .await
-                .map_err(|e| ApiError::Upstream(format!("获取百度设备码失败: {}", mask_err(&e))))?;
-            let code_info = Self::response_json(code_resp, "获取设备码").await?;
-            let device_code = code_info
-                .get("device_code")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    ApiError::Upstream(format!("设备码响应无 device_code: {code_info}"))
-                })?;
-            let user_code = code_info
-                .get("user_code")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    ApiError::Upstream(format!("设备码响应无 user_code: {code_info}"))
-                })?;
-
-            let mut approve_url = self.oauth_device_approve_api.clone();
-            approve_url
-                .query_pairs_mut()
-                .append_pair("code", user_code)
-                .append_pair("display", "page")
-                .append_pair("redirect_uri", "")
-                .append_pair("force_login", "");
-            let approve = self
-                .web_request(Method::GET, approve_url)
-                .header(COOKIE, self.download_cookie.clone())
-                .send()
-                .await
-                .map_err(|e| {
-                    ApiError::Upstream(format!("使用 BDUSS 授权设备码失败: {}", mask_err(&e)))
-                })?;
-            if !approve.status().is_success() {
-                return Err(ApiError::Upstream(format!(
-                    "使用 BDUSS 授权设备码失败: HTTP {}",
-                    approve.status()
-                )));
-            }
-
-            let interval = code_info
-                .get("interval")
-                .and_then(Value::as_u64)
-                .unwrap_or(1)
-                .clamp(1, 5);
-            let mut token_info = None;
-            for attempt in 0..6 {
-                let mut token_url = self.oauth_token_api.clone();
-                token_url
-                    .query_pairs_mut()
-                    .append_pair("grant_type", "device_token")
-                    .append_pair("openapi", "xpansdk")
-                    .append_pair("code", device_code)
-                    .append_pair("client_id", &self.client_id)
-                    .append_pair("client_secret", &self.client_secret);
-                let token_resp = self
-                    .web_request(Method::GET, token_url)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        ApiError::Upstream(format!("设备码换取令牌失败: {}", mask_err(&e)))
-                    })?;
-                let candidate = Self::response_json(token_resp, "设备码换取令牌").await?;
-                let pending = candidate
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .is_some_and(|error| matches!(error, "authorization_pending" | "slow_down"));
-                if !pending {
-                    token_info = Some(candidate);
-                    break;
-                }
-                if attempt < 5 {
-                    tokio::time::sleep(Duration::from_secs(interval)).await;
-                }
-            }
-            token_info
-                .ok_or_else(|| ApiError::Upstream("BDUSS 设备授权超时，请确认 BDUSS 有效".into()))?
+        // access_token 没有/过期 → 用 refresh_token 刷新；refresh_token 没有，或刷新
+        // 被拒（过期/失效，响应带 error）→ 用 BDUSS 走设备码一次性换一对新令牌，
+        // 拿到即可直接用，无需再刷一次。
+        let (value, grant_type) = if tokens.refresh_token.is_empty() {
+            tracing::debug!("百度开放平台令牌：无 refresh_token，走 BDUSS 设备码首次授权");
+            (self.device_code_grant().await?, "device_token")
         } else {
-            let mut url = self.oauth_token_api.clone();
-            url.query_pairs_mut()
-                .append_pair("grant_type", "refresh_token")
-                .append_pair("openapi", "xpansdk")
-                .append_pair("refresh_token", &tokens.refresh_token)
-                .append_pair("client_id", &self.client_id)
-                .append_pair("client_secret", &self.client_secret);
-            let resp = self
-                .web_request(Method::GET, url)
-                .send()
-                .await
-                .map_err(|e| {
-                    ApiError::Upstream(format!("刷新百度开放平台令牌失败: {}", mask_err(&e)))
-                })?;
-            Self::response_json(resp, "刷新开放平台令牌").await?
+            tracing::debug!("百度开放平台令牌：用 refresh_token 刷新");
+            let refreshed = self.refresh_token_grant(&tokens.refresh_token).await?;
+            if let Some(error) = refreshed.get("error").and_then(Value::as_str) {
+                tracing::warn!(
+                    "百度 refresh_token 刷新被拒({error})，回退 BDUSS 设备码授权: {}",
+                    truncate_chars(&refreshed.to_string(), LOG_BODY_MAX),
+                );
+                (self.device_code_grant().await?, "device_token")
+            } else {
+                (refreshed, "refresh_token")
+            }
         };
         if let Some(error) = value.get("error").and_then(Value::as_str) {
             let description = value
@@ -750,12 +849,7 @@ impl BaiduPanFs {
                 .unwrap_or("");
             // 失败响应只含 error/error_description，无凭据，可整体落日志
             tracing::error!(
-                "百度 OAuth 令牌请求被拒: grant_type={} 原始响应: {}",
-                if tokens.refresh_token.is_empty() {
-                    "device_token"
-                } else {
-                    "refresh_token"
-                },
+                "百度 OAuth 令牌请求被拒: grant_type={grant_type} 原始响应: {}",
                 truncate_chars(&value.to_string(), LOG_BODY_MAX),
             );
             return Err(ApiError::Upstream(format!(
@@ -2112,6 +2206,76 @@ fn log_body(text: &str) -> String {
     }
 }
 
+/// OAuth 令牌响应体脱敏：把 JSON 里的 access_token / refresh_token 值遮掉再打印。
+/// 解析失败（非 JSON）则原样截断。
+fn mask_oauth_body(text: &str) -> String {
+    match serde_json::from_str::<Value>(text) {
+        Ok(value) => mask_oauth_value(&value),
+        Err(_) => log_body(text),
+    }
+}
+
+/// 从设备码授权页 HTML 中提取某个 hidden input 的 value（如 bdstoken）。
+/// 授权页是服务端渲染的静态表单，字符串扫描足够稳。
+fn extract_input_value(html: &str, name: &str) -> Option<String> {
+    let needle = format!("name=\"{name}\"");
+    let mut search = html;
+    while let Some(pos) = search.find(&needle) {
+        // 以该 input 标签为中心，截出 <input ...> 片段找 value=""。
+        let tag_start = search[..pos].rfind('<').unwrap_or(0);
+        let tag_end = search[pos..].find('>').map_or(search.len(), |end| pos + end);
+        let tag = &search[tag_start..tag_end];
+        if let Some(value_pos) = tag.find("value=\"") {
+            let rest = &tag[value_pos + "value=\"".len()..];
+            if let Some(quote) = rest.find('"') {
+                return Some(rest[..quote].to_owned());
+            }
+        }
+        search = &search[tag_end..];
+    }
+    None
+}
+
+/// 提取授权页勾选的 scope（name="grant_permissions_arr" 的 checkbox value），
+/// 返回逗号分隔串（对齐页面 JS 的 getGrantPermissions）；缺省 basic,netdisk。
+fn extract_granted_scopes(html: &str) -> String {
+    let mut scopes: Vec<String> = Vec::new();
+    let mut search = html;
+    while let Some(pos) = search.find("name=\"grant_permissions_arr\"") {
+        let tag_start = search[..pos].rfind('<').unwrap_or(0);
+        let tag_end = search[pos..].find('>').map_or(search.len(), |end| pos + end);
+        let tag = &search[tag_start..tag_end];
+        if let Some(value_pos) = tag.find("value=\"") {
+            let rest = &tag[value_pos + "value=\"".len()..];
+            if let Some(quote) = rest.find('"') {
+                let scope = rest[..quote].to_owned();
+                if !scope.is_empty() && !scopes.contains(&scope) {
+                    scopes.push(scope);
+                }
+            }
+        }
+        search = &search[tag_end..];
+    }
+    if scopes.is_empty() {
+        "basic,netdisk".to_owned()
+    } else {
+        scopes.join(",")
+    }
+}
+
+/// 令牌类 JSON 值脱敏后转字符串（保留 error / expires_in 等排查字段原样）。
+fn mask_oauth_value(value: &Value) -> String {
+    let mut cloned = value.clone();
+    if let Some(object) = cloned.as_object_mut() {
+        for key in ["access_token", "refresh_token"] {
+            if let Some(Value::String(token)) = object.get_mut(key) {
+                *token = mask_secret(token);
+            }
+        }
+    }
+    truncate_chars(&cloned.to_string(), LOG_BODY_MAX)
+}
+
 /// 凭据脱敏：保留首 8 位 + 尾 6 位（可辨认是哪个 token 而不暴露全值）；
 /// 过短的值全遮。
 fn mask_secret(value: &str) -> String {
@@ -2469,7 +2633,9 @@ mod tests {
         Query(query): Query<HashMap<String, String>>,
     ) -> impl IntoResponse {
         assert_open_headers(&headers);
-        assert_eq!(query.get("openapi").map(String::as_str), Some("xpansdk"));
+        // OAuth 端点（openapi.baidu.com）不得带 xpansdk 标识——那是 xpan 业务接口
+        // 专用；带上会破坏 BDUSS 静默授权，令设备码停在 authorization_pending。
+        assert_eq!(query.get("openapi"), None);
         assert_eq!(
             query.get("client_id").map(String::as_str),
             Some(DEFAULT_CLIENT_ID)
@@ -2504,7 +2670,7 @@ mod tests {
     ) -> impl IntoResponse {
         assert!(headers.get(COOKIE).is_none());
         assert_eq!(headers.get(USER_AGENT).unwrap(), "pan.baidu.com");
-        assert_eq!(query.get("openapi").map(String::as_str), Some("xpansdk"));
+        assert_eq!(query.get("openapi"), None);
         assert_eq!(
             query.get("client_id").map(String::as_str),
             Some(DEFAULT_CLIENT_ID)
@@ -2522,8 +2688,67 @@ mod tests {
         Query(query): Query<HashMap<String, String>>,
     ) -> impl IntoResponse {
         assert_eq!(headers.get(COOKIE).unwrap(), "BDUSS=test");
+        assert_eq!(headers.get(USER_AGENT).unwrap(), "pan.baidu.com");
         assert_eq!(query.get("code").map(String::as_str), Some("user-code"));
-        StatusCode::OK
+        // GET 返回「确认授权」表单（含 bdstoken 与勾选 scope），对齐百度真实页面。
+        Response::builder()
+            .header(CONTENT_TYPE, "text/html; charset=UTF-8")
+            .body(Body::from(
+                r#"<!DOCTYPE html><html><body>
+<form name="scopes" method="post">
+<input type="checkbox" checked="checked" name="grant_permissions_arr" value="basic" />
+<input type="checkbox" checked="checked" name="grant_permissions_arr" value="netdisk" />
+<input type="hidden" name="bdstoken" value="device-bdstoken" />
+<input type="hidden" name="code" value="user-code" />
+</form></body></html>"#,
+            ))
+            .unwrap()
+    }
+
+    async fn oauth_device_confirm(
+        headers: HeaderMap,
+        Query(query): Query<HashMap<String, String>>,
+        AxumForm(form): AxumForm<HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        assert_eq!(headers.get(COOKIE).unwrap(), "BDUSS=test");
+        assert_eq!(query.get("code").map(String::as_str), Some("user-code"));
+        // 提交的确认表单必须带从授权页提取的 bdstoken 与勾选的 scope。
+        assert_eq!(
+            form.get("bdstoken").map(String::as_str),
+            Some("device-bdstoken")
+        );
+        assert_eq!(
+            form.get("grant_permissions").map(String::as_str),
+            Some("basic,netdisk")
+        );
+        assert_eq!(form.get("code").map(String::as_str), Some("user-code"));
+        Response::builder()
+            .header(CONTENT_TYPE, "text/html; charset=UTF-8")
+            .body(Body::from(
+                "<html><body><div class=\"device-result\">您已成功为测试授权！</div></body></html>",
+            ))
+            .unwrap()
+    }
+
+    /// 已授权过该应用的账号：GET 授权页直接返回成功页，不含 bdstoken 确认表单。
+    async fn oauth_device_approve_already_authorized(
+        headers: HeaderMap,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        assert_eq!(headers.get(COOKIE).unwrap(), "BDUSS=test");
+        assert_eq!(headers.get(USER_AGENT).unwrap(), "pan.baidu.com");
+        assert_eq!(query.get("code").map(String::as_str), Some("user-code"));
+        Response::builder()
+            .header(CONTENT_TYPE, "text/html; charset=UTF-8")
+            .body(Body::from(
+                "<html><body><p>您已成功为 \"测试\" 授权!请返回设备继续操作！</p></body></html>",
+            ))
+            .unwrap()
+    }
+
+    /// 已授权账号不应再发起 POST 确认——命中即测试失败。
+    async fn oauth_device_confirm_must_not_be_called() -> Response<Body> {
+        panic!("已授权账号（GET 返回成功页）不应发起 POST 确认");
     }
 
     async fn login_status(
@@ -2849,7 +3074,7 @@ mod tests {
         let app = Router::new()
             .route("/oauth/token", get(oauth_token))
             .route("/oauth/device/code", get(oauth_device_code))
-            .route("/device", get(oauth_device_approve))
+            .route("/device", get(oauth_device_approve).post(oauth_device_confirm))
             .route("/api/loginStatus", get(login_status))
             .route("/share/pset", post(share_pset))
             .route("/share/verify", post(share_verify))
@@ -2986,6 +3211,37 @@ mod tests {
             timeout_metrics.snapshot().1,
             1,
             "引擎报告的响应体超时必须反向降权实际获胜候选"
+        );
+    }
+
+    /// 已授权过该应用时：GET 授权页返回成功页（无 bdstoken），此时不应 POST 确认，
+    /// 直接轮询 device_token 即可拿到令牌。命中 POST 处理器会 panic 使测试失败。
+    #[tokio::test]
+    async fn device_code_grant_skips_post_when_already_authorized() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let app = Router::new()
+            .route("/oauth/token", get(oauth_token))
+            .route("/oauth/device/code", get(oauth_device_code))
+            .route(
+                "/device",
+                get(oauth_device_approve_already_authorized)
+                    .post(oauth_device_confirm_must_not_be_called),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let fs =
+            BaiduPanFs::from_config_with_persister(&config(&base), Client::new(), None).unwrap();
+        let granted = fs.device_code_grant().await.unwrap();
+        assert_eq!(
+            granted.get("access_token").and_then(Value::as_str),
+            Some("fresh-token"),
+            "无确认表单时应直接轮询拿到令牌"
+        );
+        assert_eq!(
+            granted.get("refresh_token").and_then(Value::as_str),
+            Some("refresh-new"),
         );
     }
 }
