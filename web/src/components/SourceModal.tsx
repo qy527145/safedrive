@@ -1,5 +1,6 @@
-import { App, Card, Checkbox, Form, Input, Modal, Select, Switch, Typography } from 'antd';
-import { useEffect, useState } from 'react';
+import { QrcodeOutlined, ReloadOutlined } from '@ant-design/icons';
+import { App, Button, Card, Checkbox, Form, Input, Modal, Select, Spin, Switch, Typography } from 'antd';
+import { useCallback, useEffect, useState } from 'react';
 import { api, type DsRecord } from '../api/client';
 import { useSources } from '../stores/sources';
 import { parseSize, sizeToInput } from '../utils/format';
@@ -19,6 +20,7 @@ export default function SourceModal({ open, editing, onClose }: {
   const { message } = App.useApp();
   const sources = useSources();
   const [saving, setSaving] = useState(false);
+  const [qrOpen, setQrOpen] = useState(false);
   const [form] = Form.useForm<FormValues>();
   const type = Form.useWatch('type', form) ?? 'localfs';
   const encrypted = Form.useWatch('encryptionEnabled', form) ?? true;
@@ -68,13 +70,21 @@ export default function SourceModal({ open, editing, onClose }: {
     } catch(e) { message.error(e instanceof Error?e.message:String(e)); } finally { setSaving(false); }
   };
 
+  const onQrSuccess = useCallback((bduss: string) => {
+    form.setFields([{ name: 'bduss', value: bduss, errors: [] }]);
+    setQrOpen(false);
+    void message.success('登录成功，BDUSS 已自动填入');
+  }, [form, message]);
+
   return <Modal title={editing?'编辑数据源':'添加数据源'} open={open} confirmLoading={saving} onOk={()=>void onSubmit()} onCancel={onClose} destroyOnHidden width={620}>
     <Form form={form} layout="vertical" name="ds">
       <Form.Item name="name" label="数据源名称" rules={[{required:true}]}><Input/></Form.Item>
       <Form.Item name="type" label="类型" rules={[{required:true}]}><Select disabled={!!editing} options={[{label:'本地文件系统',value:'localfs'},{label:'WebDAV',value:'webdav'},{label:'百度网盘',value:'baidupan'}]}/></Form.Item>
       {type==='localfs'&&<Form.Item name="root" label="根目录" rules={[{required:true}]}><Input/></Form.Item>}
       {type==='webdav'&&<><Form.Item name="url" label="WebDAV 地址" rules={[{required:true},{pattern:/^https?:\/\//}]}><Input/></Form.Item><Form.Item name="username" label="用户名"><Input/></Form.Item><Form.Item name="password" label="密码"><Input.Password/></Form.Item></>}
-      {type==='baidupan'&&<><Form.Item name="root" label="网盘根目录" rules={[{required:true}]}><Input/></Form.Item><Form.Item name="clientId" label="开放平台 API Key（可选）"><Input/></Form.Item><Form.Item name="clientSecret" label="Secret Key（可选）"><Input.Password/></Form.Item><Form.Item name="bduss" label="BDUSS" rules={[{required:true}]}><Input.Password/></Form.Item><Form.Item name="userAgent" label="下载 User-Agent"><Input/></Form.Item></>}
+      {type==='baidupan'&&<><Form.Item name="root" label="网盘根目录" rules={[{required:true}]}><Input/></Form.Item><Form.Item name="clientId" label="开放平台 API Key（可选）"><Input/></Form.Item><Form.Item name="clientSecret" label="Secret Key（可选）"><Input.Password/></Form.Item>
+      <Form.Item name="bduss" label="BDUSS" rules={[{required:true,message:'请扫码登录获取，或手动粘贴'}]} extra={<Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>setQrOpen(true)}>扫码登录自动获取</Button>}><Input.Password placeholder="点击下方扫码登录自动获取，或手动粘贴 Cookie 中的 BDUSS"/></Form.Item>
+      <Form.Item name="userAgent" label="下载 User-Agent"><Input/></Form.Item></>}
       <Card size="small" title="数据保护" style={{marginBottom:16}}>
         <Form.Item name="encryptionEnabled" label="内容加密" valuePropName="checked" extra={editing?'创建后不可修改；如需切换请新建数据源。':'该选择创建后不可更改。'}><Switch disabled={!!editing}/></Form.Item>
         {encrypted&&<Form.Item name="encryptionPassword" label="根密码" rules={[{required:!editing,message:'请输入密码'}]} extra={editing?'修改后会重命名存储端根层加密文件名；留空保持原密码。':'丢失后无法恢复数据。'}><Input.Password/></Form.Item>}
@@ -86,5 +96,64 @@ export default function SourceModal({ open, editing, onClose }: {
         <Form.Item name="cacheEnabled" valuePropName="checked" style={{marginTop:12}}><Checkbox>允许该数据源使用持久下载缓存</Checkbox></Form.Item>
       </Card>
     </Form>
+    <BaiduQrModal open={qrOpen} onClose={()=>setQrOpen(false)} onSuccess={onQrSuccess}/>
+  </Modal>;
+}
+
+type QrStatus = 'loading' | 'waiting' | 'scanned' | 'expired' | 'error';
+
+/** 百度扫码登录弹窗：轮询扫码状态，确认后把 BDUSS 交给父组件填入表单。 */
+function BaiduQrModal({ open, onClose, onSuccess }: {
+  open: boolean; onClose: () => void; onSuccess: (bduss: string) => void;
+}) {
+  const [img, setImg] = useState('');
+  const [status, setStatus] = useState<QrStatus>('loading');
+  const [error, setError] = useState('');
+  const [epoch, setEpoch] = useState(0); // 自增触发刷新二维码
+
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    setImg(''); setStatus('loading'); setError('');
+    (async () => {
+      try {
+        const qr = await api.baiduQrCreate();
+        if (!alive) return;
+        setImg(qr.img); setStatus('waiting');
+        const deadline = Date.now() + 180_000; // 与百度二维码有效期同量级
+        while (alive && Date.now() < deadline) {
+          const r = await api.baiduQrPoll(qr.sign, qr.gid);
+          if (!alive) return;
+          if (r.status === 'confirmed' && r.bduss) { onSuccess(r.bduss); return; }
+          if (r.status === 'scanned') setStatus('scanned');
+          if (r.status === 'expired') { setStatus('expired'); return; }
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        }
+        if (alive) setStatus('expired');
+      } catch (e) {
+        if (alive) { setStatus('error'); setError(e instanceof Error ? e.message : String(e)); }
+      }
+    })();
+    return () => { alive = false; };
+  }, [open, epoch, onSuccess]);
+
+  const stale = status === 'expired' || status === 'error';
+  return <Modal title="扫码登录百度网盘" open={open} onCancel={onClose} footer={null} width={300} destroyOnHidden>
+    <div style={{textAlign:'center',padding:'8px 0'}}>
+      <div style={{position:'relative',display:'inline-block',width:200,height:200}}>
+        {img
+          ? <img src={`data:image/png;base64,${img}`} width={200} height={200} alt="百度登录二维码"/>
+          : <Spin style={{marginTop:84}}/>}
+        {stale && <div style={{position:'absolute',inset:0,background:'rgba(255,255,255,.94)',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:8,padding:8}}>
+          <Typography.Text type="secondary">{status==='error'?error:'二维码已失效'}</Typography.Text>
+          <Button type="primary" size="small" icon={<ReloadOutlined/>} onClick={()=>setEpoch((n)=>n+1)}>刷新二维码</Button>
+        </div>}
+      </div>
+      <div style={{marginTop:12}}>
+        <Typography.Text type={status==='scanned'?'success':'secondary'}>
+          {status==='scanned'?'扫码成功，请在手机上点击确认登录':'用百度网盘 App 扫码，确认后自动填入 BDUSS'}
+        </Typography.Text>
+      </div>
+    </div>
   </Modal>;
 }

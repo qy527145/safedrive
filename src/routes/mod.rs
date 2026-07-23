@@ -1,3 +1,4 @@
+mod baidu_qr;
 pub mod ds;
 pub mod files;
 pub mod share;
@@ -19,6 +20,7 @@ pub fn router(state: AppState) -> Router {
         .route("/login", post(auth::login));
 
     let protected = Router::new()
+        .merge(baidu_qr::routes())
         .merge(ds::routes())
         .merge(system::routes())
         .merge(files::api_routes())

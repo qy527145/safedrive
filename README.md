@@ -59,7 +59,7 @@ bun run dev
 
 ### 百度网盘凭证
 
-最简配置只需填写登录百度网盘账号的 `BDUSS` 值。首次连接时，服务会参考 onepan 的流程申请 OAuth 设备码、使用 BDUSS 完成设备授权并自动换取 Access/Refresh Token。AT 到期前会使用 RT 刷新；每次成功都将轮换后的新 AT、新 RT 与根据 `expires_in` 计算的 `accessTokenExpiresAt` 原子写回 `datasources.json`。
+最简配置只需填写登录百度网盘账号的 `BDUSS` 值。推荐直接点击表单中的「扫码登录自动获取」：用百度网盘 App 扫码并在手机上确认后，BDUSS 会自动填入，无需手动查浏览器 Cookie（扫码走 passport.baidu.com 网页版登录协议，由 SafeDrive 服务端代理，凭证不经过第三方）。首次连接时，服务会参考 onepan 的流程申请 OAuth 设备码、使用 BDUSS 完成设备授权并自动换取 Access/Refresh Token。AT 到期前会使用 RT 刷新；每次成功都将轮换后的新 AT、新 RT 与根据 `expires_in` 计算的 `accessTokenExpiresAt` 原子写回 `datasources.json`。
 
 界面仍提供可选的 API Key（Client ID）和 Secret Key（Client Secret）入口；两者同时留空时使用内置客户端。BDUSS 除了首次设备授权，只发送给 `locatedownload` 与其返回的 CDN 下载地址；列目录、CRUD 和上传不会携带 Cookie。开放平台应用只能访问其获授权的路径时，请将“网盘根目录”设置在该授权范围内。
 

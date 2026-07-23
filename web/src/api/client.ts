@@ -166,6 +166,15 @@ export const api = {
   testDs: (id: string) =>
     request<{ ok: boolean; entries: number }>(`/api/ds/${id}/test`, { method: 'POST' }),
 
+  // ---- 百度网盘扫码登录（自动获取 BDUSS） ----
+  baiduQrCreate: () =>
+    request<{ sign: string; gid: string; img: string }>('/api/baidu/qrcode', { method: 'POST' }),
+  baiduQrPoll: (sign: string, gid: string) =>
+    request<{ status: 'waiting' | 'scanned' | 'confirmed' | 'expired'; bduss?: string }>(
+      '/api/baidu/qrcode/poll',
+      { method: 'POST', body: JSON.stringify({ sign, gid }) },
+    ),
+
   getSettings: () => request<TransferSettings>('/api/settings'),
   updateSettings: (body: TransferSettings) =>
     request<TransferSettings>('/api/settings', { method: 'PUT', body: JSON.stringify(body) }),
