@@ -46,24 +46,22 @@ fn volume_plan(total: u64, enabled: bool, max: u64, strategy: &str) -> Vec<u64> 
             .map(|i| max.min(total - i as u64 * max))
             .collect();
     }
-    let mut left = total;
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let remain = count - i - 1;
-        if remain == 0 {
-            out.push(left);
-            break;
-        }
-        let low = left.saturating_sub(remain as u64 * max).max(1);
-        let high = max.min(left - remain as u64);
-        let mut random = [0u8; 8];
-        getrandom::fill(&mut random).expect("系统随机数不可用");
-        let span = high - low + 1;
-        let size = low + u64::from_le_bytes(random) % span;
-        out.push(size);
-        left -= size;
-    }
-    out
+    // 切点法：把总松弛量 slack = count*max - total（恒 < max）均匀随机分成
+    // count 份 d_i，每卷大小 = max - d_i。这等价于在「卷数固定、单卷 ≤ max、
+    // 总和 = total」的全部可行方案上均匀采样；而逐卷贪心会在前几卷耗尽
+    // 松弛量，导致后面的分卷全部顶格等于 max。
+    let slack = count as u64 * max - total;
+    let mut cuts: Vec<u64> = (0..count - 1)
+        .map(|_| {
+            let mut random = [0u8; 8];
+            getrandom::fill(&mut random).expect("系统随机数不可用");
+            u64::from_le_bytes(random) % (slack + 1)
+        })
+        .collect();
+    cuts.push(0);
+    cuts.push(slack);
+    cuts.sort_unstable();
+    (0..count).map(|i| max - (cuts[i + 1] - cuts[i])).collect()
 }
 
 fn volume_names(format: &str, source: &str, count: usize) -> Vec<String> {
@@ -1834,6 +1832,23 @@ mod config_tests {
             assert_eq!(plan.len(), total.div_ceil(max) as usize);
             assert_eq!(plan.iter().sum::<u64>(), total);
             assert!(plan.iter().all(|size| *size > 0 && *size <= max));
+        }
+    }
+
+    #[test]
+    fn random_plan_spreads_slack_instead_of_pinning_at_max() {
+        // 2900M / 300M：卷数恒为 10，松弛量 100M 应摊到全部分卷上，
+        // 而不是被前几卷耗尽导致后面的卷全部顶格 300M。
+        let mb = 1024 * 1024;
+        let total = 2900 * mb;
+        let max = 300 * mb;
+        for _ in 0..32 {
+            let plan = volume_plan(total, true, max, "random");
+            assert_eq!(plan.len(), 10);
+            assert_eq!(plan.iter().sum::<u64>(), total);
+            assert!(plan.iter().all(|size| *size > 0 && *size <= max));
+            let pinned = plan.iter().filter(|size| **size == max).count();
+            assert!(pinned < plan.len() / 2, "顶格分卷过多: {plan:?}");
         }
     }
 
