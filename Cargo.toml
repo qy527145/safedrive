@@ -1,6 +1,6 @@
 [package]
 name = "safedrive"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "端到端零知识加密的数据源管理 Web 客户端（单二进制，前端嵌入）"
 license = "MIT"
