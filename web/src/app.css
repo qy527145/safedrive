@@ -102,6 +102,36 @@ body > #root { min-height: 100vh; }
   color: var(--sd-text); border: 2px dashed var(--sd-accent); border-radius: 8px;
   background: rgba(10, 12, 18, .88); backdrop-filter: blur(6px); }
 .file-drop-overlay .anticon { color: var(--sd-accent); font-size: 42px; }
+
+/* ---------- 文件预览：跟随暗色主题 ---------- */
+.text-preview { max-height: 65vh; overflow: auto; background: #10141e; border: 1px solid #262c3a;
+  padding: 12px 14px; border-radius: 8px; white-space: pre-wrap; word-break: break-all;
+  font-size: 13px; line-height: 1.6; }
+.md-preview { max-height: 68vh; overflow: auto; padding: 4px 8px; line-height: 1.75; font-size: 14px; }
+.md-preview h1, .md-preview h2 { padding-bottom: .3em; border-bottom: 1px solid #262c3a; }
+.md-preview h1:first-child, .md-preview h2:first-child, .md-preview h3:first-child { margin-top: 0; }
+.md-preview a { color: var(--sd-accent); }
+.md-preview code { background: rgba(110,168,255,.12); padding: 2px 6px; border-radius: 4px;
+  font-size: .9em; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.md-preview pre { background: #10141e; border: 1px solid #262c3a; padding: 12px 14px;
+  border-radius: 8px; overflow: auto; line-height: 1.55; }
+.md-preview pre code { background: none; padding: 0; }
+.md-preview blockquote { margin: 8px 0; padding: 4px 14px; color: #aab3c5;
+  border-left: 3px solid var(--sd-accent); background: rgba(110,168,255,.06); border-radius: 0 6px 6px 0; }
+.md-preview table { border-collapse: collapse; margin: 8px 0; display: block; max-width: 100%; overflow: auto; }
+.md-preview th, .md-preview td { border: 1px solid #262c3a; padding: 6px 12px; }
+.md-preview th { background: #10141e; }
+.md-preview img { max-width: 100%; border-radius: 6px; }
+.md-preview hr { border: none; border-top: 1px solid #262c3a; }
+.md-preview input[type='checkbox'] { margin-right: 6px; }
+/* docx：保留“纸张”白底，容器用主题深底衬托 */
+.docx-preview-scroll { max-height: 70vh; overflow: auto; border-radius: 8px; background: #10141e; }
+.docx-preview-scroll .docx-wrapper { background: transparent; padding: 18px; }
+.sheet-preview { max-height: 62vh; overflow: auto; }
+.sheet-preview table { border-collapse: collapse; font-size: 13px; }
+.sheet-preview td { border: 1px solid #262c3a; padding: 4px 10px; min-width: 60px;
+  max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sheet-preview tr:first-child td { background: #10141e; font-weight: 600; }
 .file-drop-overlay strong { font-size: 18px; }
 .file-drop-overlay span { color: #9aa6ba; font-size: 13px; }
 /* 文件浏览器卡片视图：自适应网格瓦片 */

@@ -28,18 +28,24 @@ const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', '
 const VIDEO_EXTS = new Set(['mp4', 'webm', 'mkv', 'mov', 'm4v', 'avi', 'ts']);
 const AUDIO_EXTS = new Set(['mp3', 'flac', 'wav', 'ogg', 'm4a', 'aac', 'opus']);
 export const TEXT_EXTS = new Set([
-  'txt', 'md', 'json', 'js', 'ts', 'tsx', 'jsx', 'css', 'html', 'xml', 'yml', 'yaml',
+  'txt', 'json', 'js', 'ts', 'tsx', 'jsx', 'css', 'html', 'xml', 'yml', 'yaml',
   'toml', 'ini', 'conf', 'log', 'sh', 'py', 'rs', 'go', 'java', 'c', 'cpp', 'h', 'csv',
 ]);
 
-export type PreviewKind = 'image' | 'video' | 'audio' | 'pdf' | 'text' | 'none';
+export type PreviewKind =
+  | 'image' | 'video' | 'audio' | 'pdf' | 'markdown' | 'docx' | 'xlsx' | 'text' | 'none';
 
+/** 注：Office 仅支持 OOXML 的 docx/xlsx（纯前端渲染，不出网）；
+ * pptx 与 legacy 二进制格式（doc/xls/ppt）无可靠的纯前端方案，不支持。 */
 export function previewKind(name: string): PreviewKind {
   const ext = extOf(name);
   if (IMAGE_EXTS.has(ext)) return 'image';
   if (VIDEO_EXTS.has(ext)) return 'video';
   if (AUDIO_EXTS.has(ext)) return 'audio';
   if (ext === 'pdf') return 'pdf';
+  if (ext === 'md' || ext === 'markdown') return 'markdown';
+  if (ext === 'docx') return 'docx';
+  if (ext === 'xlsx') return 'xlsx';
   if (TEXT_EXTS.has(ext)) return 'text';
   return 'none';
 }

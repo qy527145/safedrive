@@ -17,7 +17,12 @@ describe('previewKind', () => {
     expect(previewKind('照片.JPG')).toBe('image');
     expect(previewKind('音乐.flac')).toBe('audio');
     expect(previewKind('说明.pdf')).toBe('pdf');
-    expect(previewKind('README.md')).toBe('text');
+    expect(previewKind('README.md')).toBe('markdown');
+    expect(previewKind('笔记.txt')).toBe('text');
+    expect(previewKind('报告.docx')).toBe('docx');
+    expect(previewKind('台账.XLSX')).toBe('xlsx');
+    expect(previewKind('旧文档.doc')).toBe('none');
+    expect(previewKind('幻灯片.pptx')).toBe('none');
     expect(previewKind('archive.zip')).toBe('none');
     expect(previewKind('无扩展名')).toBe('none');
   });
