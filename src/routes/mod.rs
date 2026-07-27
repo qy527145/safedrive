@@ -1,5 +1,7 @@
 mod baidu_qr;
+mod bits;
 pub mod ds;
+mod ds_codec;
 pub mod files;
 pub mod share;
 mod share_codec;

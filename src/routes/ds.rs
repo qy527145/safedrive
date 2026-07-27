@@ -8,11 +8,16 @@ use crate::error::{ApiError, ApiResult};
 use crate::registry::{DataSource, now_ms};
 use crate::state::AppState;
 
+use super::bits::DecodeError;
+use super::ds_codec;
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/ds", get(list).post(create))
+        .route("/ds/import", post(import))
         .route("/ds/{id}", put(update).delete(remove))
         .route("/ds/{id}/test", post(test))
+        .route("/ds/{id}/share", post(share))
 }
 
 #[derive(Deserialize)]
@@ -351,4 +356,158 @@ async fn test(
         Err(e) => return Err(e),
     };
     Ok(Json(json!({ "ok": true, "entries": entries.len() })))
+}
+
+/// 生成 `sdds://` 配置分享链接。链接包含凭证与根密码，属于不记名密钥，
+/// 服务端不落盘、不记录，只回给当前已鉴权的管理端。
+async fn share(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let ds = state
+        .registry
+        .get(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("数据源不存在: {id}")))?;
+    let pack = ds_codec::DsPack {
+        ds_type: ds.ds_type,
+        name: ds.name,
+        config: ds.config,
+        encryption_enabled: ds.encryption_enabled,
+        password: ds.password,
+        volume_enabled: ds.volume_enabled,
+        volume_size: ds.volume_size,
+        volume_strategy: ds.volume_strategy,
+        volume_name_format: ds.volume_name_format,
+        cache_enabled: ds.cache_enabled,
+    };
+    let link =
+        ds_codec::encode(&pack).map_err(|message| ApiError::Internal(anyhow::anyhow!(message)))?;
+    Ok(Json(json!({ "link": link })))
+}
+
+#[derive(Deserialize)]
+struct DsImportBody {
+    link: String,
+}
+
+/// 通过 `sdds://` 链接导入数据源：走与手工创建完全相同的校验路径，
+/// 名称冲突时自动追加序号。
+async fn import(
+    State(state): State<AppState>,
+    Json(body): Json<DsImportBody>,
+) -> ApiResult<Json<DataSource>> {
+    if body.link.len() > 64 * 1024 {
+        return Err(ApiError::BadRequest("分享链接过长".into()));
+    }
+    let pack = ds_codec::decode(&body.link).map_err(|error| match error {
+        DecodeError::UnsupportedVersion(version) => {
+            ApiError::BadRequest(format!("不支持的数据源分享协议版本: {version}"))
+        }
+        DecodeError::Invalid => ApiError::BadRequest("数据源分享链接格式无效或已损坏".into()),
+    })?;
+    let body = DsBody {
+        name: unique_name(&state, &pack.name),
+        ds_type: pack.ds_type,
+        config: pack.config,
+        encryption_enabled: Some(pack.encryption_enabled),
+        password: pack.encryption_enabled.then_some(pack.password),
+        volume_enabled: Some(pack.volume_enabled),
+        volume_size: Some(pack.volume_size),
+        volume_strategy: Some(pack.volume_strategy),
+        volume_name_format: Some(pack.volume_name_format),
+        cache_enabled: Some(pack.cache_enabled),
+    };
+    create(State(state), Json(body)).await
+}
+
+/// WebDAV 数据平面按名称寻址数据源，导入时避开重名。
+fn unique_name(state: &AppState, wanted: &str) -> String {
+    let taken: Vec<String> = state.registry.list().into_iter().map(|d| d.name).collect();
+    if !taken.iter().any(|name| name == wanted) {
+        return wanted.to_owned();
+    }
+    (2..)
+        .map(|n| format!("{wanted} ({n})"))
+        .find(|candidate| !taken.iter().any(|name| name == candidate))
+        .expect("总能找到未占用的名称")
+}
+
+#[cfg(test)]
+mod tests {
+    use http_body_util::BodyExt;
+    use tower::util::ServiceExt;
+
+    fn setup() -> (crate::state::AppState, axum::Router, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(dir.path().join("data"), None).unwrap();
+        (state.clone(), crate::routes::router(state), dir)
+    }
+
+    async fn send(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        let body = match body {
+            Some(json) => {
+                builder = builder.header("content-type", "application/json");
+                axum::body::Body::from(json.to_string())
+            }
+            None => axum::body::Body::empty(),
+        };
+        let resp = app.clone().oneshot(builder.body(body).unwrap()).await.unwrap();
+        let (parts, body) = resp.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (parts.status, json)
+    }
+
+    /// 分享 → 导入闭环：导入结果与原数据源配置一致，重名自动加序号。
+    #[tokio::test]
+    async fn share_link_roundtrip_and_unique_name() {
+        let (_state, app, dir) = setup();
+        let root = dir.path().join("cloud");
+        let body = serde_json::json!({
+            "name": "我的空间", "type": "localfs",
+            "config": { "root": root.to_str().unwrap() },
+            "encryptionEnabled": true, "password": "root-pw-123",
+            "volumeEnabled": true, "volumeSize": 128 * 1024,
+            "volumeStrategy": "fixed", "cacheEnabled": false,
+        });
+        let (status, created) = send(&app, "POST", "/api/ds", Some(body)).await;
+        assert_eq!(status, 200, "{created}");
+        let id = created["id"].as_str().unwrap();
+
+        let (status, shared) = send(&app, "POST", &format!("/api/ds/{id}/share"), None).await;
+        assert_eq!(status, 200, "{shared}");
+        let link = shared["link"].as_str().unwrap();
+        assert!(link.starts_with("sdds://"));
+        assert!(!link.contains("root-pw-123"));
+
+        let import = serde_json::json!({ "link": link });
+        let (status, imported) = send(&app, "POST", "/api/ds/import", Some(import.clone())).await;
+        assert_eq!(status, 200, "{imported}");
+        assert_eq!(imported["name"], "我的空间 (2)");
+        assert_ne!(imported["id"], created["id"]);
+        for key in ["type", "config", "encryptionEnabled", "password",
+                    "volumeEnabled", "volumeSize", "volumeStrategy", "cacheEnabled"] {
+            assert_eq!(imported[key], created[key], "field {key}");
+        }
+
+        // 再导入一次：继续顺延序号
+        let (_, third) = send(&app, "POST", "/api/ds/import", Some(import)).await;
+        assert_eq!(third["name"], "我的空间 (3)");
+    }
+
+    #[tokio::test]
+    async fn import_rejects_garbage_links() {
+        let (_state, app, _dir) = setup();
+        for link in ["", "sd://abcdef", "sdds://!!!", "sdds://AAAA"] {
+            let body = serde_json::json!({ "link": link });
+            let (status, _) = send(&app, "POST", "/api/ds/import", Some(body)).await;
+            assert_eq!(status, 400, "link {link:?} should be rejected");
+        }
+    }
 }

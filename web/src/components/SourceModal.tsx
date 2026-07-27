@@ -13,11 +13,12 @@ interface FormValues {
   volumeStrategy: 'fixed' | 'random'; volumeNameFormat: string; cacheEnabled: boolean;
 }
 
-/** 添加/编辑数据源弹窗：连接、加密、分卷与缓存配置均归属于数据源。 */
-export default function SourceModal({ open, editing, onClose }: {
-  open: boolean; editing: DsRecord | null; onClose: () => void;
+/** 添加/编辑/克隆数据源弹窗：连接、加密、分卷与缓存配置均归属于数据源。
+ * `cloneFrom` 提供时按「以它为模板新建」处理：预填全部配置，保存走创建接口。 */
+export default function SourceModal({ open, editing, cloneFrom = null, onClose }: {
+  open: boolean; editing: DsRecord | null; cloneFrom?: DsRecord | null; onClose: () => void;
 }) {
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const sources = useSources();
   const [saving, setSaving] = useState(false);
   const [qrOpen, setQrOpen] = useState(false);
@@ -29,9 +30,10 @@ export default function SourceModal({ open, editing, onClose }: {
   useEffect(() => {
     if (!open) return;
     form.resetFields();
-    if (editing) {
-      const d = editing;
-      form.setFieldsValue({ name:d.name, type:d.type, root:d.config.root, url:d.config.url,
+    const template = editing ?? cloneFrom;
+    if (template) {
+      const d = template;
+      form.setFieldsValue({ name:editing?d.name:`${d.name} 副本`, type:d.type, root:d.config.root, url:d.config.url,
         username:d.config.username, password:d.config.password, bduss:d.config.bduss,
         userAgent:d.config.userAgent, clientId:d.config.clientId, clientSecret:d.config.clientSecret,
         encryptionEnabled:d.encryptionEnabled, encryptionPassword:d.password,
@@ -41,7 +43,20 @@ export default function SourceModal({ open, editing, onClose }: {
       form.setFieldsValue({ type: 'localfs', encryptionEnabled: true, volumeEnabled: true,
         volumeText: '300M', volumeStrategy: 'random', volumeNameFormat: '{s}_{i}.bin', cacheEnabled: true });
     }
-  }, [open, editing, form]);
+  }, [open, editing, cloneFrom, form]);
+
+  /** 表单动过就先确认再关，避免误触（遮罩点击 / Esc / 取消 / X 都会走这里）。 */
+  const confirmClose = () => {
+    if (!form.isFieldsTouched()) { onClose(); return; }
+    modal.confirm({
+      title: '放弃未保存的修改？',
+      content: '关闭后已填写的内容将丢失。',
+      okText: '放弃修改',
+      okButtonProps: { danger: true },
+      cancelText: '继续编辑',
+      onOk: onClose,
+    });
+  };
 
   const onSubmit = async () => {
     const v = await form.validateFields();
@@ -71,12 +86,13 @@ export default function SourceModal({ open, editing, onClose }: {
   };
 
   const onQrSuccess = useCallback((bduss: string) => {
-    form.setFields([{ name: 'bduss', value: bduss, errors: [] }]);
+    // touched: 让 confirmClose 把扫码结果也视为「未保存的修改」
+    form.setFields([{ name: 'bduss', value: bduss, touched: true, errors: [] }]);
     setQrOpen(false);
     void message.success('登录成功，BDUSS 已自动填入');
   }, [form, message]);
 
-  return <Modal title={editing?'编辑数据源':'添加数据源'} open={open} confirmLoading={saving} onOk={()=>void onSubmit()} onCancel={onClose} destroyOnHidden width={620}>
+  return <Modal title={editing?'编辑数据源':cloneFrom?'克隆数据源':'添加数据源'} open={open} confirmLoading={saving} onOk={()=>void onSubmit()} onCancel={confirmClose} destroyOnHidden width={620}>
     <Form form={form} layout="vertical" name="ds">
       <Form.Item name="name" label="数据源名称" rules={[{required:true}]}><Input/></Form.Item>
       <Form.Item name="type" label="类型" rules={[{required:true}]}><Select disabled={!!editing} options={[{label:'本地文件系统',value:'localfs'},{label:'WebDAV',value:'webdav'},{label:'百度网盘',value:'baidupan'}]}/></Form.Item>
@@ -84,7 +100,7 @@ export default function SourceModal({ open, editing, onClose }: {
       {type==='webdav'&&<><Form.Item name="url" label="WebDAV 地址" rules={[{required:true},{pattern:/^https?:\/\//}]}><Input/></Form.Item><Form.Item name="username" label="用户名"><Input/></Form.Item><Form.Item name="password" label="密码"><Input.Password/></Form.Item></>}
       {type==='baidupan'&&<><Form.Item name="root" label="网盘根目录" rules={[{required:true}]}><Input/></Form.Item><Form.Item name="clientId" label="开放平台 API Key（可选）"><Input/></Form.Item><Form.Item name="clientSecret" label="Secret Key（可选）"><Input.Password/></Form.Item>
       <Form.Item name="bduss" label="BDUSS" rules={[{required:true,message:'请扫码登录获取，或手动粘贴'}]} extra={<Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>setQrOpen(true)}>扫码登录自动获取</Button>}><Input.Password placeholder="点击下方扫码登录自动获取，或手动粘贴 Cookie 中的 BDUSS"/></Form.Item>
-      <Form.Item name="userAgent" label="下载 User-Agent"><Input/></Form.Item></>}
+      <Form.Item name="userAgent" label="下载 User-Agent" extra="留空使用默认值，仅影响下载数据流量的 UA 标识"><Input placeholder="netdisk;P2SP;2.2.61.31;android"/></Form.Item></>}
       <Card size="small" title="数据保护" style={{marginBottom:16}}>
         <Form.Item name="encryptionEnabled" label="内容加密" valuePropName="checked" extra={editing?'创建后不可修改；如需切换请新建数据源。':'该选择创建后不可更改。'}><Switch disabled={!!editing}/></Form.Item>
         {encrypted&&<Form.Item name="encryptionPassword" label="根密码" rules={[{required:!editing,message:'请输入密码'}]} extra={editing?'修改后会重命名存储端根层加密文件名；留空保持原密码。':'丢失后无法恢复数据。'}><Input.Password/></Form.Item>}

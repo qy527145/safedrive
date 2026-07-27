@@ -87,6 +87,10 @@ body > #root { min-height: 100vh; }
 .center-glow { position: absolute; width: 480px; height: 480px; border-radius: 50%; pointer-events: none;
   background: rgba(88, 99, 246, .16); filter: blur(90px); }
 .source-card .ant-card-meta-title { font-size: 16px !important; }
+.source-card { position: relative; }
+/* 卡片右上角批量选择框：默认半透明，悬停或选中时显形 */
+.source-card-check { position: absolute; top: 10px; right: 12px; z-index: 2; opacity: .35; transition: opacity .15s; }
+.source-card:hover .source-card-check, .source-card-check.ant-checkbox-wrapper-checked { opacity: 1; }
 .source-icon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 10px;
   color: var(--sd-accent); font-size: 22px; background: rgba(110,168,255,.1); border: 1px solid rgba(110,168,255,.18); }
 .source-icon-sm { width: 30px; height: 30px; font-size: 15px; border-radius: 8px; }

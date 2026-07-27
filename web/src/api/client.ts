@@ -165,6 +165,12 @@ export const api = {
   deleteDs: (id: string) => request<{ ok: boolean }>(`/api/ds/${id}`, { method: 'DELETE' }),
   testDs: (id: string) =>
     request<{ ok: boolean; entries: number }>(`/api/ds/${id}/test`, { method: 'POST' }),
+  /** 生成 sdds:// 配置分享链接（包含凭证与根密码，链接即密钥）。 */
+  shareDs: (id: string) =>
+    request<{ link: string }>(`/api/ds/${id}/share`, { method: 'POST' }),
+  /** 通过 sdds:// 链接导入数据源，重名时服务端自动追加序号。 */
+  importDs: (link: string) =>
+    request<DsRecord>('/api/ds/import', { method: 'POST', body: JSON.stringify({ link }) }),
 
   // ---- 百度网盘扫码登录（自动获取 BDUSS） ----
   baiduQrCreate: () =>
