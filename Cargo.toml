@@ -5,9 +5,16 @@ edition = "2024"
 description = "端到端零知识加密的数据源管理 Web 客户端（单二进制，前端嵌入）"
 license = "MIT"
 repository = "https://github.com/qy527145/safedrive"
+authors = ["wmymz"]
 # 前端产物 web/dist 随仓库提交并随包发布，cargo install（crates.io / --git）均不依赖 bun/npm；
 # 改动 web/ 后需执行 bun run --cwd web build 并将 dist 一并提交
 include = ["/src/**", "/build.rs", "/web/dist/**", "/README.md", "/LICENSE"]
+
+[package.metadata.wix]
+upgrade-guid = "3D63DA0D-80D6-4F13-8F62-A3D7BAFC6F9B"
+path-guid = "9CD967DA-8069-417F-B3B0-4D0B79A86B0D"
+license = false
+eula = false
 
 [dependencies]
 anyhow = "1"
@@ -54,3 +61,8 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
