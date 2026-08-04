@@ -1,6 +1,7 @@
 import {
   ClearOutlined,
   CloseOutlined,
+  CopyOutlined,
   DownloadOutlined,
   ReloadOutlined,
   UploadOutlined,
@@ -24,7 +25,7 @@ function statusTag(t: TransferTask) {
   }
 }
 
-/** 上传/下载任务队列抽屉。 */
+/** 上传/下载/跨源复制任务队列抽屉。 */
 export default function TaskDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
   const tasks = useTasks((s) => s.tasks);
   const cancel = useTasks((s) => s.cancel);
@@ -57,10 +58,12 @@ export default function TaskDrawer({ open, onClose }: { open: boolean; onClose: 
                   : 0;
             const donePercent = pct(t.doneBytes);
             const uploadedPercent = pct(t.uploadedBytes);
+            const dual = t.kind === 'upload' || t.kind === 'copy';
             return (
               <List.Item
                 actions={
-                  t.status === 'running' || t.status === 'queued'
+                  // 跨源复制在服务端一气呵成，中途没有可安全中断的点，不给取消
+                  (t.status === 'running' || t.status === 'queued') && t.kind !== 'copy'
                     ? [<Button key="c" size="small" icon={<CloseOutlined />} onClick={() => cancel(t.id)} />]
                     : t.status === 'error'
                       ? [
@@ -72,7 +75,7 @@ export default function TaskDrawer({ open, onClose }: { open: boolean; onClose: 
                 }
               >
                 <List.Item.Meta
-                  avatar={t.kind === 'upload' ? <UploadOutlined /> : <DownloadOutlined />}
+                  avatar={t.kind === 'upload' ? <UploadOutlined /> : t.kind === 'copy' ? <CopyOutlined /> : <DownloadOutlined />}
                   title={
                     <Space>
                       <Typography.Text style={{ maxWidth: 200 }} ellipsis>
@@ -85,24 +88,28 @@ export default function TaskDrawer({ open, onClose }: { open: boolean; onClose: 
                     <>
                       <Progress
                         percent={donePercent}
-                        // 上传双维度同条呈现：绿 = 远端已确认，蓝 = 本地已加密待传
-                        success={t.kind === 'upload' ? { percent: uploadedPercent } : undefined}
+                        // 上传/复制双维度同条呈现：绿 = 远端已确认，蓝 = 本地已就绪待传
+                        success={dual ? { percent: uploadedPercent } : undefined}
                         size="small"
                         status={t.status === 'error' ? 'exception' : t.status === 'done' ? 'success' : 'active'}
                       />
                       <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                         {t.dsName} ·{' '}
-                        {t.kind === 'upload' ? (
+                        {dual ? (
                           <>
-                            <span style={{ color: '#1677ff' }}>加密 {formatBytes(t.doneBytes)}</span> ·{' '}
-                            <span style={{ color: '#52c41a' }}>上传 {formatBytes(t.uploadedBytes)}</span> /{' '}
-                            {formatBytes(t.totalBytes)}
+                            <span style={{ color: '#1677ff' }}>
+                              {t.kind === 'copy' ? '读取' : '加密'} {formatBytes(t.doneBytes)}
+                            </span>{' '}
+                            ·{' '}
+                            <span style={{ color: '#52c41a' }}>写入 {formatBytes(t.uploadedBytes)}</span>
+                            {t.totalBytes > 0 ? ` / ${formatBytes(t.totalBytes)}` : ''}
                           </>
                         ) : (
                           <>
                             {formatBytes(t.doneBytes)} / {formatBytes(t.totalBytes)}
                           </>
                         )}
+                        {t.note ? ` · ${t.note}` : ''}
                         {t.error ? ` · ${t.error}` : ''}
                       </Typography.Text>
                     </>

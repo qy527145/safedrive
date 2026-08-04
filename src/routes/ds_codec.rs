@@ -25,6 +25,8 @@ const VERSION: u8 = 1;
 const SOURCE_LOCALFS: u8 = 1;
 const SOURCE_WEBDAV: u8 = 2;
 const SOURCE_BAIDUPAN: u8 = 3;
+const SOURCE_ALIYUNDRIVE: u8 = 4;
+const SOURCE_QUARK: u8 = 5;
 const COMPACT_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 const DEFAULT_VOLUME_NAME_FORMAT: &str = "{s}_{i}.bin";
@@ -37,8 +39,9 @@ const V1_KEY: [u8; 32] = [
     0x36, 0xdf, 0x0a, 0x7e, 0x45, 0xb2, 0x19, 0xcd, 0x63, 0x8f, 0xf4, 0x21, 0x5a, 0x97, 0xd0, 0x0b,
 ];
 
-/// A datasource's shareable configuration. Baidu OAuth tokens are left out:
-/// they are short-lived and the importing side re-derives them from BDUSS.
+/// A datasource's shareable configuration. Short-lived access tokens and
+/// cached drive ids are left out — the importing side re-derives them from the
+/// long-lived credential (BDUSS / refresh token / cookie).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DsPack {
     pub ds_type: String,
@@ -58,6 +61,8 @@ pub(super) fn encode(pack: &DsPack) -> Result<String, &'static str> {
         "localfs" => SOURCE_LOCALFS,
         "webdav" => SOURCE_WEBDAV,
         "baidupan" => SOURCE_BAIDUPAN,
+        "aliyundrive" => SOURCE_ALIYUNDRIVE,
+        "quark" => SOURCE_QUARK,
         _ => return Err("unsupported datasource type"),
     };
     if pack.name.trim().is_empty() {
@@ -98,6 +103,20 @@ pub(super) fn encode(pack: &DsPack) -> Result<String, &'static str> {
             write_url(&mut bits, field("url"))?;
             write_optional(&mut bits, Some(field("username")).filter(|v| !v.is_empty()))?;
             write_optional(&mut bits, Some(field("password")).filter(|v| !v.is_empty()))?;
+        }
+        SOURCE_ALIYUNDRIVE => {
+            write_compact(&mut bits, field("root"))?;
+            write_compact(&mut bits, field("clientId"))?;
+            write_compact(&mut bits, field("clientSecret"))?;
+            write_compact(&mut bits, field("refreshToken"))?;
+            for key in ["driveType", "apiBase"] {
+                write_optional(&mut bits, Some(field(key)).filter(|v| !v.is_empty()))?;
+            }
+        }
+        SOURCE_QUARK => {
+            write_compact(&mut bits, field("root"))?;
+            write_compact(&mut bits, field("cookie"))?;
+            write_optional(&mut bits, Some(field("apiBase")).filter(|v| !v.is_empty()))?;
         }
         _ => {
             write_compact(&mut bits, field("root"))?;
@@ -150,6 +169,8 @@ fn decode_plain(plain: &[u8]) -> Result<DsPack, DecodeError> {
         SOURCE_LOCALFS => "localfs",
         SOURCE_WEBDAV => "webdav",
         SOURCE_BAIDUPAN => "baidupan",
+        SOURCE_ALIYUNDRIVE => "aliyundrive",
+        SOURCE_QUARK => "quark",
         _ => return Err(DecodeError::Invalid),
     };
     let encryption_enabled = bits.read_bit()?;
@@ -183,6 +204,19 @@ fn decode_plain(plain: &[u8]) -> Result<DsPack, DecodeError> {
             "url": read_url(&mut bits)?,
             "username": read_optional(&mut bits)?.unwrap_or_default(),
             "password": read_optional(&mut bits)?.unwrap_or_default(),
+        }),
+        SOURCE_ALIYUNDRIVE => json!({
+            "root": read_compact(&mut bits)?,
+            "clientId": read_compact(&mut bits)?,
+            "clientSecret": read_compact(&mut bits)?,
+            "refreshToken": read_compact(&mut bits)?,
+            "driveType": read_optional(&mut bits)?.unwrap_or_else(|| "default".into()),
+            "apiBase": read_optional(&mut bits)?.unwrap_or_default(),
+        }),
+        SOURCE_QUARK => json!({
+            "root": read_compact(&mut bits)?,
+            "cookie": read_compact(&mut bits)?,
+            "apiBase": read_optional(&mut bits)?.unwrap_or_default(),
         }),
         _ => json!({
             "root": read_compact(&mut bits)?,
@@ -350,8 +384,49 @@ mod tests {
         }
     }
 
-    fn localfs_pack() -> DsPack {
+    fn aliyun_pack() -> DsPack {
         DsPack {
+            ds_type: "aliyundrive".into(),
+            name: "阿里云盘".into(),
+            config: json!({
+                "root": "/safedrive",
+                "clientId": "9f2a1c0b7d3e4f56",
+                "clientSecret": "7c1d5e9a3b8f2046",
+                "refreshToken": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1LTEifQ.c2ln",
+                "driveType": "resource",
+                "apiBase": "",
+            }),
+            encryption_enabled: true,
+            password: "3Qk9vLpZ2xHnT7wc".into(),
+            volume_enabled: true,
+            volume_size: 300 * 1024 * 1024,
+            volume_strategy: "random".into(),
+            volume_name_format: DEFAULT_VOLUME_NAME_FORMAT.into(),
+            cache_enabled: true,
+        }
+    }
+
+    fn quark_pack() -> DsPack {
+        DsPack {
+            ds_type: "quark".into(),
+            name: "夸克".into(),
+            // Cookie 含 `=`、`;`、空格，落在紧凑字母表之外，走原样字节分支。
+            config: json!({
+                "root": "",
+                "cookie": "__pus=abc; __puus=def; __uid=42",
+                "apiBase": "https://drive.quark.cn/1/clouddrive",
+            }),
+            encryption_enabled: false,
+            password: String::new(),
+            volume_enabled: false,
+            volume_size: crate::registry::DEFAULT_VOLUME_SIZE,
+            volume_strategy: "random".into(),
+            volume_name_format: DEFAULT_VOLUME_NAME_FORMAT.into(),
+            cache_enabled: true,
+        }
+    }
+
+    fn localfs_pack() -> DsPack {        DsPack {
             ds_type: "localfs".into(),
             name: "local".into(),
             config: json!({ "root": "/tmp/safedrive" }),
@@ -379,7 +454,13 @@ mod tests {
 
     #[test]
     fn all_types_roundtrip() {
-        for pack in [baidu_pack(), webdav_pack(), localfs_pack()] {
+        for pack in [
+            baidu_pack(),
+            webdav_pack(),
+            localfs_pack(),
+            aliyun_pack(),
+            quark_pack(),
+        ] {
             let link = encode(&pack).unwrap();
             assert!(link.starts_with(SCHEME), "{link}");
             assert_eq!(decode(&link), Ok(normalized(pack)));

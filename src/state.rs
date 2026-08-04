@@ -121,7 +121,11 @@ impl AppState {
             .registry
             .get(ds_id)
             .ok_or_else(|| ApiError::NotFound(format!("数据源不存在: {ds_id}")))?;
-        adapters::make_with_token_persister(&ds, self.http.clone(), self.baidu_token_persister(&ds))
+        adapters::make_with_token_persister(
+            &ds,
+            self.http.clone(),
+            self.credential_persister(&ds),
+        )
     }
 
     /// `Arc` 版本（下载/上传引擎多任务共享）。
@@ -133,29 +137,26 @@ impl AppState {
         adapters::make_arc_with_token_persister(
             &ds,
             self.http.clone(),
-            self.baidu_token_persister(&ds),
+            self.credential_persister(&ds),
         )
     }
 
-    fn baidu_token_persister(
+    /// 令适配器把刷新出来的令牌 / 轮换后的 Cookie 原子写回注册表。
+    fn credential_persister(
         &self,
         datasource: &crate::registry::DataSource,
-    ) -> Option<crate::adapters::baidupan::TokenPersister> {
-        if datasource.ds_type != "baidupan" {
+    ) -> Option<crate::adapters::CredentialPersister> {
+        if !matches!(
+            datasource.ds_type.as_str(),
+            "baidupan" | "aliyundrive" | "quark"
+        ) {
             return None;
         }
         let state = self.clone();
         let id = datasource.id.clone();
-        Some(Arc::new(
-            move |access_token, refresh_token, access_expires_at| {
-                state.registry.update_baidu_tokens(
-                    &id,
-                    access_token,
-                    refresh_token,
-                    access_expires_at,
-                )
-            },
-        ))
+        Some(Arc::new(move |fields| {
+            state.registry.update_credentials(&id, fields)
+        }))
     }
 
     /// 数据源级目录创建锁（惰性创建）。

@@ -4,6 +4,7 @@ import {
   BarsOutlined,
   ClearOutlined,
   CloudDownloadOutlined,
+  CopyOutlined,
   DeleteOutlined,
   DownOutlined,
   DownloadOutlined,
@@ -43,6 +44,7 @@ import type { ChangeEvent, DragEvent } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { api, streamUrl, uploadFile, type FileCacheStatus, type FsEntry } from '../api/client';
+import CopyModal from '../components/CopyModal';
 import MoveModal from '../components/MoveModal';
 import PreviewModal from '../components/PreviewModal';
 import { useSources } from '../stores/sources';
@@ -131,6 +133,7 @@ export default function BrowserPage() {
   const [entries, setEntries] = useState<FsEntry[]>([]);
   const [selectedNames, setSelectedNames] = useState<string[]>([]);
   const [moveOpen, setMoveOpen] = useState(false);
+  const [copyOpen, setCopyOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const dragDepth = useRef(0);
@@ -703,6 +706,9 @@ export default function BrowserPage() {
           <Button size="small" icon={<ExportOutlined />} onClick={() => setMoveOpen(true)}>
             移动到…
           </Button>
+          <Button size="small" icon={<CopyOutlined />} onClick={() => setCopyOpen(true)}>
+            复制到…
+          </Button>
           <Button size="small" danger icon={<DeleteOutlined />} onClick={batchDeleteAction}>
             删除
           </Button>
@@ -910,6 +916,18 @@ export default function BrowserPage() {
           names={selectedNames}
           onClose={() => setMoveOpen(false)}
           onMoved={() => void refresh()}
+        />
+      )}
+
+      {copyOpen && (
+        <CopyModal
+          dsId={dsId}
+          sourceDir={curPath}
+          items={entries
+            .filter((e) => selectedNames.includes(e.name))
+            .map((e) => ({ name: e.name, size: e.size, isDir: e.isDir }))}
+          onClose={() => setCopyOpen(false)}
+          onCopied={() => void refresh()}
         />
       )}
 

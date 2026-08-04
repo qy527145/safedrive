@@ -1,5 +1,7 @@
+mod aliyun_qr;
 mod baidu_qr;
 mod bits;
+pub mod copy;
 pub mod ds;
 mod ds_codec;
 pub mod files;
@@ -22,10 +24,12 @@ pub fn router(state: AppState) -> Router {
         .route("/login", post(auth::login));
 
     let protected = Router::new()
+        .merge(aliyun_qr::routes())
         .merge(baidu_qr::routes())
         .merge(ds::routes())
         .merge(system::routes())
         .merge(files::api_routes())
+        .merge(copy::routes())
         .merge(share::routes())
         .layer(middleware::from_fn_with_state(
             state.clone(),

@@ -312,7 +312,7 @@ fn upload_slots_for(key: u64, threads: usize) -> Arc<tokio::sync::Semaphore> {
     Arc::clone(&entry.1)
 }
 
-pub type TokenPersister = Arc<dyn Fn(&str, &str, u64) -> ApiResult<()> + Send + Sync>;
+pub type TokenPersister = super::CredentialPersister;
 
 const TOKEN_REFRESH_SKEW_SECS: u64 = 60;
 const DEFAULT_ACCESS_TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
@@ -874,7 +874,11 @@ impl BaiduPanFs {
             .unwrap_or(DEFAULT_ACCESS_TOKEN_TTL_SECS);
         let access_expires_at = now.saturating_add(access_ttl);
         if let Some(persist) = &self.persist_tokens {
-            persist(&access, &refresh, access_expires_at)?;
+            persist(vec![
+                ("accessToken".into(), access.clone().into()),
+                ("refreshToken".into(), refresh.clone().into()),
+                ("accessTokenExpiresAt".into(), access_expires_at.into()),
+            ])?;
         }
         tokens.access_token = access.clone();
         tokens.refresh_token = refresh;
@@ -3096,9 +3100,19 @@ mod tests {
 
         let persisted = Arc::new(StdMutex::new(None));
         let persisted_for_callback = Arc::clone(&persisted);
-        let persister: TokenPersister = Arc::new(move |access, refresh, access_expires| {
-            *persisted_for_callback.lock().unwrap() =
-                Some((access.to_owned(), refresh.to_owned(), access_expires));
+        let persister: TokenPersister = Arc::new(move |fields| {
+            let field = |key: &str| {
+                fields
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or(Value::Null)
+            };
+            *persisted_for_callback.lock().unwrap() = Some((
+                field("accessToken").as_str().unwrap_or_default().to_owned(),
+                field("refreshToken").as_str().unwrap_or_default().to_owned(),
+                field("accessTokenExpiresAt").as_u64().unwrap_or_default(),
+            ));
             Ok(())
         });
         let fs =

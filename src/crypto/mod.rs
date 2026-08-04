@@ -313,7 +313,7 @@ mod tests {
         assert!(prp.index_of("zz").is_none(), "非 hex");
         // 4 字符名反解落在 0..256 的必然被拒（那是 2 字符域的序号）
         let short_idx = (0..256).map(|i| prp.name_of(i)).next().unwrap();
-        assert!(prp.index_of(&format!("{short_idx}{short_idx}")).is_none() || true); // 不 panic 即可
+        let _ = prp.index_of(&format!("{short_idx}{short_idx}")); // 不 panic 即可
 
         // 不同密码 → 不同置换
         assert_ne!(gen_chunk_names(&gen_secret(), 10), gen_chunk_names(&pw, 10));

@@ -1398,6 +1398,13 @@ impl UploadProgress {
             network: Some(network),
         }
     }
+    /// 记一笔「存储端已确认接收」的增量，顺带喂给全局网速统计。
+    pub fn record_uploaded(&self, bytes: u64) {
+        self.uploaded.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(network) = &self.network {
+            network.upload(bytes);
+        }
+    }
 }
 
 /// 已封口但仍在等待存储端响应的最大分卷数。允许少量重叠可隐藏 WebDAV
@@ -1553,10 +1560,7 @@ where
                 let st = Arc::clone(&storage);
                 let uploaded = Arc::clone(&progress);
                 let on_upload: crate::adapters::ProgressFn = Arc::new(move |n| {
-                    uploaded.uploaded.fetch_add(n, Ordering::Relaxed);
-                    if let Some(network) = &uploaded.network {
-                        network.upload(n);
-                    }
+                    uploaded.record_uploaded(n);
                 });
                 let handle = tokio::spawn(async move {
                     st.put_sized_tracked(&obj_path, cap, ReceiverStream::new(rx).boxed(), on_upload)

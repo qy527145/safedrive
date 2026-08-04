@@ -108,11 +108,64 @@ fn validate(body: &DsBody) -> ApiResult<()> {
                 .get("root")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if root.contains("..") || root.contains('\\') {
-                return Err(ApiError::BadRequest("百度网盘根目录非法".into()));
+            check_root(root, "百度网盘")?;
+        }
+        "aliyundrive" => {
+            let text = config_text(body);
+            for (key, label) in [
+                ("clientId", "client_id"),
+                ("clientSecret", "client_secret"),
+                ("refreshToken", "refresh_token（请先扫码授权）"),
+            ] {
+                if text(key).is_empty() {
+                    return Err(ApiError::BadRequest(format!("阿里云盘需要 {label}")));
+                }
             }
+            // 盘位决定用哪个 *_drive_id，写错了会一直查不到盘。
+            if !matches!(text("driveType"), "" | "default" | "resource" | "backup") {
+                return Err(ApiError::BadRequest(
+                    "阿里云盘盘位只能是 default / resource / backup".into(),
+                ));
+            }
+            check_root(text("root"), "阿里云盘")?;
+            check_api_base(text("apiBase"), "阿里云盘")?;
+        }
+        "quark" => {
+            let text = config_text(body);
+            if text("cookie").is_empty() {
+                return Err(ApiError::BadRequest("夸克网盘需要 Cookie".into()));
+            }
+            check_root(text("root"), "夸克网盘")?;
+            check_api_base(text("apiBase"), "夸克网盘")?;
         }
         other => return Err(ApiError::BadRequest(format!("未知数据源类型: {other}"))),
+    }
+    Ok(())
+}
+
+fn config_text<'a>(body: &'a DsBody) -> impl Fn(&str) -> &'a str {
+    move |key: &str| {
+        body.config
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+    }
+}
+
+/// 网盘根目录是相对网盘根的明文路径片段，别让它爬出授权范围。
+fn check_root(root: &str, what: &str) -> ApiResult<()> {
+    if root.contains("..") || root.contains('\\') {
+        return Err(ApiError::BadRequest(format!("{what}根目录非法")));
+    }
+    Ok(())
+}
+
+/// 自定义接口地址留空即用默认值，填了就必须是 http(s)。
+fn check_api_base(base: &str, what: &str) -> ApiResult<()> {
+    let ok = base.is_empty() || base.starts_with("http://") || base.starts_with("https://");
+    if !ok {
+        return Err(ApiError::BadRequest(format!("{what}接口地址必须是 http(s)")));
     }
     Ok(())
 }
@@ -499,6 +552,63 @@ mod tests {
         // 再导入一次：继续顺延序号
         let (_, third) = send(&app, "POST", "/api/ds/import", Some(import)).await;
         assert_eq!(third["name"], "我的空间 (3)");
+    }
+
+    /// 两个新驱动的配置校验：缺凭证、盘位写错、根目录越界、接口地址非法都要拦下；
+    /// 填全了能落库（创建过程不连网，只校验 + 写注册表）。
+    #[tokio::test]
+    async fn new_driver_configs_are_validated() {
+        let (_state, app, _dir) = setup();
+        let body = |ds_type: &str, config: serde_json::Value| {
+            serde_json::json!({
+                "name": "新盘", "type": ds_type, "config": config,
+                "encryptionEnabled": false, "volumeEnabled": false, "cacheEnabled": false,
+            })
+        };
+        // 基准配置 + 逐项改坏，确保拦的是被改的那一项。
+        let patched = |base: serde_json::Value, patch: serde_json::Value| {
+            let mut config = base;
+            for (key, value) in patch.as_object().expect("patch 是对象") {
+                config[key.as_str()] = value.clone();
+            }
+            config
+        };
+        let aliyun_base = serde_json::json!({
+            "root": "/safedrive", "clientId": "cid", "clientSecret": "csec",
+            "refreshToken": "rt", "driveType": "resource", "apiBase": "",
+        });
+        let quark_base =
+            serde_json::json!({ "root": "safedrive", "cookie": "__pus=a; __puus=b", "apiBase": "" });
+
+        for (ds_type, base, patch, expect) in [
+            ("aliyundrive", &aliyun_base, serde_json::json!({ "clientId": "  " }), "client_id"),
+            ("aliyundrive", &aliyun_base, serde_json::json!({ "clientSecret": "" }), "client_secret"),
+            ("aliyundrive", &aliyun_base, serde_json::json!({ "refreshToken": "" }), "refresh_token"),
+            ("aliyundrive", &aliyun_base, serde_json::json!({ "driveType": "vault" }), "盘位"),
+            ("aliyundrive", &aliyun_base, serde_json::json!({ "root": "../别人的盘" }), "根目录非法"),
+            ("aliyundrive", &aliyun_base, serde_json::json!({ "apiBase": "ftp://x" }), "http(s)"),
+            ("quark", &quark_base, serde_json::json!({ "cookie": " " }), "Cookie"),
+            ("quark", &quark_base, serde_json::json!({ "root": "a\\b" }), "根目录非法"),
+            ("quark", &quark_base, serde_json::json!({ "apiBase": "drive.quark.cn" }), "http(s)"),
+        ] {
+            let config = patched(base.clone(), patch.clone());
+            let (status, resp) = send(&app, "POST", "/api/ds", Some(body(ds_type, config))).await;
+            assert_eq!(status, 400, "{ds_type} {patch} 应被拒绝: {resp}");
+            let message = resp["error"].as_str().unwrap_or_default();
+            assert!(message.contains(expect), "{ds_type} {patch} → {message}");
+        }
+
+        // 盘位留空 = 默认盘；夸克根目录可为空（即网盘根）。
+        for (ds_type, config) in [
+            ("aliyundrive", patched(aliyun_base.clone(), serde_json::json!({ "driveType": "" }))),
+            ("aliyundrive", aliyun_base.clone()),
+            ("quark", patched(quark_base.clone(), serde_json::json!({ "root": "" }))),
+            ("quark", quark_base.clone()),
+        ] {
+            let (status, created) = send(&app, "POST", "/api/ds", Some(body(ds_type, config))).await;
+            assert_eq!(status, 200, "{ds_type} {created}");
+            assert_eq!(created["type"], ds_type);
+        }
     }
 
     #[tokio::test]

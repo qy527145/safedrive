@@ -27,7 +27,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::vault::CachedNode;
 
-const PLAIN_VOLUME_SUFFIX: &str = ".__safedrive_volumes__";
+pub(crate) const PLAIN_VOLUME_SUFFIX: &str = ".__safedrive_volumes__";
 
 pub(crate) fn parent_and_name(path: &str) -> (&str, &str) {
     path.rsplit_once('/').unwrap_or(("", path))
@@ -64,7 +64,7 @@ fn volume_plan(total: u64, enabled: bool, max: u64, strategy: &str) -> Vec<u64> 
     (0..count).map(|i| max - (cuts[i + 1] - cuts[i])).collect()
 }
 
-fn volume_names(format: &str, source: &str, count: usize) -> Vec<String> {
+pub(crate) fn volume_names(format: &str, source: &str, count: usize) -> Vec<String> {
     let width = count.max(1).to_string().len().max(2);
     (0..count)
         .map(|i| {
@@ -94,7 +94,7 @@ pub(crate) async fn plain_locate(
     Err(ApiError::NotFound(format!("路径不存在: {path}")))
 }
 
-async fn ensure_plain_dir(storage: &dyn crate::adapters::Storage, path: &str) -> ApiResult<()> {
+pub(crate) async fn ensure_plain_dir(storage: &dyn crate::adapters::Storage, path: &str) -> ApiResult<()> {
     if path.is_empty() {
         return Ok(());
     }
@@ -167,7 +167,7 @@ impl Resolved {
 }
 
 /// 根「节点」：数据源根目录（无 nc，秘密即 FK_root）。
-fn resolve_root(state: &AppState, ds: &str) -> ApiResult<Resolved> {
+pub(crate) fn resolve_root(state: &AppState, ds: &str) -> ApiResult<Resolved> {
     let mut candidates = state.root_key_candidates_of(ds)?;
     let fk = candidates.remove(0);
     Ok(Resolved {
@@ -645,7 +645,7 @@ pub(crate) async fn mkdir_path(
 /// 全程持有数据源级 mkdir 锁：「云端判存 → mkdir」必须互斥，否则并发
 /// 上传同一文件夹会各自判到「不存在」、各建一个解密后同名的加密目录。
 /// 判存走 find_child（fresh list），不信缓存。
-async fn ensure_dir(
+pub(crate) async fn ensure_dir(
     state: &AppState,
     storage: &dyn crate::adapters::Storage,
     ds: &str,

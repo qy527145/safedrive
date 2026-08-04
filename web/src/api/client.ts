@@ -3,10 +3,12 @@
  * 路径打交道 —— 这是一个普通 CRUD 客户端。
  */
 
+export type DsType = 'localfs' | 'webdav' | 'baidupan' | 'aliyundrive' | 'quark';
+
 export interface DsRecord {
   id: string;
   name: string;
-  type: 'localfs' | 'webdav' | 'baidupan';
+  type: DsType;
   config: DsConfig;
   encryptionEnabled: boolean;
   password: string;
@@ -66,8 +68,31 @@ export interface DsConfig {
   refreshToken?: string;
   accessTokenExpiresAt?: number;
   shareApiBase?: string;
+  /** 阿里云盘：resource（资源盘）/ backup（备份盘） */
+  driveType?: string;
+  /** 阿里云盘：开放平台接口地址，留空用默认 */
+  apiBase?: string;
+  driveId?: string;
+  /** 夸克网盘：浏览器 Cookie 全串 */
+  cookie?: string;
 }
 export type DsInput = Omit<DsRecord, 'id' | 'createdAt' | 'password'> & { password?: string };
+
+/** 一次跨数据源复制的成绩单。mode 直接决定 UI 上说「秒传」还是「普通传输」。 */
+export interface CopyReport {
+  mode: 'rapid' | 'transfer' | 'mixed' | 'empty';
+  files: number;
+  dirs: number;
+  /** 云端直接引用、零字节落地的分卷数 */
+  rapidVolumes: number;
+  /** 真实搬了字节的分卷数 */
+  transferredVolumes: number;
+  rapidBytes: number;
+  transferredBytes: number;
+  /** 因为源/目标加密设置不同而解密重加密的文件数 */
+  reencryptedFiles: number;
+  skipped: string[];
+}
 
 export interface FileCacheStatus {
   cached: boolean;
@@ -181,6 +206,20 @@ export const api = {
       { method: 'POST', body: JSON.stringify({ sign, gid }) },
     ),
 
+  // ---- 阿里云盘扫码授权（自动获取 refreshToken） ----
+  aliyunQrCreate: (app: { clientId: string; clientSecret: string; apiBase?: string }) =>
+    request<{ qrCodeUrl: string; sid: string; img: string }>('/api/aliyun/qrcode', {
+      method: 'POST',
+      body: JSON.stringify(app),
+    }),
+  aliyunQrPoll: (app: { clientId: string; clientSecret: string; apiBase?: string; sid: string }) =>
+    request<{
+      status: 'waiting' | 'scanned' | 'confirmed' | 'expired';
+      refreshToken?: string;
+      accessToken?: string;
+      accessTokenExpiresAt?: number;
+    }>('/api/aliyun/qrcode/poll', { method: 'POST', body: JSON.stringify(app) }),
+
   getSettings: () => request<TransferSettings>('/api/settings'),
   updateSettings: (body: TransferSettings) =>
     request<TransferSettings>('/api/settings', { method: 'PUT', body: JSON.stringify(body) }),
@@ -208,6 +247,27 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ path }),
     }),
+  /**
+   * 复制（可跨数据源）。两端加密设置一致时逐个分卷原样搬运，能秒传就
+   * 秒传；否则解密重加密。返回的 report 说明实际走了哪条路。
+   */
+  copyPath: (
+    ds: string,
+    path: string,
+    destDs: string,
+    destPath: string,
+    opts?: { overwrite?: boolean; progress?: string },
+  ) =>
+    request<{ ok: boolean; report: CopyReport }>(`/api/files/${ds}/copy`, {
+      method: 'POST',
+      body: JSON.stringify({
+        path,
+        destDs,
+        destPath,
+        overwrite: opts?.overwrite ?? false,
+        progress: opts?.progress,
+      }),
+    }).then((r) => r.report),
   deleteForeign: (ds: string, path: string, name: string) =>
     request<{ ok: boolean }>(`/api/files/${ds}/delete-foreign`, {
       method: 'POST',

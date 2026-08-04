@@ -37,6 +37,11 @@ impl LocalFs {
 
 #[async_trait]
 impl Storage for LocalFs {
+    /// 本地读不花网络流量：跨源复制可以直接读全量算摘要去试秒传。
+    fn reads_are_free(&self) -> bool {
+        true
+    }
+
     async fn list(&self, path: &str) -> ApiResult<Vec<Entry>> {
         let dir = self.resolve(path);
         let mut rd = tokio::fs::read_dir(&dir).await?;

@@ -2,14 +2,16 @@ import { create } from 'zustand';
 
 export interface TransferTask {
   id: string;
-  kind: 'upload' | 'download';
+  kind: 'upload' | 'download' | 'copy';
   name: string;
   dsName: string;
   totalBytes: number;
-  /** 本地维度：上传 = 已加密/分卷的字节；下载 = 已接收字节 */
+  /** 本地维度：上传 = 已加密/分卷的字节；下载 = 已接收字节；复制 = 已读出的密文 */
   doneBytes: number;
-  /** 远端维度（仅上传）：存储端已确认接收的字节 */
+  /** 远端维度（上传/复制）：存储端已确认接收的字节 */
   uploadedBytes: number;
+  /** 结果备注：跨源复制用它说明实际走的是秒传还是普通传输 */
+  note?: string;
   status: 'queued' | 'running' | 'done' | 'error' | 'canceled';
   error?: string;
 }
@@ -132,4 +134,9 @@ export function taskProgress(id: string, done: number) {
 /** 上传远端维度：存储端已确认接收的字节（轮询服务端得来）。 */
 export function taskUploaded(id: string, uploaded: number) {
   useTasks.getState()._patch(id, { uploadedBytes: uploaded });
+}
+
+/** 结果备注（跨源复制：秒传还是普通传输）。 */
+export function taskNote(id: string, note: string) {
+  useTasks.getState()._patch(id, { note });
 }

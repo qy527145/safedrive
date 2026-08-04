@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
 
-/// 数据源记录。`config` 由类型决定（localfs / webdav / baidupan）。
+/// 数据源记录。`config` 由类型决定（localfs / webdav / baidupan / aliyundrive / quark）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataSource {
@@ -103,6 +103,8 @@ impl Registry {
 
     pub fn create(&self, ds: DataSource) -> ApiResult<DataSource> {
         let mut guard = self.inner.lock().unwrap();
+        let mut ds = ds;
+        seed_rotating_secrets(&mut ds);
         guard.push(ds.clone());
         self.save(&guard)?;
         Ok(ds)
@@ -118,39 +120,33 @@ impl Registry {
             id: id.to_string(),
             ..ds
         };
-        preserve_live_baidu_tokens(slot, &mut replacement);
+        preserve_live_credentials(slot, &mut replacement);
+        seed_rotating_secrets(&mut replacement);
         *slot = replacement;
         let saved = slot.clone();
         self.save(&guard)?;
         Ok(saved)
     }
 
-    /// 百度开放平台刷新令牌后原子更新凭证，避免服务重启后退回已经轮换的 refresh token。
-    pub fn update_baidu_tokens(
+    /// 适配器轮换凭证后原子写回 `config`，避免服务重启退回已作废的旧令牌。
+    /// 键即 config 字段名，由适配器自己决定（accessToken / cookie / …）。
+    pub fn update_credentials(
         &self,
         id: &str,
-        access_token: &str,
-        refresh_token: &str,
-        access_token_expires_at: u64,
+        fields: Vec<(String, serde_json::Value)>,
     ) -> ApiResult<()> {
         let mut guard = self.inner.lock().unwrap();
         let datasource = guard
             .iter_mut()
             .find(|datasource| datasource.id == id)
             .ok_or_else(|| ApiError::NotFound(format!("数据源不存在: {id}")))?;
-        if datasource.ds_type != "baidupan" {
-            return Err(ApiError::BadRequest("数据源不是百度网盘".into()));
-        }
         let config = datasource
             .config
             .as_object_mut()
-            .ok_or_else(|| ApiError::BadRequest("百度网盘配置不是对象".into()))?;
-        config.insert("accessToken".into(), access_token.into());
-        config.insert("refreshToken".into(), refresh_token.into());
-        config.insert(
-            "accessTokenExpiresAt".into(),
-            access_token_expires_at.into(),
-        );
+            .ok_or_else(|| ApiError::BadRequest("数据源配置不是对象".into()))?;
+        for (key, value) in fields {
+            config.insert(key, value);
+        }
         self.save(&guard)
     }
 
@@ -184,24 +180,115 @@ impl Registry {
     }
 }
 
-fn preserve_live_baidu_tokens(current: &DataSource, replacement: &mut DataSource) {
-    if current.ds_type != "baidupan" || replacement.ds_type != "baidupan" {
+/// 每种数据源的凭证形态：
+/// - `identity`：改动即代表换账号，运行期缓存的令牌必须作废；
+/// - `rotating`：既是用户填的初值、又会被后台轮换（阿里云盘 refreshToken、
+///   夸克 cookie）。表单回填的可能是轮换后的值，也可能是最初的种子值，
+///   两者都算「没改」，因此额外记一份 `<字段>Seed`；
+/// - `live`：纯运行期产物，跟随 identity 一起保留或丢弃。
+fn credential_spec(
+    ds_type: &str,
+) -> Option<(
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static [&'static str],
+)> {
+    match ds_type {
+        "baidupan" => Some((
+            &["bduss", "clientId", "clientSecret"],
+            &[],
+            &["accessToken", "refreshToken", "accessTokenExpiresAt"],
+        )),
+        "aliyundrive" => Some((
+            &["clientId", "clientSecret"],
+            &["refreshToken"],
+            &["accessToken", "accessTokenExpiresAt", "driveId"],
+        )),
+        "quark" => Some((&[], &["cookie"], &[])),
+        _ => None,
+    }
+}
+
+fn seed_field(field: &str) -> String {
+    format!("{field}Seed")
+}
+
+/// 新建/保存时把轮换字段的当前值记为种子，供后续「用户到底改没改」的判定。
+fn seed_rotating_secrets(datasource: &mut DataSource) {
+    let Some((_, rotating, _)) = credential_spec(&datasource.ds_type) else {
+        return;
+    };
+    let Some(config) = datasource.config.as_object_mut() else {
+        return;
+    };
+    for field in rotating {
+        let seed = seed_field(field);
+        if !config.contains_key(&seed)
+            && let Some(value) = config.get(*field).cloned()
+        {
+            config.insert(seed, value);
+        }
+    }
+}
+
+/// 阿里云盘的盘位（备份盘 / 资源库），缺省视为 default。
+fn drive_type_of(config: &serde_json::Value) -> &str {
+    config
+        .get("driveType")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("default")
+}
+
+/// 保存数据源时保住后台已经轮换出来的凭证 —— 设置页可能是在轮换发生
+/// 之前打开的，直接回写表单里的旧令牌会把账号打挂。
+fn preserve_live_credentials(current: &DataSource, replacement: &mut DataSource) {
+    if current.ds_type != replacement.ds_type {
         return;
     }
-    let identity_fields = ["bduss", "clientId", "clientSecret"];
-    let same_identity = identity_fields
+    let Some((identity, rotating, live)) = credential_spec(&current.ds_type) else {
+        return;
+    };
+    // driveId 是由 driveType 查出来的：换了盘就不能留旧 ID，否则会继续
+    // 读写上一个盘。删掉即可，适配器下次会重新问一遍并回写。
+    let drive_changed = current.ds_type == "aliyundrive"
+        && drive_type_of(&current.config) != drive_type_of(&replacement.config);
+    let same_identity = identity
         .iter()
         .all(|field| current.config.get(field) == replacement.config.get(field));
-    if !same_identity {
-        return;
-    }
+    // 轮换字段：等于当前值或等于种子值都说明用户没动过。
+    let same_rotating = rotating.iter().all(|field| {
+        let submitted = replacement.config.get(*field);
+        submitted.is_none()
+            || submitted == current.config.get(*field)
+            || submitted == current.config.get(seed_field(field).as_str())
+    });
     let Some(target) = replacement.config.as_object_mut() else {
         return;
     };
-    for field in ["accessToken", "refreshToken", "accessTokenExpiresAt"] {
-        if let Some(value) = current.config.get(field) {
-            target.insert(field.into(), value.clone());
+    if !(same_identity && same_rotating) {
+        // 换账号了：连种子一起重置，别把旧账号的令牌带进来。
+        for field in rotating {
+            let seed = seed_field(field);
+            match target.get(*field).cloned() {
+                Some(value) => target.insert(seed, value),
+                None => target.remove(&seed),
+            };
         }
+        return;
+    }
+    for field in rotating.iter().chain(live.iter()) {
+        if let Some(value) = current.config.get(field) {
+            target.insert((*field).into(), value.clone());
+        }
+        let seed = seed_field(field);
+        if let Some(value) = current.config.get(seed.as_str()) {
+            target.insert(seed, value.clone());
+        }
+    }
+    if drive_changed {
+        target.remove("driveId");
     }
 }
 
@@ -260,6 +347,14 @@ mod tests {
         assert_eq!(reg2.get("a").unwrap().id, "a");
     }
 
+    fn baidu_tokens(access: &str, refresh: &str, expires_at: u64) -> Vec<(String, serde_json::Value)> {
+        vec![
+            ("accessToken".into(), access.into()),
+            ("refreshToken".into(), refresh.into()),
+            ("accessTokenExpiresAt".into(), expires_at.into()),
+        ]
+    }
+
     #[test]
     fn refreshed_baidu_tokens_are_persisted() {
         let dir = tempfile::tempdir().unwrap();
@@ -273,7 +368,7 @@ mod tests {
         });
         registry.create(source).unwrap();
         registry
-            .update_baidu_tokens("baidu", "new-access", "new-refresh", 1234)
+            .update_credentials("baidu", baidu_tokens("new-access", "new-refresh", 1234))
             .unwrap();
 
         let reloaded = Registry::load(path).unwrap();
@@ -300,7 +395,7 @@ mod tests {
         });
         registry.create(source.clone()).unwrap();
         registry
-            .update_baidu_tokens("baidu", "new-access", "new-refresh", 1234)
+            .update_credentials("baidu", baidu_tokens("new-access", "new-refresh", 1234))
             .unwrap();
 
         // Simulate a settings form that was opened before the refresh completed.
@@ -313,5 +408,131 @@ mod tests {
         assert_eq!(updated.config["accessToken"], "new-access");
         assert_eq!(updated.config["refreshToken"], "new-refresh");
         assert_eq!(updated.config["accessTokenExpiresAt"], 1234);
+    }
+
+    /// 阿里云盘的 refreshToken 每次刷新都会轮换：表单提交的是打开设置页
+    /// 时的旧值（= 种子值），保存后必须仍然是后台轮换出来的新值。
+    #[test]
+    fn stale_form_cannot_revert_rotated_aliyun_refresh_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("datasources.json");
+        let registry = Registry::load(path.clone()).unwrap();
+        let mut source = ds("ali");
+        source.ds_type = "aliyundrive".into();
+        source.config = serde_json::json!({
+            "clientId": "app",
+            "clientSecret": "secret",
+            "refreshToken": "seed-refresh"
+        });
+        registry.create(source.clone()).unwrap();
+        registry
+            .update_credentials(
+                "ali",
+                vec![
+                    ("accessToken".into(), "fresh-access".into()),
+                    ("refreshToken".into(), "rotated-refresh".into()),
+                ],
+            )
+            .unwrap();
+
+        source.name = "renamed".into();
+        registry.update("ali", source).unwrap();
+
+        let updated = Registry::load(path).unwrap().get("ali").unwrap();
+        assert_eq!(updated.config["refreshToken"], "rotated-refresh");
+        assert_eq!(updated.config["accessToken"], "fresh-access");
+    }
+
+    /// 但用户真的粘贴了一个新的 refreshToken（换账号）时，旧账号的
+    /// access token 必须被丢掉。
+    #[test]
+    fn new_aliyun_refresh_token_discards_old_access_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("datasources.json");
+        let registry = Registry::load(path.clone()).unwrap();
+        let mut source = ds("ali");
+        source.ds_type = "aliyundrive".into();
+        source.config = serde_json::json!({
+            "clientId": "app",
+            "clientSecret": "secret",
+            "refreshToken": "seed-refresh"
+        });
+        registry.create(source.clone()).unwrap();
+        registry
+            .update_credentials(
+                "ali",
+                vec![
+                    ("accessToken".into(), "fresh-access".into()),
+                    ("refreshToken".into(), "rotated-refresh".into()),
+                ],
+            )
+            .unwrap();
+
+        source.config = serde_json::json!({
+            "clientId": "app",
+            "clientSecret": "secret",
+            "refreshToken": "another-account"
+        });
+        registry.update("ali", source).unwrap();
+
+        let updated = Registry::load(path).unwrap().get("ali").unwrap();
+        assert_eq!(updated.config["refreshToken"], "another-account");
+        assert_eq!(updated.config["refreshTokenSeed"], "another-account");
+        assert!(updated.config.get("accessToken").is_none());
+    }
+
+    /// 夸克的 __puus 每次请求都可能轮换，同样不能被设置页回写覆盖。
+    #[test]
+    fn stale_form_cannot_revert_rotated_quark_cookie() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("datasources.json");
+        let registry = Registry::load(path.clone()).unwrap();
+        let mut source = ds("quark");
+        source.ds_type = "quark".into();
+        source.config = serde_json::json!({"cookie": "__puus=old"});
+        registry.create(source.clone()).unwrap();
+        registry
+            .update_credentials("quark", vec![("cookie".into(), "__puus=new".into())])
+            .unwrap();
+
+        source.name = "renamed".into();
+        registry.update("quark", source).unwrap();
+
+        let updated = Registry::load(path).unwrap().get("quark").unwrap();
+        assert_eq!(updated.config["cookie"], "__puus=new");
+    }
+
+    /// 换盘位（备份盘 → 资源库）时缓存的 driveId 必须作废，否则会继续
+    /// 读写上一个盘；轮换出来的令牌则照旧保留（账号没变）。
+    #[test]
+    fn switching_aliyun_drive_type_drops_cached_drive_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("datasources.json");
+        let registry = Registry::load(path.clone()).unwrap();
+        let mut source = ds("ali");
+        source.ds_type = "aliyundrive".into();
+        source.config = serde_json::json!({
+            "clientId": "app",
+            "clientSecret": "secret",
+            "refreshToken": "seed-refresh",
+            "driveType": "default"
+        });
+        registry.create(source.clone()).unwrap();
+        registry
+            .update_credentials(
+                "ali",
+                vec![
+                    ("accessToken".into(), "fresh-access".into()),
+                    ("driveId".into(), "drive-of-default".into()),
+                ],
+            )
+            .unwrap();
+
+        source.config["driveType"] = "resource".into();
+        registry.update("ali", source).unwrap();
+
+        let updated = Registry::load(path).unwrap().get("ali").unwrap();
+        assert!(updated.config.get("driveId").is_none());
+        assert_eq!(updated.config["accessToken"], "fresh-access");
     }
 }

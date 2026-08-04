@@ -281,32 +281,49 @@ async fn move_copy(
     if rel.is_empty() {
         return Ok(StatusCode::FORBIDDEN.into_response());
     }
-    let to = destination_rel(state, ds, headers)?;
+    let (dest_ds, to) = destination_rel(state, headers)?;
     // Overwrite 头缺省为 T（RFC 4918）
     let overwrite = headers
         .get("overwrite")
         .and_then(|v| v.to_str().ok())
         .map(|v| !v.eq_ignore_ascii_case("f"))
         .unwrap_or(true);
-    let storage = state.adapter(&ds.id)?;
-    let existed = match files::stat_path(state, storage.as_ref(), &ds.id, &to).await {
+    let cross = dest_ds.id != ds.id;
+    let dest_storage = state.adapter(&dest_ds.id)?;
+    let existed = match files::stat_path(state, dest_storage.as_ref(), &dest_ds.id, &to).await {
         Ok(_) => true,
         Err(ApiError::NotFound(_)) => false,
         Err(e) => return Err(e),
     };
-    if existed {
-        if !overwrite {
-            return Ok(StatusCode::PRECONDITION_FAILED.into_response());
+    if existed && !overwrite {
+        return Ok(StatusCode::PRECONDITION_FAILED.into_response());
+    }
+
+    if cross {
+        // 跨数据源：走保密钥复制（同为加密时逐卷原样搬运，能秒传就秒传）。
+        // MOVE = 复制成功后再删源，失败则源原样保留。
+        crate::routes::copy::copy_path(state, &ds.id, rel, &dest_ds.id, &to, overwrite, None)
+            .await?;
+        if is_move {
+            let storage = state.adapter(&ds.id)?;
+            files::delete_path(state, storage.as_ref(), &ds.id, rel).await?;
         }
-        if to != rel {
-            files::delete_path(state, storage.as_ref(), &ds.id, &to).await?;
-        }
+        return Ok(if existed {
+            StatusCode::NO_CONTENT.into_response()
+        } else {
+            StatusCode::CREATED.into_response()
+        });
+    }
+
+    let storage = state.adapter(&ds.id)?;
+    if existed && to != rel {
+        files::delete_path(state, storage.as_ref(), &ds.id, &to).await?;
     }
     if is_move {
         files::rename_path(state, storage.as_ref(), &ds.id, rel, &to).await?;
     } else {
-        // COPY：只支持文件 —— 服务端解密回源再重加密写入（目录递归复制
-        // 对分卷云端过重，客户端可自行递归）。
+        // 同源 COPY：只支持文件 —— 服务端解密回源再重加密写入（同一数据源
+        // 内内容密钥必须换新，没法原样搬运；目录递归对分卷云端过重）。
         let src = files::stat_path(state, storage.as_ref(), &ds.id, rel).await?;
         if src.is_dir {
             return Ok(StatusCode::FORBIDDEN.into_response());
@@ -339,8 +356,9 @@ async fn move_copy(
     })
 }
 
-/// 解析 Destination 头 → 同数据源内的明文相对路径。
-fn destination_rel(state: &AppState, ds: &DataSource, headers: &HeaderMap) -> ApiResult<String> {
+/// 解析 Destination 头 → (目标数据源, 明文相对路径)。目标数据源可以与源
+/// 不同 —— 跨源移动/复制由 copy_path 承接。
+fn destination_rel(state: &AppState, headers: &HeaderMap) -> ApiResult<(DataSource, String)> {
     let raw = headers
         .get("destination")
         .and_then(|v| v.to_str().ok())
@@ -361,14 +379,13 @@ fn destination_rel(state: &AppState, ds: &DataSource, headers: &HeaderMap) -> Ap
         .strip_prefix("/dav/")
         .ok_or_else(|| ApiError::BadRequest("Destination 必须位于 /dav/ 下".into()))?;
     let (seg, to) = rest.split_once('/').unwrap_or((rest, ""));
-    if find_ds(state, seg).map(|d| d.id) != Some(ds.id.clone()) {
-        return Err(ApiError::BadRequest("不支持跨数据源移动/复制".into()));
-    }
+    let dest_ds = find_ds(state, seg)
+        .ok_or_else(|| ApiError::BadRequest(format!("Destination 数据源不存在: {seg}")))?;
     let to = sanitize(to)?;
     if to.is_empty() {
         return Err(ApiError::BadRequest("Destination 不能是数据源根".into()));
     }
-    Ok(to)
+    Ok((dest_ds, to))
 }
 
 // ---------------- 响应构造 ----------------
@@ -677,6 +694,86 @@ mod tests {
         let (st, _, body) = send(&app, "GET", "/dav/cloud/note.txt", &[], b"").await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(body, b"hello");
+    }
+
+    /// 跨数据源 COPY / MOVE：Destination 指向另一个 /dav/<数据源>，
+    /// 走保密钥复制；MOVE 复制成功后才删源。
+    #[tokio::test]
+    async fn webdav_cross_datasource_copy_and_move() {
+        let (state, app, dir) = setup(true, None);
+        let second = dir.path().join("backup");
+        std::fs::create_dir_all(&second).unwrap();
+        state
+            .registry
+            .create(DataSource {
+                id: "ds2".into(),
+                name: "backup".into(),
+                // 另一个根密码：目标必须用自己的 FK 重编信封名。
+                password: "other-pw".into(),
+                config: serde_json::json!({ "root": second.to_str().unwrap() }),
+                ..datasource(true, "")
+            })
+            .unwrap();
+
+        let (st, ..) = send(
+            &app,
+            "PUT",
+            "/dav/cloud/a.bin",
+            &[("Content-Length", "5")],
+            b"hello",
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+
+        // COPY：源保留，目标可读。
+        let (st, ..) = send(
+            &app,
+            "COPY",
+            "/dav/cloud/a.bin",
+            &[("Destination", "/dav/backup/copied.bin")],
+            b"",
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let (_, _, body) = send(&app, "GET", "/dav/backup/copied.bin", &[], b"").await;
+        assert_eq!(body, b"hello");
+        let (st, ..) = send(&app, "GET", "/dav/cloud/a.bin", &[], b"").await;
+        assert_eq!(st, StatusCode::OK, "COPY 不能动源");
+
+        // MOVE：源必须消失。
+        let (st, ..) = send(
+            &app,
+            "MOVE",
+            "/dav/cloud/a.bin",
+            &[("Destination", "/dav/backup/moved.bin")],
+            b"",
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let (_, _, body) = send(&app, "GET", "/dav/backup/moved.bin", &[], b"").await;
+        assert_eq!(body, b"hello");
+        let (st, ..) = send(&app, "GET", "/dav/cloud/a.bin", &[], b"").await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "MOVE 必须删源");
+
+        // Overwrite: F 且目标已存在 → 412
+        let (st, ..) = send(
+            &app,
+            "COPY",
+            "/dav/backup/moved.bin",
+            &[("Destination", "/dav/cloud/copied.bin"), ("Overwrite", "F")],
+            b"",
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let (st, ..) = send(
+            &app,
+            "COPY",
+            "/dav/backup/moved.bin",
+            &[("Destination", "/dav/cloud/copied.bin"), ("Overwrite", "F")],
+            b"",
+        )
+        .await;
+        assert_eq!(st, StatusCode::PRECONDITION_FAILED);
     }
 
     /// 设了管理密码时：无凭证 → 401 + WWW-Authenticate；Basic 密码正确 → 放行。

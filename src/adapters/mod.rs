@@ -1,5 +1,7 @@
+pub mod aliyundrive;
 pub mod baidupan;
 pub mod localfs;
+pub mod quark;
 pub mod webdav;
 
 use async_trait::async_trait;
@@ -76,6 +78,50 @@ impl RangeRead {
 
 /// 上传进度回调：报告「已确认写入上游」的**增量**字节数。
 pub type ProgressFn = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
+
+/// 适配器把运行期轮换出来的凭证原子写回注册表。键就是 `datasources.json`
+/// 里 `config` 的字段名（accessToken / refreshToken / cookie …）。
+pub type CredentialPersister =
+    Arc<dyn Fn(Vec<(String, serde_json::Value)>) -> ApiResult<()> + Send + Sync>;
+
+/// 秒传要用的内容摘要种类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashKind {
+    Sha1,
+    Md5,
+}
+
+/// 对象内容摘要（小写十六进制）。跨数据源秒传的唯一凭据。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentHashes {
+    pub sha1: Option<String>,
+    pub md5: Option<String>,
+}
+
+impl ContentHashes {
+    pub fn get(&self, kind: HashKind) -> Option<&str> {
+        match kind {
+            HashKind::Sha1 => self.sha1.as_deref(),
+            HashKind::Md5 => self.md5.as_deref(),
+        }
+    }
+
+    /// 是否已经凑齐 `kinds` 要求的全部摘要。
+    pub fn covers(&self, kinds: &[HashKind]) -> bool {
+        !kinds.is_empty() && kinds.iter().all(|kind| self.get(*kind).is_some())
+    }
+}
+
+/// 秒传取数口：目标适配器只按需读极少量原文（pre_hash 头 1 KiB、
+/// proof_code 8 字节），全量字节永远不经过它。
+#[async_trait]
+pub trait RapidSource: Send + Sync {
+    fn size(&self) -> u64;
+    /// 已知摘要；缺的那部分由调用方在真正需要时补算。
+    fn hashes(&self) -> &ContentHashes;
+    /// 读取 `[offset, offset+len)`，必须恰好返回 `len` 字节。
+    async fn read_at(&self, offset: u64, len: u64) -> ApiResult<bytes::Bytes>;
+}
 
 /// Per-client-stream diagnostics populated by adapters while Range requests
 /// are active. The engine snapshots these counters in its final summary log.
@@ -211,17 +257,166 @@ pub trait Storage: Send + Sync {
         });
         self.put_sized(path, size, counted.boxed()).await
     }
+
+    // ---- 秒传（跨数据源复制专用；不支持的适配器用默认实现即可） ----
+
+    /// 读取该对象是否零成本（本地磁盘）。为 true 时调用方可以放心地
+    /// 直接读全量算摘要，不必先落盘缓存。
+    fn reads_are_free(&self) -> bool {
+        false
+    }
+    /// 目录内各对象的内容摘要 —— 一次 list 全拿到（阿里云盘列表自带
+    /// content_hash）。拿得到就等于免费凑齐了秒传凭据。键是存储端条目名。
+    async fn dir_content_hashes(
+        &self,
+        _dir: &str,
+    ) -> ApiResult<std::collections::HashMap<String, ContentHashes>> {
+        Ok(std::collections::HashMap::new())
+    }
+    /// 秒传需要的摘要种类；**空切片 = 该数据源不支持秒传**。
+    fn rapid_hash_kinds(&self) -> &'static [HashKind] {
+        &[]
+    }
+    /// 廉价预检（阿里云盘 pre_hash：只看头 1 KiB）。返回 `Ok(false)` 表示
+    /// 秒传必然落空，调用方可以省掉全量摘要计算直接走真实传输。
+    async fn rapid_precheck(&self, _path: &str, _source: &dyn RapidSource) -> ApiResult<bool> {
+        Ok(true)
+    }
+    /// 凭摘要把 `path` 秒传出来。`Ok(false)` = 云端没有该内容，未写入任何
+    /// 东西，调用方降级为真实传输。
+    async fn rapid_put(&self, _path: &str, _source: &dyn RapidSource) -> ApiResult<bool> {
+        Ok(false)
+    }
+}
+
+/// 上传落盘缓冲：必须先算全量摘要、或需要可重放分片的上游，用它把请求体
+/// 写到临时文件；析构即删除。
+pub(crate) struct TempSpool {
+    pub(crate) path: std::path::PathBuf,
+}
+
+impl TempSpool {
+    pub(crate) fn new(tag: &str) -> Self {
+        Self {
+            path: std::env::temp_dir().join(format!(
+                "safedrive-{tag}-{}.upload",
+                uuid::Uuid::new_v4().simple()
+            )),
+        }
+    }
+}
+
+impl Drop for TempSpool {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// 把流落盘并顺带算出秒传要的摘要（只算 `kinds` 里点名的那几种）。
+pub(crate) async fn spool_with_hashes(
+    tag: &str,
+    size: u64,
+    mut body: ByteStream,
+    kinds: &[HashKind],
+) -> ApiResult<(TempSpool, ContentHashes)> {
+    use futures_util::StreamExt;
+    use md5::Digest as _;
+    use tokio::io::AsyncWriteExt;
+
+    let spool = TempSpool::new(tag);
+    let file = tokio::fs::File::create(&spool.path).await?;
+    let mut file = tokio::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut sha1 = kinds.contains(&HashKind::Sha1).then(sha1::Sha1::new);
+    let mut md5 = kinds.contains(&HashKind::Md5).then(md5::Md5::new);
+    let mut received = 0u64;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        received = received.saturating_add(chunk.len() as u64);
+        if received > size {
+            return Err(ApiError::BadRequest("上传数据超过声明大小".into()));
+        }
+        file.write_all(&chunk).await?;
+        if let Some(hasher) = sha1.as_mut() {
+            hasher.update(&chunk);
+        }
+        if let Some(hasher) = md5.as_mut() {
+            hasher.update(&chunk);
+        }
+    }
+    file.flush().await?;
+    drop(file);
+    if received != size {
+        return Err(ApiError::BadRequest(format!(
+            "上传数据大小不匹配: 声明 {size}，实际 {received}"
+        )));
+    }
+    Ok((
+        spool,
+        ContentHashes {
+            sha1: sha1.map(|h| hex::encode(h.finalize())),
+            md5: md5.map(|h| hex::encode(h.finalize())),
+        },
+    ))
+}
+
+/// 读取落盘缓冲的一个区间（分片上传 / proof_code 取样）。
+pub(crate) async fn read_spool(
+    path: &std::path::Path,
+    offset: u64,
+    len: usize,
+) -> ApiResult<bytes::Bytes> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = tokio::fs::File::open(path).await?;
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    let mut buf = vec![0u8; len];
+    file.read_exact(&mut buf).await?;
+    Ok(bytes::Bytes::from(buf))
+}
+
+/// 流式算摘要，字节读完即丢。跨数据源复制在「源侧读廉价」时用它补齐
+/// 秒传凭据。
+pub(crate) async fn hash_stream(mut body: ByteStream, kinds: &[HashKind]) -> ApiResult<ContentHashes> {
+    use futures_util::StreamExt;
+    use md5::Digest as _;
+
+    let mut sha1 = kinds.contains(&HashKind::Sha1).then(sha1::Sha1::new);
+    let mut md5 = kinds.contains(&HashKind::Md5).then(md5::Md5::new);
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        if let Some(hasher) = sha1.as_mut() {
+            hasher.update(&chunk);
+        }
+        if let Some(hasher) = md5.as_mut() {
+            hasher.update(&chunk);
+        }
+    }
+    Ok(ContentHashes {
+        sha1: sha1.map(|h| hex::encode(h.finalize())),
+        md5: md5.map(|h| hex::encode(h.finalize())),
+    })
 }
 
 pub fn make_with_token_persister(
     ds: &DataSource,
     http: reqwest::Client,
-    persist_tokens: Option<baidupan::TokenPersister>,
+    persist_tokens: Option<CredentialPersister>,
 ) -> ApiResult<Box<dyn Storage>> {
     match ds.ds_type.as_str() {
         "localfs" => Ok(Box::new(localfs::LocalFs::from_config(&ds.config)?)),
         "webdav" => Ok(Box::new(webdav::WebdavFs::from_config(&ds.config, http)?)),
         "baidupan" => Ok(Box::new(baidupan::BaiduPanFs::from_config_with_persister(
+            &ds.config,
+            http,
+            persist_tokens,
+        )?)),
+        "aliyundrive" => Ok(Box::new(
+            aliyundrive::AliyunDriveFs::from_config_with_persister(
+                &ds.config,
+                http,
+                persist_tokens,
+            )?,
+        )),
+        "quark" => Ok(Box::new(quark::QuarkFs::from_config_with_persister(
             &ds.config,
             http,
             persist_tokens,
@@ -233,7 +428,7 @@ pub fn make_with_token_persister(
 pub fn make_arc_with_token_persister(
     ds: &DataSource,
     http: reqwest::Client,
-    persist_tokens: Option<baidupan::TokenPersister>,
+    persist_tokens: Option<CredentialPersister>,
 ) -> ApiResult<std::sync::Arc<dyn Storage>> {
     Ok(std::sync::Arc::from(make_with_token_persister(
         ds,
