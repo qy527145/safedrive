@@ -28,8 +28,9 @@ use crate::crypto::names::{NameMeta, decode_name, encode_name};
 use crate::engine;
 use crate::error::{ApiError, ApiResult};
 use crate::routes::files::{
-    PLAIN_VOLUME_SUFFIX, ensure_dir, ensure_plain_dir, join_enc, list_dir, mkdir_path,
-    parent_and_name, plain_locate, resolve, resolve_root, stat_path, upload_file, volume_names,
+    Located, PLAIN_VOLUME_SUFFIX, ensure_dir, ensure_plain_dir, join_enc, list_dir, locate_any,
+    mkdir_path, parent_and_name, plain_locate, resolve, resolve_root, stat_path, upload_file,
+    volume_names,
 };
 use crate::state::AppState;
 use crate::vault::CachedNode;
@@ -621,11 +622,6 @@ pub(crate) async fn copy_path(
 
     let src_storage = state.adapter_arc(src_ds)?;
     let entry = stat_path(state, src_storage.as_ref(), src_ds, src_path).await?;
-    if entry.foreign {
-        return Err(ApiError::BadRequest(format!(
-            "{src_path} 是解不开信封的外来条目，无法复制"
-        )));
-    }
 
     // 目录复制的总量要遍历整棵树才知道，不值当多跑一轮 list：total 记 0，
     // 前端按「已传字节」显示即可。
@@ -651,6 +647,34 @@ pub(crate) async fn copy_path(
             .insert(id.to_string(), Arc::clone(&progress));
     }
     let _progress_guard = ProgressGuard(state, progress_id.map(str::to_owned));
+
+    // 外来（明文）对象：整棵按字面存储路径直传，落地仍是外来条目——不纳管、
+    // 不加解密（受管条目才走保留文件密钥的信封搬运）。
+    if entry.foreign {
+        let src_enc = match locate_any(state, src_storage.as_ref(), src_ds, src_path).await? {
+            Located::Foreign { enc_path, .. } => enc_path,
+            // stat_path 已判为外来，不会走到这
+            Located::Managed(_) => {
+                return Err(ApiError::Internal(anyhow::anyhow!("外来判定不一致")));
+            }
+        };
+        let dst_storage = state.adapter_arc(dst_ds)?;
+        let (dst_parent, leaf) = parent_and_name(dst_path);
+        let dst_parent_enc =
+            ensure_dest_parent_enc(state, dst_storage.as_ref(), dst_ds, dst_parent).await?;
+        return copy_foreign_node(
+            state,
+            src_ds,
+            &src_enc,
+            entry.is_dir,
+            entry.size,
+            dst_ds,
+            &join_enc(&dst_parent_enc, leaf),
+            overwrite,
+            &progress,
+        )
+        .await;
+    }
 
     let mut hashes = HashCache::default();
     copy_node(
@@ -698,7 +722,29 @@ fn copy_node<'a>(
         };
         for child in children {
             if child.foreign {
-                report.skipped.push(join_enc(src_path, &child.name));
+                // 受管目录里夹带的外来（明文）子对象：按字面存储路径直传，
+                // 落地仍是外来条目（受管子对象才递归走信封搬运）。
+                let src_dir_enc = match locate_any(state, src_storage.as_ref(), src_ds, src_path)
+                    .await?
+                {
+                    Located::Managed(n) => n.enc_path,
+                    Located::Foreign { enc_path, .. } => enc_path,
+                };
+                let dst_dir_enc =
+                    ensure_dest_parent_enc(state, dst_storage.as_ref(), dst_ds, dst_path).await?;
+                let child_report = copy_foreign_node(
+                    state,
+                    src_ds,
+                    &join_enc(&src_dir_enc, &child.name),
+                    child.is_dir,
+                    child.size,
+                    dst_ds,
+                    &join_enc(&dst_dir_enc, &child.name),
+                    overwrite,
+                    progress,
+                )
+                .await?;
+                report.merge(child_report);
                 continue;
             }
             let child_report = copy_node(
@@ -714,6 +760,115 @@ fn copy_node<'a>(
             )
             .await?;
             report.merge(child_report);
+        }
+        Ok(report)
+    })
+}
+
+/// 目标父目录的字面存储路径：受管数据源建/取加密目录返回其 enc_path，明文
+/// 数据源建普通目录返回明文路径本身（根为空串）。外来对象按字面名落进这里。
+async fn ensure_dest_parent_enc(
+    state: &AppState,
+    storage: &dyn Storage,
+    ds: &str,
+    path: &str,
+) -> ApiResult<String> {
+    if path.is_empty() {
+        return Ok(String::new());
+    }
+    if state.datasource(ds)?.encryption_enabled {
+        Ok(ensure_dir(state, storage, ds, path).await?.enc_path)
+    } else {
+        ensure_plain_dir(storage, path).await?;
+        Ok(path.to_owned())
+    }
+}
+
+/// 复制外来（明文）对象：源与目标都用**字面存储路径**，逐字节直传（能秒传
+/// 就秒传），落地仍是明文——在加密目标数据源里即「外来条目」。全程不碰任何
+/// 加解密，也不写信封缓存。
+#[allow(clippy::too_many_arguments)]
+fn copy_foreign_node<'a>(
+    state: &'a AppState,
+    src_ds: &'a str,
+    src_enc: &'a str,
+    is_dir: bool,
+    size: u64,
+    dst_ds: &'a str,
+    dst_enc: &'a str,
+    overwrite: bool,
+    progress: &'a Arc<engine::UploadProgress>,
+) -> std::pin::Pin<Box<dyn Future<Output = ApiResult<CopyReport>> + Send + 'a>> {
+    Box::pin(async move {
+        let src_storage = state.adapter_arc(src_ds)?;
+        let dst_storage = state.adapter_arc(dst_ds)?;
+        let (dst_parent_enc, leaf) = parent_and_name(dst_enc);
+        let existing = dst_storage
+            .list(dst_parent_enc)
+            .await?
+            .into_iter()
+            .find(|e| e.name == leaf);
+
+        if is_dir {
+            match &existing {
+                Some(e) if e.is_dir => {} // 复用已存在的同名外来目录
+                Some(_) => {
+                    return Err(ApiError::BadRequest(format!("目标已存在且不是目录: {dst_enc}")));
+                }
+                None => dst_storage.mkdir(dst_enc).await?,
+            }
+            let mut report = CopyReport {
+                dirs: 1,
+                ..Default::default()
+            };
+            for child in src_storage.list(src_enc).await? {
+                let child_report = copy_foreign_node(
+                    state,
+                    src_ds,
+                    &join_enc(src_enc, &child.name),
+                    child.is_dir,
+                    child.size,
+                    dst_ds,
+                    &join_enc(dst_enc, &child.name),
+                    overwrite,
+                    progress,
+                )
+                .await?;
+                report.merge(child_report);
+            }
+            return Ok(report);
+        }
+
+        // 文件：先按 overwrite 处理目标同名对象，再逐字节直传。
+        if existing.is_some() {
+            if !overwrite {
+                return Err(ApiError::BadRequest(format!("已存在同名条目: {dst_enc}")));
+            }
+            match dst_storage.delete(dst_enc).await {
+                Ok(()) | Err(ApiError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let rapid = copy_object(
+            &src_storage,
+            src_enc,
+            dst_storage.as_ref(),
+            dst_enc,
+            size,
+            ContentHashes::default(),
+            progress,
+        )
+        .await?;
+        let mut report = CopyReport {
+            files: 1,
+            ..Default::default()
+        };
+        if rapid {
+            report.rapid_volumes = 1;
+            report.rapid_bytes = size;
+        } else {
+            report.transferred_volumes = 1;
+            report.transferred_bytes = size;
         }
         Ok(report)
     })
@@ -972,6 +1127,90 @@ mod tests {
         assert_eq!((report.files, report.transferred_volumes), (1, 3));
         assert_eq!(read_back(&state, "src", "d/a.bin").await, data);
         assert_eq!(read_back(&state, "src", "e/b.bin").await, data);
+    }
+
+    /// 外来（明文）对象在加密数据源里搬来搬去，身份不能变味：
+    /// 复制/移动后仍是外来条目、字节不变；删除能清掉；复制进明文数据源
+    /// 则落成普通明文对象。这条正是「外来还是外来，受管走受管」的锁。
+    #[tokio::test]
+    async fn foreign_objects_stay_foreign_across_copy_move_delete() {
+        let (state, dir) = setup(&[("enc", true, false), ("plain", false, false)]);
+        let enc_root = dir.path().join("enc");
+        let file_bytes = payload(3000);
+        let inner_bytes = payload(5000);
+        // 直接往加密数据源存储根塞明文对象：名字解不开信封 → 外来条目。
+        std::fs::write(enc_root.join("外来.txt"), &file_bytes).unwrap();
+        std::fs::create_dir(enc_root.join("外来夹")).unwrap();
+        std::fs::write(enc_root.join("外来夹").join("inner.bin"), &inner_bytes).unwrap();
+
+        let storage = state.adapter("enc").unwrap();
+        let root = list_dir(&state, storage.as_ref(), "enc", "").await.unwrap();
+        assert!(
+            root.iter()
+                .any(|e| e.name == "外来.txt" && e.foreign && !e.is_dir),
+            "外来文件应被识别为外来条目"
+        );
+        assert!(
+            root.iter()
+                .any(|e| e.name == "外来夹" && e.foreign && e.is_dir),
+            "外来目录应被识别为外来条目"
+        );
+
+        // 复制外来文件到受管子目录：落地仍是外来，字节原样。
+        copy_path(&state, "enc", "外来.txt", "enc", "受管夹/外来.txt", false, None)
+            .await
+            .unwrap();
+        let managed = list_dir(&state, storage.as_ref(), "enc", "受管夹").await.unwrap();
+        let copied = managed.iter().find(|e| e.name == "外来.txt").unwrap();
+        assert!(copied.foreign, "复制进受管目录后仍是外来条目");
+        assert_eq!(copied.size, 3000);
+        assert_eq!(read_back(&state, "enc", "受管夹/外来.txt").await, file_bytes);
+
+        // 复制整棵外来目录：子对象也保持外来，字节原样。
+        copy_path(&state, "enc", "外来夹", "enc", "受管夹/外来夹", false, None)
+            .await
+            .unwrap();
+        let sub = list_dir(&state, storage.as_ref(), "enc", "受管夹/外来夹")
+            .await
+            .unwrap();
+        let inner = sub.iter().find(|e| e.name == "inner.bin").unwrap();
+        assert!(inner.foreign, "外来目录的子文件仍是外来条目");
+        assert_eq!(read_back(&state, "enc", "受管夹/外来夹/inner.bin").await, inner_bytes);
+
+        // 复制进明文数据源：落成普通明文对象（明文源永不标外来）。
+        copy_path(&state, "enc", "外来夹", "plain", "落地", false, None)
+            .await
+            .unwrap();
+        assert!(dir.path().join("plain/落地/inner.bin").is_file());
+        let plain_storage = state.adapter("plain").unwrap();
+        let plain_root = list_dir(&state, plain_storage.as_ref(), "plain", "落地")
+            .await
+            .unwrap();
+        assert!(
+            plain_root
+                .iter()
+                .any(|e| e.name == "inner.bin" && !e.foreign),
+            "明文数据源里落地的是普通明文对象"
+        );
+
+        // 移动（rename）外来文件：仍是外来，旧名消失。
+        crate::routes::files::rename_path(&state, storage.as_ref(), "enc", "外来.txt", "外来改.txt")
+            .await
+            .unwrap();
+        let root = list_dir(&state, storage.as_ref(), "enc", "").await.unwrap();
+        assert!(
+            root.iter().any(|e| e.name == "外来改.txt" && e.foreign),
+            "重命名后仍是外来条目"
+        );
+        assert!(!root.iter().any(|e| e.name == "外来.txt"));
+
+        // 删除外来文件：真删掉。
+        crate::routes::files::delete_path(&state, storage.as_ref(), "enc", "外来改.txt")
+            .await
+            .unwrap();
+        assert!(!enc_root.join("外来改.txt").exists());
+        let root = list_dir(&state, storage.as_ref(), "enc", "").await.unwrap();
+        assert!(!root.iter().any(|e| e.name == "外来改.txt"));
     }
 
     /// 假的「支持秒传」目标：记录每次调用，永远宣称命中。

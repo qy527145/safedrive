@@ -267,6 +267,93 @@ pub(crate) async fn resolve(
     }
 }
 
+/// 定位结果：受管节点，或落在外来（不受管、明文）子树里的存储端对象。
+pub(crate) enum Located {
+    Managed(Resolved),
+    /// 外来对象：一旦某段路径解不开信封（如转存进来的他人明文分享），
+    /// 该段起的所有路径都按字面存储名处理，内容不解密、不合卷。
+    Foreign {
+        enc_path: String,
+        is_dir: bool,
+        size: u64,
+    },
+}
+
+/// 明文路径 → 受管节点或外来对象。先按信封链解析（命中缓存走快路径）；
+/// 解不开的那一段起，剩余路径当作字面存储名逐层核实 —— 让外来目录也能
+/// 进入、其中的明文文件也能取用。
+pub(crate) async fn locate_any(
+    state: &AppState,
+    storage: &dyn crate::adapters::Storage,
+    ds: &str,
+    path: &str,
+) -> ApiResult<Located> {
+    match resolve(state, storage, ds, path).await {
+        Ok(node) => return Ok(Located::Managed(node)),
+        Err(ApiError::NotFound(_)) => {} // 可能是外来子树，继续按字面名下钻
+        Err(e) => return Err(e),
+    }
+    let segs: Vec<&str> = path.split('/').collect();
+    // 尽可能深地按信封链下钻，直到某段解不开
+    let mut node = resolve_root(state, ds)?;
+    let mut depth = 0;
+    while depth < segs.len() && node.dir {
+        match find_child(storage, &node.enc_path, &node.decode_keys(), segs[depth]).await? {
+            Some((nc, meta)) => {
+                node = Resolved {
+                    secret: meta.secret,
+                    parent_key: node.secret,
+                    enc_path: join_enc(&node.enc_path, &nc),
+                    nc,
+                    dir: meta.is_dir,
+                    alt_keys: Vec::new(),
+                };
+                depth += 1;
+            }
+            None => break,
+        }
+    }
+    if depth == segs.len() {
+        // 全程可解但 resolve 报了 NotFound：并发竞态，按不存在处理
+        return Err(ApiError::NotFound(format!("路径不存在: {path}")));
+    }
+    if !node.dir {
+        return Err(ApiError::NotFound(format!("{} 不是目录", segs[..depth].join("/"))));
+    }
+    locate_foreign(storage, &node.enc_path, path, &segs[depth..]).await
+}
+
+/// 从受管祖先的 `enc_parent` 起，按字面存储名逐层核实外来路径。
+async fn locate_foreign(
+    storage: &dyn crate::adapters::Storage,
+    enc_parent: &str,
+    full_path: &str,
+    segs: &[&str],
+) -> ApiResult<Located> {
+    let mut enc = enc_parent.to_string();
+    for (i, seg) in segs.iter().enumerate() {
+        let entry = storage
+            .list(&enc)
+            .await?
+            .into_iter()
+            .find(|e| e.name == *seg)
+            .ok_or_else(|| ApiError::NotFound(format!("路径不存在: {full_path}")))?;
+        enc = join_enc(&enc, seg);
+        if i + 1 == segs.len() {
+            return Ok(Located::Foreign {
+                enc_path: enc,
+                is_dir: entry.is_dir,
+                size: entry.size,
+            });
+        }
+        if !entry.is_dir {
+            return Err(ApiError::NotFound(format!("{seg} 不是目录")));
+        }
+    }
+    // segs 非空，循环必在末段返回
+    Err(ApiError::NotFound(format!("路径不存在: {full_path}")))
+}
+
 /// 祖先目录解析：缓存命中即用（这里**不**逐层验证云端 —— 祖先失效时
 /// 后续 list 会报 NotFound，我们捕获后清退缓存整链重试一次）。
 async fn resolve_cached_dir(
@@ -447,10 +534,39 @@ pub(crate) async fn list_dir(
         }
         out
     } else {
-        let node = resolve(state, storage, ds, path).await?;
-        if !node.dir {
-            return Err(ApiError::BadRequest(format!("{path} 不是目录")));
-        }
+        let node = match locate_any(state, storage, ds, path).await? {
+            Located::Managed(node) => {
+                if !node.dir {
+                    return Err(ApiError::BadRequest(format!("{path} 不是目录")));
+                }
+                node
+            }
+            // 外来目录（如转存进来的他人明文分享）：里面全是不受管的字面对象，
+            // 原样列出并标为外来，不尝试解名/合卷。
+            Located::Foreign {
+                enc_path,
+                is_dir: true,
+                ..
+            } => {
+                let raw = storage.list(&enc_path).await?;
+                let mut out = Vec::with_capacity(raw.len());
+                for e in raw {
+                    out.push(ListedEntry {
+                        name: e.name,
+                        is_dir: e.is_dir,
+                        size: e.size,
+                        mtime: e.mtime,
+                        foreign: true,
+                        identity: None,
+                    });
+                }
+                out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+                return Ok(out);
+            }
+            Located::Foreign { .. } => {
+                return Err(ApiError::BadRequest(format!("{path} 不是目录")));
+            }
+        };
         let raw = storage.list(&node.enc_path).await?;
 
         // 第一遍：解名并按明文名分组，同名多条（并发竞态遗留副本）时
@@ -784,7 +900,35 @@ pub(crate) async fn rename_path(
         }
         return Ok(());
     }
-    let node = resolve(state, storage, ds, from).await?;
+    // 加密数据源：外来（明文）对象只按字面存储名整体搬运，仍保持明文外来身份；
+    // 只有受管条目才走「换父钥重编码信封」的零重加密 rename。
+    let node = match locate_any(state, storage, ds, from).await? {
+        Located::Managed(node) => node,
+        Located::Foreign { enc_path, .. } => {
+            let (to_parent, to_name) = parent_and_name(to);
+            let (parent_enc, parent_is_dir) =
+                match locate_any(state, storage, ds, to_parent).await? {
+                    Located::Managed(n) => (n.enc_path, n.dir),
+                    Located::Foreign { enc_path, is_dir, .. } => (enc_path, is_dir),
+                };
+            if !parent_is_dir {
+                return Err(ApiError::BadRequest(format!("{to_parent} 不是目录")));
+            }
+            if storage
+                .list(&parent_enc)
+                .await?
+                .iter()
+                .any(|entry| entry.name == to_name)
+            {
+                return Err(ApiError::BadRequest("目标名称已存在".into()));
+            }
+            storage
+                .rename(&enc_path, &join_enc(&parent_enc, to_name))
+                .await?;
+            state.cache.evict_subtree(ds, from);
+            return Ok(());
+        }
+    };
     // size 缓存路径下拿不到，从 nc 解出（decode 必然成功——刚 resolve 过）
     let old_meta = decode_name(&node.parent_key, &node.nc)
         .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("无法解码 {from} 的密文名")))?;
@@ -861,12 +1005,20 @@ pub(crate) async fn delete_path(
         storage.delete(&actual).await?;
         return Ok(());
     }
-    let node = resolve(state, storage, ds, path).await?;
-    match storage.delete(&node.enc_path).await {
-        Ok(()) | Err(ApiError::NotFound(_)) => {}
-        Err(e) => return Err(e),
+    // 受管条目走信封解析后按 enc_path 删；外来（明文）对象按字面存储名删。
+    match locate_any(state, storage, ds, path).await? {
+        Located::Managed(node) => {
+            match storage.delete(&node.enc_path).await {
+                Ok(()) | Err(ApiError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+            state.cache.evict_subtree(ds, path);
+        }
+        Located::Foreign { enc_path, .. } => match storage.delete(&enc_path).await {
+            Ok(()) | Err(ApiError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        },
     }
-    state.cache.evict_subtree(ds, path);
     Ok(())
 }
 
@@ -889,26 +1041,42 @@ async fn delete_foreign(
         return Err(ApiError::BadRequest("非法名称".into()));
     }
     let storage = state.adapter(&ds)?;
-    let parent = resolve(&state, storage.as_ref(), &ds, &dir).await?;
-    // 允许删除：解不开的真外来条目，或解得开但非规范的同名副本；
-    // 只保护规范条目本身（请走常规删除）。
-    if let Some(m) = decode_multi(&parent.decode_keys(), name) {
-        let canonical = find_child(
-            storage.as_ref(),
-            &parent.enc_path,
-            &parent.decode_keys(),
-            &m.name,
-        )
-        .await?
-        .map(|(nc, _)| nc);
-        if canonical.as_deref() == Some(name) {
-            return Err(ApiError::BadRequest(
-                "该条目是受管数据，请用常规删除".into(),
-            ));
+    match locate_any(&state, storage.as_ref(), &ds, &dir).await? {
+        Located::Managed(parent) => {
+            if !parent.dir {
+                return Err(ApiError::BadRequest(format!("{dir} 不是目录")));
+            }
+            // 允许删除：解不开的真外来条目，或解得开但非规范的同名副本；
+            // 只保护规范条目本身（请走常规删除）。
+            if let Some(m) = decode_multi(&parent.decode_keys(), name) {
+                let canonical = find_child(
+                    storage.as_ref(),
+                    &parent.enc_path,
+                    &parent.decode_keys(),
+                    &m.name,
+                )
+                .await?
+                .map(|(nc, _)| nc);
+                if canonical.as_deref() == Some(name) {
+                    return Err(ApiError::BadRequest(
+                        "该条目是受管数据，请用常规删除".into(),
+                    ));
+                }
+            }
+            storage.delete(&join_enc(&parent.enc_path, name)).await?;
+        }
+        // 外来目录里全是不受管的字面对象，按名直删即可。
+        Located::Foreign {
+            enc_path,
+            is_dir: true,
+            ..
+        } => {
+            storage.delete(&join_enc(&enc_path, name)).await?;
+        }
+        Located::Foreign { .. } => {
+            return Err(ApiError::BadRequest(format!("{dir} 不是目录")));
         }
     }
-    let target = join_enc(&parent.enc_path, name);
-    storage.delete(&target).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1527,7 +1695,14 @@ pub(crate) async fn stream_file(
     if !datasource.encryption_enabled {
         return stream_plain(state, storage, ds, path, download, method, headers).await;
     }
-    let node = resolve(state, storage.as_ref(), ds, path).await?;
+    let node = match resolve(state, storage.as_ref(), ds, path).await {
+        Ok(node) => node,
+        // 解不开信封的明文外来文件（如转存进来的他人明文分享）按字节直传，照常可用。
+        Err(ApiError::NotFound(_)) => {
+            return stream_foreign_plain(state, storage, ds, path, download, method, headers).await;
+        }
+        Err(e) => return Err(e),
+    };
     if node.dir {
         return Err(ApiError::BadRequest("不能下载目录".into()));
     }
@@ -1734,11 +1909,112 @@ async fn stream_plain(
             }),
         )
     };
-    let total = layout.total;
-    let mime = mime_guess::from_path(path).first_or_octet_stream();
-    let file_name = parent_and_name(path).1;
-    let disposition = if download { "attachment" } else { "inline" };
-    let encoded_name = utf8_percent_encode(file_name, NON_ALPHANUMERIC).to_string();
+    serve_object(
+        state,
+        storage,
+        ds,
+        ServeObject {
+            cache_key: &actual,
+            enc_folder,
+            layout,
+            secret: [0u8; SECRET_LEN],
+            encrypted: false,
+            display_name: parent_and_name(path).1,
+            transfer_key: format!("{ds}:{path}"),
+            download,
+        },
+        method,
+        headers,
+    )
+    .await
+}
+
+/// 加密数据源里解不开信封的**明文外来文件**（例如转存进来的他人明文分享，
+/// 可能还嵌在外来目录里）：定位存储端原始对象后按字节直传 —— 不做解密，
+/// 照常支持 Range / 预览 / 下载。
+async fn stream_foreign_plain(
+    state: &AppState,
+    storage: Arc<dyn crate::adapters::Storage>,
+    ds: &str,
+    path: &str,
+    download: bool,
+    method: Method,
+    headers: &HeaderMap,
+) -> ApiResult<Response> {
+    let (enc_path, size) = match locate_any(state, storage.as_ref(), ds, path).await? {
+        Located::Foreign {
+            enc_path,
+            is_dir: false,
+            size,
+        } => (enc_path, size),
+        Located::Foreign { is_dir: true, .. } => {
+            return Err(ApiError::BadRequest("不能下载目录".into()));
+        }
+        // resolve 已失败才会走到这里；受管对象不应再落到外来分支
+        Located::Managed(_) => {
+            return Err(ApiError::NotFound(format!("路径不存在: {path}")));
+        }
+    };
+    let (parent_enc, raw_name) = parent_and_name(&enc_path);
+    let layout = Arc::new(engine::FileLayout {
+        volumes: vec![engine::VolumeMeta {
+            name: raw_name.to_string(),
+            size,
+            offset: 0,
+        }],
+        total: size,
+    });
+    serve_object(
+        state,
+        storage,
+        ds,
+        ServeObject {
+            cache_key: &enc_path,
+            enc_folder: parent_enc.to_string(),
+            layout,
+            secret: [0u8; SECRET_LEN],
+            encrypted: false,
+            display_name: parent_and_name(path).1,
+            transfer_key: format!("{ds}:{path}"),
+            download,
+        },
+        method,
+        headers,
+    )
+    .await
+}
+
+/// 单对象服务参数：把「哪个对象、怎么解密、怎么展示」打成一包，避免函数入参过多。
+struct ServeObject<'a> {
+    /// 内容缓存身份（存储端路径）。
+    cache_key: &'a str,
+    /// 分卷所在的存储端文件夹。
+    enc_folder: String,
+    layout: Arc<engine::FileLayout>,
+    /// 解密密钥；明文 / 外来对象传全零并配 `encrypted=false`。
+    secret: [u8; SECRET_LEN],
+    encrypted: bool,
+    /// 展示名（决定 MIME 与下载文件名）。
+    display_name: &'a str,
+    /// 下行进度上报键。
+    transfer_key: String,
+    download: bool,
+}
+
+/// 按既定分卷布局把一个存储端对象作为 HTTP 响应吐出（Range/HEAD/写透缓存）。
+/// 明文直传与外来明文文件共用；`secret` / `encrypted` 决定引擎是否解密。
+async fn serve_object(
+    state: &AppState,
+    storage: Arc<dyn crate::adapters::Storage>,
+    ds: &str,
+    serve: ServeObject<'_>,
+    method: Method,
+    headers: &HeaderMap,
+) -> ApiResult<Response> {
+    let total = serve.layout.total;
+    let mime = mime_guess::from_path(serve.display_name).first_or_octet_stream();
+    let disposition = if serve.download { "attachment" } else { "inline" };
+    let encoded_name = utf8_percent_encode(serve.display_name, NON_ALPHANUMERIC).to_string();
     let (spec, open_ended) = engine::parse_range(
         headers.get(header::RANGE).and_then(|v| v.to_str().ok()),
         total,
@@ -1780,22 +2056,22 @@ async fn stream_plain(
     let transfer = state.settings.get();
     let ds_cfg = state.datasource(ds)?;
     let cache = if transfer.cache_enabled && ds_cfg.cache_enabled {
-        let key = crate::cache::CacheStore::key(ds, &actual);
+        let key = crate::cache::CacheStore::key(ds, serve.cache_key);
         state.content_cache.open(&key, total).ok()
     } else {
         None
     };
     let tracker = Arc::clone(&state.transfers);
-    let transfer_key = format!("{ds}:{path}");
+    let transfer_key = serve.transfer_key;
     let progress: crate::adapters::ProgressFn = Arc::new(move |n| {
         tracker.download(transfer_key.clone(), n);
     });
     let rx = engine::stream_range_cached_mode(
         storage,
-        enc_folder,
-        [0u8; SECRET_LEN],
-        false,
-        layout,
+        serve.enc_folder,
+        serve.secret,
+        serve.encrypted,
+        serve.layout,
         start,
         end,
         open_ended,
@@ -1803,7 +2079,7 @@ async fn stream_plain(
             max_split: transfer.max_split,
             max_threads: transfer.max_threads,
             max_per_volume: transfer.max_per_volume,
-            mode: if download {
+            mode: if serve.download {
                 StreamMode::BulkDownload
             } else {
                 StreamMode::Playback

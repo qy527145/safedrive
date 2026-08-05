@@ -19,6 +19,7 @@ pub(super) use super::bits::DecodeError;
 const VERSION: u8 = 1;
 const SOURCE_BAIDUPAN: u8 = 1;
 const SOURCE_ALIYUNDRIVE: u8 = 2;
+const SOURCE_QUARK: u8 = 3;
 const MAX_ITEMS: usize = 100;
 const PASSWORD_ALPHABET: &[u8; 31] = b"abcdefghjkmnpqrstuvwxyz23456789";
 
@@ -55,6 +56,7 @@ pub(super) fn share_id(ds_type: &str, url: &str) -> Option<String> {
                 .map(|parts| parts[1].strip_prefix('1').unwrap_or(parts[1]).to_owned())?
         }
         "aliyundrive" => crate::adapters::aliyun_web::share_id_from_url(url)?,
+        "quark" => crate::adapters::quark::share_id_from_url(url)?,
         _ => return None,
     };
     (!id.is_empty() && id.len() <= MAX_STRING_BYTES).then_some(id)
@@ -65,14 +67,48 @@ pub(super) fn share_url(ds_type: &str, share_id: &str) -> Option<String> {
     match ds_type {
         "baidupan" => Some(format!("https://pan.baidu.com/s/1{share_id}")),
         "aliyundrive" => Some(crate::adapters::aliyun_web::share_url(share_id)),
+        "quark" => Some(crate::adapters::quark::share_url(share_id)),
         _ => None,
     }
+}
+
+/// 识别一条云盘**原生**分享短链属于哪种数据源 —— 导入时据此自动兼容
+/// `sd://` 之外的官网分享链接。认得出且确实是分享短链才返回类型。
+pub(super) fn native_source(url: &str) -> Option<&'static str> {
+    let host = reqwest::Url::parse(url.trim()).ok()?.host_str()?.to_owned();
+    let ds_type = if host == "baidu.com" || host.ends_with(".baidu.com") {
+        "baidupan"
+    } else if host == "alipan.com"
+        || host == "aliyundrive.com"
+        || host.ends_with(".alipan.com")
+        || host.ends_with(".aliyundrive.com")
+    {
+        "aliyundrive"
+    } else if host == "quark.cn" || host.ends_with(".quark.cn") {
+        "quark"
+    } else {
+        return None;
+    };
+    // 用各自的短链解析确认这确实是一条分享链接（而非首页/文件页等）。
+    share_id(ds_type, url).map(|_| ds_type)
+}
+
+/// 取出原生分享短链里内嵌的提取码：百度 `?pwd=xxxx`、阿里 `?pwd=xxxx`、
+/// 夸克 `?passcode=xxxx` 都用查询参数承载。没有则返回 None（由用户手填）。
+pub(super) fn native_password(url: &str) -> Option<String> {
+    reqwest::Url::parse(url.trim())
+        .ok()?
+        .query_pairs()
+        .find(|(key, _)| key == "pwd" || key == "passcode")
+        .map(|(_, value)| value.into_owned())
+        .filter(|pwd| !pwd.is_empty())
 }
 
 pub(super) fn encode(pack: &Pack) -> Result<String, &'static str> {
     let source = match pack.source_type.as_str() {
         "baidupan" => SOURCE_BAIDUPAN,
         "aliyundrive" => SOURCE_ALIYUNDRIVE,
+        "quark" => SOURCE_QUARK,
         _ => return Err("unsupported datasource type"),
     };
     if pack.item_count == 0 || pack.item_count > MAX_ITEMS {
@@ -140,6 +176,7 @@ fn decode_plain(plain: &[u8]) -> Result<Pack, DecodeError> {
     let source_type = match bits.read_bits(4)? as u8 {
         SOURCE_BAIDUPAN => "baidupan".to_owned(),
         SOURCE_ALIYUNDRIVE => "aliyundrive".to_owned(),
+        SOURCE_QUARK => "quark".to_owned(),
         _ => return Err(DecodeError::Invalid),
     };
     let encrypted = bits.read_bit()?;
@@ -230,6 +267,7 @@ mod tests {
         for (ds_type, url, id) in [
             ("baidupan", "https://pan.baidu.com/s/1qym_MmGtZhFrTpKqf", "qym_MmGtZhFrTpKqf"),
             ("aliyundrive", "https://www.alipan.com/s/3XCkDNb1Cfa", "3XCkDNb1Cfa"),
+            ("quark", "https://pan.quark.cn/s/3a5f8b2c1d0e", "3a5f8b2c1d0e"),
         ] {
             assert_eq!(share_id(ds_type, url).as_deref(), Some(id), "{ds_type}");
             let rebuilt = share_url(ds_type, id).expect("支持的类型都能还原短链");
@@ -247,6 +285,42 @@ mod tests {
         let mut unsupported = sample(true);
         unsupported.source_type = "localfs".into();
         assert!(encode(&unsupported).is_err());
+    }
+
+    /// 原生分享短链能按域名自动识别数据源类型；非分享链接、陌生域名判 None。
+    #[test]
+    fn detects_native_source_from_url() {
+        assert_eq!(native_source("https://pan.baidu.com/s/1qym_MmGtZhFrTpKqf"), Some("baidupan"));
+        assert_eq!(native_source("https://www.alipan.com/s/3XCkDNb1Cfa"), Some("aliyundrive"));
+        assert_eq!(native_source(" https://www.aliyundrive.com/s/3XCkDNb1Cfa?x=1 "), Some("aliyundrive"));
+        assert_eq!(native_source("https://pan.quark.cn/s/3a5f8b2c1d0e"), Some("quark"));
+        // 同域名但不是分享短链
+        assert!(native_source("https://pan.baidu.com/disk/home").is_none());
+        assert!(native_source("https://www.alipan.com/").is_none());
+        // 陌生域名 / 非 URL
+        assert!(native_source("https://example.com/s/1abc").is_none());
+        assert!(native_source("sd://abcdef").is_none());
+        // 域名后缀伪装不能蒙混（evil-baidu.com 不属于 baidu.com）
+        assert!(native_source("https://evil-baidu.com/s/1abc").is_none());
+    }
+
+    /// 链接内嵌的 `?pwd=` 提取码能被取出；没有或为空则判 None。
+    #[test]
+    fn extracts_embedded_pwd_from_native_link() {
+        assert_eq!(
+            native_password("https://pan.baidu.com/s/17SPua3oIUyK_HYzxYbfN-Q?pwd=pnqv").as_deref(),
+            Some("pnqv")
+        );
+        assert_eq!(
+            native_password("https://www.alipan.com/s/3XCkDNb1Cfa?pwd=ab12").as_deref(),
+            Some("ab12")
+        );
+        assert_eq!(
+            native_password("https://pan.quark.cn/s/3a5f8b2c1d0e?passcode=cd34").as_deref(),
+            Some("cd34")
+        );
+        assert!(native_password("https://pan.baidu.com/s/17SPua3oIUyK_HYzxYbfN-Q").is_none());
+        assert!(native_password("https://pan.baidu.com/s/1abc?pwd=").is_none());
     }
 
     #[test]

@@ -26,12 +26,14 @@ use serde_json::{Value, json};
 use sha1::Sha1;
 
 use super::{
-    ByteStream, CredentialPersister, Entry, HashKind, ProgressFn, RapidSource, Storage, read_spool,
-    sanitize, spool_with_hashes,
+    ByteStream, CloudShare, CredentialPersister, Entry, HashKind, ImportedEntry, ProgressFn,
+    RapidSource, Storage, read_spool, sanitize, spool_with_hashes,
 };
 use crate::error::{ApiError, ApiResult};
 
 const API_BASE: &str = "https://drive.quark.cn/1/clouddrive";
+/// 分享/转存这些写操作走 PC 客户端域名（与各开源实现一致）；可被 `shareApiBase` 覆盖。
+const SHARE_API_BASE: &str = "https://drive-pc.quark.cn/1/clouddrive";
 const REFERER: &str = "https://pan.quark.cn";
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch";
 /// 分片上传走的是阿里 OSS，签名里的 UA 必须与夸克前端完全一致。
@@ -54,6 +56,23 @@ static COOKIES: LazyLock<Mutex<HashMap<String, String>>> =
 
 fn cache_key(account: &str, path: &str) -> String {
     format!("{account}\u{1}{path}")
+}
+
+/// 官网分享短链。`pwd_id` 就是 `https://pan.quark.cn/s/<pwd_id>` 里的短码。
+pub fn share_url(pwd_id: &str) -> String {
+    format!("https://pan.quark.cn/s/{pwd_id}")
+}
+
+/// 从分享短链取回 `pwd_id`（可带 `?passcode=`/`?pwd=` 等查询串）。
+pub fn share_id_from_url(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    let segments: Vec<&str> = parsed.path_segments()?.collect();
+    segments
+        .windows(2)
+        .find(|parts| parts[0] == "s")
+        .map(|parts| parts[1])
+        .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()))
+        .map(str::to_owned)
 }
 
 fn evict_path_ids(account: &str, path: &str) {
@@ -155,8 +174,29 @@ enum Call {
     Failed { message: String },
 }
 
+/// 夸克官网分享里的一个根条目（转存时逐个 `fid` + `share_fid_token` 配对提交）。
+struct ShareEntry {
+    fid: String,
+    share_fid_token: String,
+    file_name: String,
+}
+
+/// 生成 4 位分享提取码。字母表与 `sd://` 协议一致，加密夸克数据源也能封进标准分享。
+fn gen_passcode() -> ApiResult<String> {
+    let alphabet = b"abcdefghjkmnpqrstuvwxyz23456789";
+    let mut random = [0u8; 4];
+    getrandom::fill(&mut random)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("生成分享提取码失败: {e}")))?;
+    Ok(random
+        .into_iter()
+        .map(|byte| alphabet[byte as usize % alphabet.len()] as char)
+        .collect())
+}
+
 pub struct QuarkFs {
     api_base: String,
+    /// 分享/转存接口域名（默认 PC 客户端域名）。
+    share_api_base: String,
     /// 明文根目录（相对网盘根，已 sanitize）。
     root: String,
     account: String,
@@ -189,6 +229,7 @@ impl QuarkFs {
             .or_insert(cookie);
         Ok(Self {
             api_base: text("apiBase").unwrap_or_else(|| API_BASE.to_owned()),
+            share_api_base: text("shareApiBase").unwrap_or_else(|| SHARE_API_BASE.to_owned()),
             root,
             account,
             persist,
@@ -241,7 +282,21 @@ impl QuarkFs {
         body: Option<&Value>,
         what: &str,
     ) -> ApiResult<Call> {
-        let url = format!("{}{path}", self.api_base.trim_end_matches('/'));
+        self.call_on(&self.api_base, method, path, query, body, what)
+            .await
+    }
+
+    /// 与 `call` 相同，但可指定接口域名（分享/转存走 PC 客户端域名）。
+    async fn call_on(
+        &self,
+        base: &str,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<&Value>,
+        what: &str,
+    ) -> ApiResult<Call> {
+        let url = format!("{}{path}", base.trim_end_matches('/'));
         let mut request = self
             .http
             .request(method, &url)
@@ -297,6 +352,105 @@ impl QuarkFs {
                 Err(ApiError::Upstream(format!("夸克网盘{what}失败: {message}")))
             }
         }
+    }
+
+    async fn share_post(&self, path: &str, body: &Value, what: &str) -> ApiResult<Value> {
+        match self
+            .call_on(&self.share_api_base, Method::POST, path, &[], Some(body), what)
+            .await?
+        {
+            Call::Ok(value) => Ok(value),
+            Call::Failed { message } => {
+                Err(ApiError::Upstream(format!("夸克网盘{what}失败: {message}")))
+            }
+        }
+    }
+
+    async fn share_get(&self, path: &str, query: &[(&str, String)], what: &str) -> ApiResult<Value> {
+        match self
+            .call_on(&self.share_api_base, Method::GET, path, query, None, what)
+            .await?
+        {
+            Call::Ok(value) => Ok(value),
+            Call::Failed { message } => {
+                Err(ApiError::Upstream(format!("夸克网盘{what}失败: {message}")))
+            }
+        }
+    }
+
+    /// 轮询异步任务直到 `data.status == 2`（成功），返回完整响应供调用方取字段。
+    async fn wait_task(&self, task_id: &str, what: &str) -> ApiResult<Value> {
+        for retry in 0..40u32 {
+            let query = [
+                ("task_id", task_id.to_owned()),
+                ("retry_index", retry.to_string()),
+            ];
+            let value = self.share_get("/task", &query, what).await?;
+            match value.pointer("/data/status").and_then(Value::as_i64) {
+                Some(2) => return Ok(value),
+                // 3 = 失败，其余 0/1 视为进行中继续轮询。
+                Some(status) if status >= 3 => {
+                    return Err(ApiError::Upstream(format!(
+                        "夸克网盘{what}任务失败（status={status}）"
+                    )));
+                }
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(700)).await;
+        }
+        Err(ApiError::Upstream(format!("夸克网盘{what}任务超时")))
+    }
+
+    /// 列出官网分享根目录下的条目（翻页）。
+    async fn share_detail(&self, pwd_id: &str, stoken: &str) -> ApiResult<Vec<ShareEntry>> {
+        let mut page = 1u32;
+        let mut out: Vec<ShareEntry> = Vec::new();
+        loop {
+            let query = [
+                ("pwd_id", pwd_id.to_owned()),
+                ("stoken", stoken.to_owned()),
+                ("pdir_fid", "0".to_owned()),
+                ("force", "0".to_owned()),
+                ("_page", page.to_string()),
+                ("_size", "50".to_owned()),
+                ("_fetch_banner", "0".to_owned()),
+                ("_fetch_share", "0".to_owned()),
+                ("_fetch_total", "1".to_owned()),
+                ("_sort", "file_type:asc,updated_at:desc".to_owned()),
+            ];
+            let value = self
+                .share_get("/share/sharepage/detail", &query, "读取分享内容")
+                .await?;
+            let list = value
+                .pointer("/data/list")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let fetched = list.len();
+            for item in list {
+                let (Some(fid), Some(token), Some(name)) = (
+                    item.get("fid").and_then(Value::as_str),
+                    item.get("share_fid_token").and_then(Value::as_str),
+                    item.get("file_name").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                out.push(ShareEntry {
+                    fid: fid.to_owned(),
+                    share_fid_token: token.to_owned(),
+                    file_name: html_unescape(name),
+                });
+            }
+            let total = value
+                .pointer("/metadata/_total")
+                .and_then(Value::as_u64)
+                .unwrap_or(out.len() as u64);
+            if fetched == 0 || out.len() as u64 >= total {
+                break;
+            }
+            page += 1;
+        }
+        Ok(out)
     }
 
     /// 列一个目录 fid 下的全部条目（翻页），顺带把子项 fid 写进缓存。
@@ -784,6 +938,146 @@ impl Storage for QuarkFs {
         Ok(())
     }
 
+    async fn share(&self, paths: &[String], password: Option<&str>) -> ApiResult<CloudShare> {
+        if paths.is_empty() {
+            return Err(ApiError::BadRequest("请至少选择一个分享条目".into()));
+        }
+        let mut fids = Vec::with_capacity(paths.len());
+        let mut title = String::new();
+        for path in paths {
+            let file = self.stat(path).await?;
+            if title.is_empty() {
+                title = file.file_name.clone();
+            }
+            fids.push(file.fid);
+        }
+        if paths.len() > 1 {
+            title = format!("{title} 等 {} 项", paths.len());
+        }
+        // 有自定义提取码就用它，否则随机 4 位。夸克 url_type：1=公开、2=带提取码。
+        let passcode = match password {
+            Some(custom) => custom.to_owned(),
+            None => gen_passcode()?,
+        };
+        let create = json!({
+            "fid_list": fids,
+            "title": title,
+            "url_type": 2,
+            "expired_type": 1,
+            "passcode": passcode,
+        });
+        let value = self.share_post("/share", &create, "创建分享").await?;
+        let task_id = value
+            .pointer("/data/task_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ApiError::Upstream("夸克网盘创建分享响应缺少 task_id".into()))?
+            .to_owned();
+        let done = self.wait_task(&task_id, "创建分享").await?;
+        let share_id = done
+            .pointer("/data/share_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ApiError::Upstream("夸克网盘创建分享任务缺少 share_id".into()))?
+            .to_owned();
+        // 换取公开短链与提取码。
+        let value = self
+            .share_post("/share/password", &json!({ "share_id": share_id }), "获取分享链接")
+            .await?;
+        let url = value
+            .pointer("/data/share_url")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ApiError::Upstream("夸克网盘分享响应缺少 share_url".into()))?
+            .to_owned();
+        // 提取码以云端回显为准（回显缺省则用我们设定的那个）。
+        let password = value
+            .pointer("/data/passcode")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map_or(passcode, str::to_owned);
+        Ok(CloudShare { url, password })
+    }
+
+    async fn import_share(&self, share: &CloudShare, dest: &str) -> ApiResult<Vec<ImportedEntry>> {
+        let pwd_id = share_id_from_url(&share.url)
+            .ok_or_else(|| ApiError::BadRequest(format!("无法从夸克分享短链提取 pwd_id: {}", share.url)))?;
+        let dest_fid = self.folder_fid(dest, true).await?;
+        // 用 pwd_id + 提取码换取一次性 stoken。
+        let token = self
+            .share_post(
+                "/share/sharepage/token",
+                &json!({ "pwd_id": pwd_id, "passcode": share.password }),
+                "校验分享提取码",
+            )
+            .await?;
+        let stoken = token
+            .pointer("/data/stoken")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ApiError::Upstream("夸克网盘分享校验响应缺少 stoken（提取码可能不对）".into())
+            })?
+            .to_owned();
+        let entries = self.share_detail(&pwd_id, &stoken).await?;
+        if entries.is_empty() {
+            return Err(ApiError::Upstream("该夸克分享没有可转存的内容".into()));
+        }
+        let fid_list: Vec<&str> = entries.iter().map(|e| e.fid.as_str()).collect();
+        let token_list: Vec<&str> = entries.iter().map(|e| e.share_fid_token.as_str()).collect();
+        let save = json!({
+            "fid_list": fid_list,
+            "fid_token_list": token_list,
+            "to_pdir_fid": dest_fid,
+            "pwd_id": pwd_id,
+            "stoken": stoken,
+            "pdir_fid": "0",
+            "scene": "link",
+        });
+        let value = self
+            .share_post("/share/sharepage/save", &save, "转存分享")
+            .await?;
+        let task_id = value
+            .pointer("/data/task_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ApiError::Upstream("夸克网盘转存响应缺少 task_id".into()))?
+            .to_owned();
+        let done = self.wait_task(&task_id, "转存分享").await?;
+        let saved: Vec<String> = done
+            .pointer("/data/save_as/save_as_top_fids")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // 落地名以目标目录实查为准（同名冲突时夸克会自动改名）；查不到就回退分享内原名。
+        evict_path_ids(&self.account, dest);
+        let landed = self.list_folder(&dest_fid, Some(dest)).await?;
+        let name_of: HashMap<&str, &str> = landed
+            .iter()
+            .map(|file| (file.fid.as_str(), file.file_name.as_str()))
+            .collect();
+        let imported = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let name = saved
+                    .get(index)
+                    .and_then(|fid| name_of.get(fid.as_str()).copied())
+                    .unwrap_or(entry.file_name.as_str())
+                    .to_owned();
+                ImportedEntry {
+                    source_name: entry.file_name.clone(),
+                    name,
+                }
+            })
+            .collect();
+        Ok(imported)
+    }
+
     async fn get(&self, path: &str) -> ApiResult<(Option<u64>, ByteStream)> {
         self.fetch(path, None).await
     }
@@ -915,6 +1209,9 @@ impl Storage for QuarkFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::Query;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
 
     #[test]
     fn cookie_round_trip() {
@@ -953,5 +1250,129 @@ mod tests {
             QuarkFs::oss_url(&pre).unwrap(),
             "https://bkt.oss-cn-hangzhou.aliyuncs.com/k/1"
         );
+    }
+
+    #[test]
+    fn share_short_link_round_trips() {
+        let url = share_url("3a5f8b2c1d0e");
+        assert_eq!(url, "https://pan.quark.cn/s/3a5f8b2c1d0e");
+        assert_eq!(share_id_from_url(&url).as_deref(), Some("3a5f8b2c1d0e"));
+        assert_eq!(
+            share_id_from_url("https://pan.quark.cn/s/abc123?passcode=cd34").as_deref(),
+            Some("abc123")
+        );
+        // 非分享链接判 None
+        assert!(share_id_from_url("https://pan.quark.cn/list/all").is_none());
+    }
+
+    #[test]
+    fn passcode_fits_the_share_link_alphabet() {
+        let alphabet = b"abcdefghjkmnpqrstuvwxyz23456789";
+        let passcode = gen_passcode().unwrap();
+        assert_eq!(passcode.len(), 4);
+        assert!(passcode.bytes().all(|byte| alphabet.contains(&byte)));
+    }
+
+    fn config(base: &str) -> Value {
+        json!({ "cookie": "kps=1", "apiBase": base, "shareApiBase": base })
+    }
+
+    // ---- 分享/转存全流程 mock（校验字段名、任务轮询、条目配对） ----
+
+    #[derive(serde::Deserialize)]
+    struct TaskQuery {
+        task_id: String,
+    }
+
+    async fn mock_task(Query(q): Query<TaskQuery>) -> Json<Value> {
+        // 创建分享任务回带 share_id；转存任务回带落地 fid。
+        if q.task_id == "task-create" {
+            Json(json!({ "code": 0, "data": { "status": 2, "share_id": "SID123" } }))
+        } else {
+            Json(json!({
+                "code": 0,
+                "data": { "status": 2, "save_as": { "save_as_top_fids": ["new-fid"] } }
+            }))
+        }
+    }
+
+    // stat 与落地回查共用 /file/sort：既含被分享文件，也含转存落地文件。
+    async fn mock_sort() -> Json<Value> {
+        Json(json!({
+            "code": 0,
+            "data": { "list": [
+                { "fid": "src-fid", "file_name": "hello.txt", "file": true, "size": 5 },
+                { "fid": "new-fid", "file_name": "hello.txt", "file": true, "size": 5 }
+            ] },
+            "metadata": { "_total": 2 }
+        }))
+    }
+
+    async fn spawn_mock() -> String {
+        let app = Router::new()
+            .route("/file/sort", get(mock_sort))
+            .route("/task", get(mock_task))
+            .route("/share", post(|| async {
+                Json(json!({ "code": 0, "data": { "task_id": "task-create" } }))
+            }))
+            .route("/share/password", post(|| async {
+                Json(json!({
+                    "code": 0,
+                    "data": {
+                        "share_url": "https://pan.quark.cn/s/PWDID",
+                        "pwd_id": "PWDID",
+                        "passcode": "ab12"
+                    }
+                }))
+            }))
+            .route("/share/sharepage/token", post(|| async {
+                Json(json!({ "code": 0, "data": { "stoken": "STOK" } }))
+            }))
+            .route("/share/sharepage/detail", get(|| async {
+                Json(json!({
+                    "code": 0,
+                    "data": { "list": [
+                        { "fid": "share-fid", "share_fid_token": "sft", "file_name": "hello.txt", "dir": false }
+                    ] },
+                    "metadata": { "_total": 1 }
+                }))
+            }))
+            .route("/share/sharepage/save", post(|| async {
+                Json(json!({ "code": 0, "data": { "task_id": "task-save" } }))
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        base
+    }
+
+    #[tokio::test]
+    async fn share_creates_native_link_with_custom_passcode() {
+        let base = spawn_mock().await;
+        let fs =
+            QuarkFs::from_config_with_persister(&config(&base), Client::new(), None).unwrap();
+        let share = fs.share(&["hello.txt".to_owned()], Some("ab12")).await.unwrap();
+        assert_eq!(share.url, "https://pan.quark.cn/s/PWDID");
+        assert_eq!(share.password, "ab12");
+    }
+
+    #[tokio::test]
+    async fn import_share_transfers_root_entries() {
+        let base = spawn_mock().await;
+        let fs =
+            QuarkFs::from_config_with_persister(&config(&base), Client::new(), None).unwrap();
+        let imported = fs
+            .import_share(
+                &CloudShare {
+                    url: "https://pan.quark.cn/s/PWDID".into(),
+                    password: "ab12".into(),
+                },
+                "",
+            )
+            .await
+            .unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].source_name, "hello.txt");
+        assert_eq!(imported[0].name, "hello.txt");
     }
 }

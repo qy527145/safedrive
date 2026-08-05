@@ -12,8 +12,8 @@
 //! 凭证流向：内置应用的令牌只在本机与「开放平台 / 该应用作者的中转服务」
 //! 之间流动，SafeDrive 不做任何转发或留存。
 
-use aes::cipher::block_padding::NoPadding;
-use aes::cipher::{BlockDecryptMut, KeyIvInit};
+use aes::cipher::block_padding::{NoPadding, Pkcs7};
+use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use md5::Digest as _;
@@ -50,6 +50,22 @@ LUyXDpTbpA4Sjk3lkuf7sTbdav/WV2ANHcClYVlIAeZgKu1gV5DY+t0CAwEAAQ==\n\
 
 static OPEN_RT_VERIFIER: LazyLock<Option<VerifyingKey<Sha256>>> = LazyLock::new(|| {
     RsaPublicKey::from_public_key_pem(OPEN_REFRESH_TOKEN_PUBKEY_PEM)
+        .ok()
+        .map(VerifyingKey::new)
+});
+
+/// 官网（PDS）access_token 的验签公钥（RS256）。用官网刷新令牌换来的 access_token
+/// 同样是一枚 RS256 JWT —— 用这把公钥验签后读它自带的 `exp`，判断是否过期比盲信刷新
+/// 响应里的 `expires_in` 可靠得多。私钥由阿里持有，不出现在本仓库。
+const PDS_ACCESS_TOKEN_PUBKEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC72/8TD242+vn0FDQm8YyeY2WH\n\
+rNIxpiCgGT6H5EbDgo7mAXy5+LtJ/imCrqfYli4mwW3SPagtGlTo1OrlqafX+pIs\n\
+ehYnKuMQEW9nPbJ0z3ItrFx1cTC70Dx3mk6mrK+KOx6XgfiLqrgGy/wysbPX5PdN\n\
+Apg4Wc3GsMk8UpdtGQIDAQAB\n\
+-----END PUBLIC KEY-----";
+
+static PDS_AT_VERIFIER: LazyLock<Option<VerifyingKey<Sha256>>> = LazyLock::new(|| {
+    RsaPublicKey::from_public_key_pem(PDS_ACCESS_TOKEN_PUBKEY_PEM)
         .ok()
         .map(VerifyingKey::new)
 });
@@ -224,11 +240,8 @@ pub fn inspect(refresh_token: &str) -> TokenInspection {
     }
 }
 
-/// RS256 验签：`header.payload` 用开放平台公钥验证末段签名。
-fn verify_open_refresh_token(token: &str) -> bool {
-    let Some(verifier) = OPEN_RT_VERIFIER.as_ref() else {
-        return false;
-    };
+/// RS256 验签：`header.payload` 用给定公钥验证末段签名。
+fn verify_rs256(verifier: &VerifyingKey<Sha256>, token: &str) -> bool {
     // token = header.payload.signature；验签对象是前两段（含中间的点）。
     let Some((message, signature)) = token.rsplit_once('.') else {
         return false;
@@ -243,6 +256,24 @@ fn verify_open_refresh_token(token: &str) -> bool {
         return false;
     };
     verifier.verify(message.as_bytes(), &signature).is_ok()
+}
+
+/// 开放平台 refresh_token 验签（公钥 PEM 解析失败时一律判 false）。
+fn verify_open_refresh_token(token: &str) -> bool {
+    OPEN_RT_VERIFIER
+        .as_ref()
+        .is_some_and(|verifier| verify_rs256(verifier, token))
+}
+
+/// 校验一枚官网（PDS）access_token：先用 PDS 公钥验签，通过才返回它自带的
+/// `exp`（unix 秒）。验签失败、不是 JWT、或公钥 PEM 没解析出来都返回 `None`
+/// —— 调用方据此判定「拿不准就该刷新」。
+pub fn web_access_token_expiry(token: &str) -> Option<u64> {
+    let verifier = PDS_AT_VERIFIER.as_ref()?;
+    if !verify_rs256(verifier, token) {
+        return None;
+    }
+    jwt_claim(token, "exp").and_then(|exp| exp.parse().ok())
 }
 
 /// 读 JWT 载荷里的一个字符串字段（不验签 —— 只用来做路由和缓存分区）。
@@ -373,16 +404,10 @@ impl App {
                 send(http.post(self.open_url("/oauth/authorize/qrcode")).json(&body), what).await?
             }
             Flavor::Tv => {
-                tv_call(
+                tv_request(
                     http,
-                    "/qrcode",
-                    &[
-                        ("scopes", OAUTH_SCOPES.to_owned()),
-                        ("width", "500".into()),
-                        ("height", "500".into()),
-                    ],
-                    None,
-                    None,
+                    "/v2/qrcode",
+                    &json!({ "scopes": OAUTH_SCOPES, "width": 500, "height": 500 }),
                     what,
                 )
                 .await?
@@ -464,15 +489,7 @@ impl App {
                 send(http.post(self.open_url("/oauth/access_token")).json(&body), what).await?
             }
             Flavor::Tv => {
-                tv_call(
-                    http,
-                    "/v2/token",
-                    &[("code", auth_code.to_owned())],
-                    None,
-                    Some(&TV_V2_KEY),
-                    what,
-                )
-                .await?
+                tv_request(http, "/v4/token", &json!({ "code": auth_code }), what).await?
             }
             Flavor::Alist => {
                 let body = json!({
@@ -565,19 +582,10 @@ impl App {
                 send(http.post(self.open_url("/oauth/access_token")).json(&body), what).await?
             }
             Flavor::Tv => {
-                // TV 的 v3 接口按请求头派生一次性 AES 密钥，响应整体加密。
-                let now = unix_time_secs().to_string();
-                let params = tv_v3_params();
-                let key = tv_v3_key(&params, &now);
-                let mut headers: Vec<(&str, String)> = params;
-                headers.push(("t", now));
-                headers.push(("User-Agent", TV_USER_AGENT.to_owned()));
-                tv_call(
+                tv_request(
                     http,
-                    "/v3/token",
-                    &[("refresh_token", refresh_token.to_owned())],
-                    Some(&headers),
-                    Some(&key),
+                    "/v4/token",
+                    &json!({ "refresh_token": refresh_token }),
                     what,
                 )
                 .await?
@@ -706,10 +714,11 @@ const CLOUDDRIVE2_BASE: &str = "https://aliredirect.zhenyunpan.com";
 const WEBDAV_BASE: &str = "https://aliyundrive-oauth.messense.me";
 const TV_BASE_HTTPS: &str = "https://api.extscreen.com/aliyundrive";
 const TV_BASE_HTTP: &str = "http://api.extscreen.com/aliyundrive";
-const TV_USER_AGENT: &str =
-    "AliTV/1.3.6 (Linux; U; Android 10; zh_CN; 1496; SM-G9730 Build/QKQ1.190828.002)";
-/// TV v2 接口的固定 AES-256-CBC 密钥。
-const TV_V2_KEY: [u8; 32] = *b"^(i/x>>5(ebyhumz*i1wkpk^orIs^Na.";
+/// 服务端时间戳接口：新协议会校验请求头 `t` 的新鲜度，本机时钟有偏差会被拒，
+/// 所以优先取服务端时间，取不到再退回本地。
+const TV_TIMESTAMP_URL: &str = "https://api.extscreen.com/timestamp";
+/// 设备指纹：值参与密钥派生与签名，照搬参考实现的固定值（中转服务允许多端共用）。
+const TV_DEVICE_ID: &str = "2c7d30cd7ae5e8017384988393f397c6";
 
 // ---------------- 通用 HTTP / 解析 ----------------
 
@@ -808,21 +817,31 @@ fn tokens_of(value: &Value) -> Tokens {
 }
 
 // ---------------- 阿里云盘 TV（api.extscreen.com） ----------------
+//
+// 新协议（对齐 alitv_openlist/main.go）：二维码走 `/v2/qrcode`、换取/刷新令牌
+// 统一走 `/v4/token`；请求体先 AES-256-CBC 加密成 `{ciphertext, iv}` 再提交，
+// 派生密钥与签名放在请求头，响应体也是同一把密钥加密的密文。设备指纹与各参数
+// 值全部照搬参考实现——服务端据请求头重算同一把密钥来解密请求、加密回包。
 
-fn tv_v3_params() -> Vec<(&'static str, String)> {
-    // 值参与密钥派生，顺序不能动。
+/// 请求头参数：值按 key 字典序排列（服务端也按字典序拼接派生密钥），`t` 单列、
+/// 不参与拼接，所以不在这里。全部照搬参考实现的固定值。
+fn tv_params() -> Vec<(&'static str, String)> {
     vec![
         ("akv", "2.8.1496".to_owned()),
-        ("apv", "1.3.6".to_owned()),
-        ("b", "abc".to_owned()),
-        ("d", uuid::Uuid::new_v4().simple().to_string()),
-        ("m", "abc".to_owned()),
-        ("n", "abc".to_owned()),
+        ("apv", "1.4.1".to_owned()),
+        ("b", "vivo".to_owned()),
+        ("d", TV_DEVICE_ID.to_owned()),
+        ("m", "V2329A".to_owned()),
+        ("mac", String::new()),
+        ("n", "V2329A".to_owned()),
+        ("nonce", String::new()),
+        ("wifiMac", "00db00200063".to_owned()),
     ]
 }
 
-/// v3 的一次性密钥：把请求头值拼起来去重，按时间戳做字符位移，取 md5 十六进制。
-fn tv_v3_key(params: &[(&'static str, String)], now: &str) -> [u8; 32] {
+/// 一次性密钥：把参数值（除 `t`）按字典序拼起来去重，按时间戳做字符位移，取
+/// md5 十六进制（32 个 ascii 字符即 32 字节的 AES-256 密钥）。
+fn tv_key(params: &[(&'static str, String)], now: &str) -> [u8; 32] {
     let joined: String = params.iter().map(|(_, value)| value.as_str()).collect();
     let modifier: i64 = now.get(7..).and_then(|tail| tail.parse().ok()).unwrap_or(0);
     let mut seen: Vec<char> = Vec::new();
@@ -845,37 +864,93 @@ fn tv_v3_key(params: &[(&'static str, String)], now: &str) -> [u8; 32] {
         .expect("md5 十六进制固定 32 字节")
 }
 
-/// TV 中转只提供 form 表单接口。优先 https 保持链路加密，但只要 https 这一跳
-/// 整段（含解密）有任何闪失就退回 http 重试 —— 该服务历史上只有 http 入口（参考
-/// 实现也一律走 http），其 https 前置常由 WAF/负载均衡兜着，可能连不上、证书对
-/// 不上、回非 2xx，甚至回一个 200 的挑战页导致解密失败；这些都不该让 TV 授权
-/// 失败，而应落到能用的 http 上。
-///
-/// `decrypt_key` 为 `Some` 时，响应体在函数内直接解密并校验（TV 的 token 接口
-/// 整体加密），这样 https 侧返回“能收下却解不开”的垃圾也能触发 http 回退；`None`
-/// 用于二维码接口这类明文响应。
-async fn tv_call(
+/// 请求签名：`sha256("POST-/api{apiPath}-{t}-{d}-{key}")` 的十六进制。注意签名里
+/// 的路径带固定 `/api` 前缀、与真实 URL（`/aliyundrive{apiPath}`）不同，照搬即可。
+fn tv_sign(api_path: &str, now: &str, key: &[u8; 32]) -> String {
+    let key_str = std::str::from_utf8(key).expect("md5 十六进制是 ascii");
+    let data = format!("POST-/api{api_path}-{now}-{TV_DEVICE_ID}-{key_str}");
+    hex::encode(Sha256::digest(data.as_bytes()))
+}
+
+/// AES-256-CBC + PKCS7 加密请求体，base64（标准表）编码。`iv` 是随机串的原始
+/// 字节（发送时也原样带上，服务端用它解密）。
+fn tv_encrypt(plaintext: &[u8], key: &[u8; 32], iv: &[u8; 16]) -> String {
+    let mut buffer = vec![0u8; plaintext.len() + 16];
+    buffer[..plaintext.len()].copy_from_slice(plaintext);
+    let cipher = cbc::Encryptor::<aes::Aes256>::new(key.into(), iv.into())
+        .encrypt_padded_mut::<Pkcs7>(&mut buffer, plaintext.len())
+        .expect("缓冲区已预留一个块的填充空间");
+    B64.encode(cipher)
+}
+
+/// 随机 16 字符 IV（取 v4 uuid 的前 16 位十六进制，均为可打印 ascii，一字符一字节）。
+fn tv_random_iv() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..16].to_owned()
+}
+
+/// 取服务端时间戳（秒），失败退回本机时间。
+async fn tv_timestamp(http: &Client) -> String {
+    match send(http.get(TV_TIMESTAMP_URL), "获取时间戳").await {
+        Ok(value) => number(&value, &["timestamp"])
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| unix_time_secs().to_string()),
+        Err(_) => unix_time_secs().to_string(),
+    }
+}
+
+/// 一次 TV 加密请求的全部材料（在 https/http 两次尝试之间复用）。
+struct TvRequest<'a> {
+    api_path: &'a str,
+    params: &'a [(&'static str, String)],
+    now: &'a str,
+    sign: &'a str,
+    body: &'a Value,
+    key: &'a [u8; 32],
+}
+
+/// 发一次加密请求并解密响应。
+async fn tv_send(http: &Client, base: &str, req: &TvRequest<'_>, what: &str) -> ApiResult<Value> {
+    let mut request = http.post(format!("{base}{}", req.api_path)).json(req.body);
+    for (name, value) in req.params {
+        request = request.header(*name, value);
+    }
+    request = request.header("t", req.now).header("sign", req.sign);
+    let value = send(request, what).await?;
+    tv_decrypt(&value, req.key)
+}
+
+/// TV 新协议的一次完整调用：取时间戳 → 派生密钥 → 加密请求体 → 带签名头 POST →
+/// 解密响应。优先 https 保持链路加密，但只要 https 这一跳整段（含解密）有任何
+/// 闪失就退回 http 重试——其 https 前置常由 WAF/负载均衡兜着，可能连不上、证书
+/// 对不上、回非 2xx，甚至回一个 200 的挑战页导致解密失败，这些都不该让授权失败。
+async fn tv_request(
     http: &Client,
-    path: &str,
-    form: &[(&str, String)],
-    headers: Option<&[(&str, String)]>,
-    decrypt_key: Option<&[u8; 32]>,
+    api_path: &'static str,
+    body: &Value,
     what: &str,
 ) -> ApiResult<Value> {
-    let attempt = |base: &'static str| async move {
-        let mut request = http.post(format!("{base}{path}")).form(form);
-        for (name, value) in headers.unwrap_or_default() {
-            request = request.header(*name, value);
-        }
-        let value = send(request, what).await?;
-        match decrypt_key {
-            Some(key) => tv_decrypt(&value, key),
-            None => Ok(value),
-        }
+    let now = tv_timestamp(http).await;
+    let params = tv_params();
+    let key = tv_key(&params, &now);
+    let iv = tv_random_iv();
+    let iv_bytes: [u8; 16] = iv.as_bytes().try_into().expect("IV 固定 16 字节");
+    let plaintext = serde_json::to_vec(body).expect("请求体一定能序列化");
+    let encrypted = json!({
+        "ciphertext": tv_encrypt(&plaintext, &key, &iv_bytes),
+        "iv": iv,
+    });
+    let sign = tv_sign(api_path, &now, &key);
+    let req = TvRequest {
+        api_path,
+        params: &params,
+        now: &now,
+        sign: &sign,
+        body: &encrypted,
+        key: &key,
     };
-    match attempt(TV_BASE_HTTPS).await {
+    match tv_send(http, TV_BASE_HTTPS, &req, what).await {
         Ok(value) => Ok(value),
-        Err(_) => attempt(TV_BASE_HTTP).await,
+        Err(_) => tv_send(http, TV_BASE_HTTP, &req, what).await,
     }
 }
 
@@ -952,6 +1027,22 @@ mod tests {
     #[test]
     fn open_refresh_token_pubkey_parses() {
         assert!(OPEN_RT_VERIFIER.is_some(), "开放平台验签公钥 PEM 解析失败");
+    }
+
+    /// PDS 公钥 PEM 同样必须能解析 —— 解析失败时 `web_access_token_expiry` 永远返
+    /// 回 None，官网令牌会被判成「读不出 exp」而每次都触发刷新（白白作废刷新令牌）。
+    #[test]
+    fn pds_access_token_pubkey_parses() {
+        assert!(PDS_AT_VERIFIER.is_some(), "官网（PDS）验签公钥 PEM 解析失败");
+    }
+
+    /// 未签名 / 篡改 / 非 JWT 的官网令牌读不出 exp（验签这一关就过不去）。
+    #[test]
+    fn web_access_token_expiry_needs_valid_signature() {
+        // 测试自造的未签名 JWT：exp 在载荷里，但签名段是假的 → 验签失败 → None。
+        let forged = jwt(r#"{"exp":9999999999}"#);
+        assert_eq!(web_access_token_expiry(&forged), None);
+        assert_eq!(web_access_token_expiry("not-a-jwt"), None);
     }
 
     /// `inspect` 读 `exp` 判过期、按 `aud` 识别应用，都不依赖签名有效性；而 `valid`
@@ -1037,22 +1128,19 @@ mod tests {
         assert!(ensure_business_ok(&json!({ "code": "InvalidParameter" }), "x").is_err());
     }
 
-    /// 与上游 Python 实现对齐：同样的时间戳与参数派生出同样的密钥。
+    /// 与参考实现（alitv_openlist/main.go）对齐：同样的参数与时间戳派生出同样的密钥。
     #[test]
-    fn tv_v3_key_matches_reference_derivation() {
-        let params = vec![
-            ("akv", "2.8.1496".to_owned()),
-            ("apv", "1.3.6".to_owned()),
-            ("b", "abc".to_owned()),
-            ("d", "0123456789abcdef0123456789abcdef".to_owned()),
-            ("m", "abc".to_owned()),
-            ("n", "abc".to_owned()),
-        ];
-        // 拼接值 = "2.8.14961.3.6abc0123456789abcdef0123456789abcdefabcabc"
-        // 位移量取时间戳的后三位（"1717082331"[7:] = 331）
-        let key = tv_v3_key(&params, "1717082331");
+    fn tv_key_matches_reference_derivation() {
+        // tv_params 已按字典序排列且不含 t，拼接顺序即服务端的拼接顺序。
+        let params = tv_params();
+        let joined: String = params.iter().map(|(_, value)| value.as_str()).collect();
+        assert_eq!(
+            joined,
+            "2.8.14961.4.1vivo2c7d30cd7ae5e8017384988393f397c6V2329AV2329A00db00200063"
+        );
+        let key = tv_key(&params, "1717082331");
         let expected = {
-            let joined = "2.8.14961.3.6abc0123456789abcdef0123456789abcdefabcabc";
+            // 位移量取时间戳的后三位（"1717082331"[7:] = 331）
             let mut seen = Vec::new();
             let mut transformed = String::new();
             for ch in joined.chars() {
@@ -1070,13 +1158,27 @@ mod tests {
         };
         assert_eq!(std::str::from_utf8(&key).unwrap(), expected);
         // 时间戳只有后三位参与位移：同秒同参数必然同密钥。
-        assert_eq!(key, tv_v3_key(&params, "1717082331"));
-        assert_ne!(key, tv_v3_key(&params, "1717082332"));
+        assert_eq!(key, tv_key(&params, "1717082331"));
+        assert_ne!(key, tv_key(&params, "1717082332"));
+    }
+
+    /// 请求签名照搬参考实现：`sha256("POST-/api{path}-{t}-{d}-{key}")` 的十六进制。
+    #[test]
+    fn tv_sign_matches_reference() {
+        let params = tv_params();
+        let now = "1717082331";
+        let key = tv_key(&params, now);
+        let key_str = std::str::from_utf8(&key).unwrap();
+        let data = format!("POST-/api/v4/token-{now}-{TV_DEVICE_ID}-{key_str}");
+        let expected = hex::encode(Sha256::digest(data.as_bytes()));
+        assert_eq!(tv_sign("/v4/token", now, &key), expected);
+        // 不同接口路径签出不同的值。
+        assert_ne!(tv_sign("/v2/qrcode", now, &key), expected);
     }
 
     #[test]
     fn tv_ciphertext_roundtrips() {
-        let key = TV_V2_KEY;
+        let key = tv_key(&tv_params(), "1717082331");
         let iv = [0x11u8; 16];
         let plain = br#"{"access_token":"at","refresh_token":"rt","expires_in":7200}"#;
         let mut buffer = vec![0u8; plain.len() + 16];
@@ -1094,5 +1196,19 @@ mod tests {
         // 换个密钥解出来的明文填充必然不成立
         assert!(tv_decrypt(&value, &[0u8; 32]).is_err());
         assert!(tv_decrypt(&json!({ "iv": "zz" }), &key).is_err());
+    }
+
+    /// 请求侧加密（tv_encrypt，iv 为随机串原始字节）能被同密钥+同 iv 解回明文。
+    #[test]
+    fn tv_encrypt_decrypts_back() {
+        let key = tv_key(&tv_params(), "1717082331");
+        let iv = tv_random_iv();
+        let iv_bytes: [u8; 16] = iv.as_bytes().try_into().unwrap();
+        let plain = br#"{"code":"abc123"}"#;
+        let ciphertext = tv_encrypt(plain, &key, &iv_bytes);
+        // 响应解密走 hex-iv，这里模拟服务端把同一 iv 以 hex 回带。
+        let value = json!({ "iv": hex::encode(iv_bytes), "ciphertext": ciphertext });
+        let decoded = tv_decrypt(&value, &key).unwrap();
+        assert_eq!(field(&decoded, &["code"]), Some("abc123"));
     }
 }

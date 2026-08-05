@@ -345,16 +345,32 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ path, name, password }),
     }),
-  createShare: (ds: string, paths: string[]) =>
-    request<{ link: string }>(`/api/files/${ds}/share`, {
+  /**
+   * 生成分享。native=true 走云盘官网原生分享（返回短链 + 提取码，仅未加密数据源可用）；
+   * 否则生成 SafeDrive 标准 sd:// 链接（含解密信息，接收方需 SafeDrive）。
+   * password 仅原生分享有效：留空随机生成，填 4 位字母数字则作自定义提取码。
+   */
+  createShare: (ds: string, paths: string[], native = false, password = '') =>
+    request<
+      | { native: false; link: string }
+      | { native: true; url: string; password: string }
+    >(`/api/files/${ds}/share`, {
       method: 'POST',
-      body: JSON.stringify({ paths }),
+      body: JSON.stringify({ paths, native, password }),
     }),
-  importShare: (ds: string, link: string, dir: string, force = false) =>
-    request<{ ok: boolean; imported: number }>(`/api/files/${ds}/import`, {
-      method: 'POST',
-      body: JSON.stringify({ link, dir, force }),
-    }),
+  /**
+   * 导入分享。sd:// 标准链接自带密码；云盘官网原生短链的提取码优先从链接里的
+   * `?pwd=`/`?passcode=` 读取，读不到且分享需要密码时后端回 needPassword，由前端
+   * 补填后重试。foreign=true 表示明文内容进了加密数据源，将以外来条目呈现。
+   */
+  importShare: (ds: string, link: string, dir: string, force = false, password = '') =>
+    request<{ ok: boolean; imported: number; foreign?: boolean; needPassword?: boolean }>(
+      `/api/files/${ds}/import`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ link, dir, force, password }),
+      },
+    ),
   fileCacheStatus: (ds: string, path: string) =>
     request<FileCacheStatus>(`/api/files/${ds}/cache?path=${encodeURIComponent(path)}`),
   clearFileCache: (ds: string, path: string) =>

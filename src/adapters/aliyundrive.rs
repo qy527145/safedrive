@@ -921,7 +921,7 @@ impl Storage for AliyunDriveFs {
     }
 
     /// 原生分享。开放平台没有分享接口，走官网（PDS）——因此必须配官网令牌。
-    async fn share(&self, paths: &[String]) -> ApiResult<CloudShare> {
+    async fn share(&self, paths: &[String], password: Option<&str>) -> ApiResult<CloudShare> {
         if paths.is_empty() {
             return Err(ApiError::BadRequest("请至少选择一个条目".into()));
         }
@@ -932,7 +932,10 @@ impl Storage for AliyunDriveFs {
         for path in paths {
             file_ids.push(self.stat(path).await?.file_id);
         }
-        let password = aliyun_web::gen_share_password()?;
+        let password = match password {
+            Some(custom) => custom.to_owned(),
+            None => aliyun_web::gen_share_password()?,
+        };
         let share_id = web.create_share(&drive_id, &file_ids, &password).await?;
         Ok(CloudShare {
             url: aliyun_web::share_url(&share_id),

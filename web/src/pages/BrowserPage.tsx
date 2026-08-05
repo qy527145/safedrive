@@ -31,6 +31,7 @@ import {
   Dropdown,
   Empty,
   Input,
+  Radio,
   Segmented,
   Space,
   Spin,
@@ -121,10 +122,12 @@ export default function BrowserPage() {
   const enqueue = useTasks((s) => s.enqueue);
 
   const ds = sources.list.find((d) => d.id === dsId);
-  // 云盘原生分享/转存：百度网盘直接支持；阿里云盘要配了官网令牌才有
-  // （开放平台没有分享与转存接口）。
+  // 云盘原生分享/转存：百度网盘、夸克网盘直接支持；阿里云盘要配了官网令牌
+  // 才有（开放平台没有分享与转存接口）。
   const nativeShare =
-    ds?.type === 'baidupan' || (ds?.type === 'aliyundrive' && !!ds.config.webRefreshToken);
+    ds?.type === 'baidupan' ||
+    ds?.type === 'quark' ||
+    (ds?.type === 'aliyundrive' && !!ds.config.webRefreshToken);
   // 当前目录放在 URL 查询参数里（?path=a/b），进入子目录会 push 历史记录，
   // 浏览器前进/后退沿目录层级走，刷新也能停留在原目录。
   const [searchParams, setSearchParams] = useSearchParams();
@@ -495,20 +498,48 @@ export default function BrowserPage() {
   };
 
   // ---------- 云盘分享 ----------
-  const createShareAction = async () => {
-    if (selectedNames.length === 0) {
-      message.warning('请先选择要分享的文件或文件夹');
-      return;
-    }
-    let result: { link: string };
-    try {
-      result = await api.createShare(dsId, selectedNames.map(joinPath));
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : String(error));
+  // 加密数据源云端存的是密文，官网原生分享对接收方毫无意义 —— 只有未加密
+  // 数据源能选原生分享；加密数据源的**受管**条目一律走标准 sd://。
+  const canNativeShare = nativeShare && !ds?.encryptionEnabled;
+  // 百度、阿里官网分享支持自定义提取码；夸克提取码由官方生成。此判定只看盘
+  // 类型（与是否加密无关）——外来明文条目的原生分享也复用它。
+  const providerCustomPassword = ds?.type === 'baidupan' || ds?.type === 'aliyundrive';
+  const canCustomSharePassword = canNativeShare && providerCustomPassword;
+  // 当前选中的条目（用于判断是否全是外来明文——那样只能走原生分享）。
+  const selectedEntries = entries.filter((e) => selectedNames.includes(e.name));
+  const selectionAllForeign =
+    selectedEntries.length > 0 && selectedEntries.every((e) => e.foreign);
+  const selectionAnyForeign = selectedEntries.some((e) => e.foreign);
+
+  /** 展示分享结果：原生分享给出短链 + 提取码，标准分享给出 sd:// 链接。 */
+  const showShareResult = (
+    result: { native: false; link: string } | { native: true; url: string; password: string },
+    count: number,
+  ) => {
+    if (result.native) {
+      modal.confirm({
+        title: `已创建官网分享（${count} 项）`,
+        icon: <LinkOutlined />,
+        content: <Space direction="vertical" style={{ width: '100%' }}>
+          <Typography.Text type="secondary">云盘官网原生分享，接收方用官方 App / 网页即可打开，无需 SafeDrive。提取码已内嵌在链接里。</Typography.Text>
+          <Input.TextArea readOnly value={result.url} autoSize={{ minRows: 2, maxRows: 4 }} onFocus={(e) => e.target.select()} />
+          {result.password && (
+            <Typography.Text type="secondary">
+              提取码：<Typography.Text code copyable>{result.password}</Typography.Text>
+            </Typography.Text>
+          )}
+        </Space>,
+        okText: '复制链接',
+        cancelText: '关闭',
+        onOk: async () => {
+          await navigator.clipboard.writeText(result.url);
+          message.success('分享链接已复制');
+        },
+      });
       return;
     }
     modal.confirm({
-      title: `已创建分享（${selectedNames.length} 项）`,
+      title: `已创建分享（${count} 项）`,
       icon: <LinkOutlined />,
       content: <Space direction="vertical" style={{ width: '100%' }}>
         <Typography.Text type="warning">链接包含提取码和解密信息，请只发给可信接收者。</Typography.Text>
@@ -523,22 +554,146 @@ export default function BrowserPage() {
     });
   };
 
+  const runCreateShare = async (native: boolean, password = '') => {
+    const count = selectedNames.length;
+    try {
+      const result = await api.createShare(
+        dsId,
+        selectedNames.map(joinPath),
+        native,
+        native ? password.trim() : '',
+      );
+      showShareResult(result, count);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  /** 外来（明文）条目只能走官网原生分享；百度/阿里可自定义提取码，其余直接生成。 */
+  const shareForeign = () => {
+    if (!providerCustomPassword) {
+      void runCreateShare(true);
+      return;
+    }
+    let customPwd = '';
+    modal.confirm({
+      title: `分享 ${selectedNames.length} 项（外来明文）`,
+      icon: <LinkOutlined />,
+      content: <Space direction="vertical" style={{ width: '100%' }}>
+        <Typography.Text type="secondary">
+          选中的是外来明文条目，将生成云盘官网原生分享（任何人可用官方 App / 网页打开）。
+        </Typography.Text>
+        <Input
+          addonBefore="自定义提取码"
+          maxLength={4}
+          placeholder="留空随机生成（4 位字母或数字）"
+          onChange={(e) => { customPwd = e.target.value; }}
+        />
+      </Space>,
+      okText: '创建分享',
+      onOk: () => runCreateShare(true, customPwd),
+    });
+  };
+
+  const createShareAction = () => {
+    if (selectedNames.length === 0) {
+      message.warning('请先选择要分享的文件或文件夹');
+      return;
+    }
+    // 受管密文与外来明文不能混在一次分享（后端也会拒绝，这里先友好拦一下）。
+    if (selectionAnyForeign && !selectionAllForeign) {
+      message.warning('外来（明文）条目与受管加密条目不能一起分享，请分开选择');
+      return;
+    }
+    // 全外来：只能原生分享（sd:// 封装的是解密信息，对明文对象无意义）。
+    if (selectionAllForeign) {
+      shareForeign();
+      return;
+    }
+    // 只有一种可选格式时不必打扰用户，直接生成标准分享。
+    if (!canNativeShare) {
+      void runCreateShare(false);
+      return;
+    }
+    let native = false;
+    let customPwd = '';
+    modal.confirm({
+      title: `分享 ${selectedNames.length} 项`,
+      icon: <LinkOutlined />,
+      content: <Space direction="vertical" style={{ width: '100%' }}>
+        <Typography.Text type="secondary">选择分享格式：</Typography.Text>
+        <Radio.Group defaultValue="sd" onChange={(e) => { native = e.target.value === 'native'; }}>
+          <Space direction="vertical">
+            <Radio value="sd">SafeDrive 标准分享（sd://，含解密信息，接收方需 SafeDrive）</Radio>
+            <Radio value="native">云盘官网原生分享（短链 + 提取码，任何人可用官方 App 打开）</Radio>
+          </Space>
+        </Radio.Group>
+        {canCustomSharePassword && (
+          <Input
+            addonBefore="自定义提取码"
+            maxLength={4}
+            placeholder="留空随机生成，仅官网原生分享有效"
+            onChange={(e) => { customPwd = e.target.value; }}
+          />
+        )}
+      </Space>,
+      okText: '创建分享',
+      onOk: () => runCreateShare(native, customPwd),
+    });
+  };
+
   const importShareAction = () => {
     let link = '';
-    const run = async (force: boolean) => {
-      const result = await api.importShare(dsId, link.trim(), curPath, force);
+    // 提取码留空先探测（免密分享直接成功；链接内嵌 ?pwd= 也会被后端自动读取）。
+    // 后端回 needPassword 表示确实需要提取码，再弹框补填后重试。
+    const run = async (force: boolean, password: string) => {
+      const result = await api.importShare(dsId, link.trim(), curPath, force, password.trim());
+      if (!result.ok && result.needPassword) {
+        promptPasswordThenImport(force);
+        return;
+      }
       message.success(`已导入 ${result.imported} 项`);
+      if (result.foreign) {
+        message.info('分享内容为明文，已作为「外来条目」导入到加密数据源，仍可正常预览/下载');
+      }
       await refresh();
+    };
+    const promptPasswordThenImport = (force: boolean) => {
+      let pwd = '';
+      modal.confirm({
+        title: '该分享需要提取码',
+        icon: <ImportOutlined />,
+        content: <Space direction="vertical" style={{ width: '100%' }}>
+          <Typography.Text type="secondary">链接里未检测到提取码，且该分享需要密码，请填写后重试。</Typography.Text>
+          <Input placeholder="提取码" onChange={(e) => { pwd = e.target.value; }} />
+        </Space>,
+        okText: '导入',
+        onOk: async () => {
+          if (!pwd.trim()) throw new Error('请输入提取码');
+          try {
+            await run(force, pwd);
+          } catch (error) {
+            message.error(error instanceof Error ? error.message : String(error));
+            throw error; // 保留弹窗，便于更正后重试
+          }
+        },
+      });
     };
     modal.confirm({
       title: '导入分享',
       icon: <ImportOutlined />,
-      content: <Input.TextArea autoSize={{ minRows: 4, maxRows: 8 }} placeholder="粘贴 sd:// 分享链接" onChange={(e) => { link = e.target.value; }} />,
+      content: <Space direction="vertical" style={{ width: '100%' }}>
+        <Input.TextArea
+          autoSize={{ minRows: 3, maxRows: 8 }}
+          placeholder="粘贴 sd:// 标准分享链接，或云盘官网分享短链（自动识别，含 ?pwd= 时免手填提取码）"
+          onChange={(e) => { link = e.target.value; }}
+        />
+      </Space>,
       okText: '导入到当前目录',
       onOk: async () => {
         if (!link.trim()) throw new Error('请粘贴分享链接');
         try {
-          await run(false);
+          await run(false, '');
         } catch (error) {
           const text = error instanceof Error ? error.message : String(error);
           if (!text.includes('加密模式不兼容')) throw error;
@@ -547,7 +702,7 @@ export default function BrowserPage() {
             content: `${text}。仍要继续吗？`,
             okText: '仍然导入',
             okButtonProps: { danger: true },
-            onOk: () => run(true),
+            onOk: () => run(true, ''),
           });
         }
       },
@@ -556,11 +711,13 @@ export default function BrowserPage() {
 
   // ---------- 行为 ----------
   const onNameClick = (item: FsEntry) => {
-    if (item.foreign) return;
     if (item.isDir) {
+      // 外来目录也允许进入，其内容按外来条目呈现（可预览/下载）；
+      // 若它其实是 SafeDrive 加密目录，可另用「输入密码解密」纳管。
       gotoPath(joinPath(item.name));
       return;
     }
+    // 外来明文文件（如转存进来的他人明文分享）可照常预览/下载
     if (previewKind(item.name) === 'none') {
       message.info('该类型不支持预览，请直接下载');
       return;
@@ -580,6 +737,14 @@ export default function BrowserPage() {
           label: '输入密码解密',
           onClick: () => adoptForeignAction(item),
         });
+      } else {
+        // 外来明文文件（转存进来的他人明文分享）照常可预览/下载/复制链接
+        if (previewKind(item.name) !== 'none') {
+          foreignItems.push({ key: 'preview', icon: <EyeOutlined />, label: '预览', onClick: () => onNameClick(item) });
+        }
+        foreignItems.push({ key: 'download', icon: <DownloadOutlined />, label: '下载', onClick: () => downloadAction(item) });
+        foreignItems.push({ key: 'link', icon: <LinkOutlined />, label: '复制播放链接', onClick: () => void copyStreamLink(item) });
+        foreignItems.push({ type: 'divider' });
       }
       foreignItems.push({
         key: 'delete-foreign',
@@ -693,7 +858,7 @@ export default function BrowserPage() {
               上传 <DownOutlined />
             </Button>
           </Dropdown>
-          {nativeShare && <Button icon={<LinkOutlined />} disabled={!selectedNames.length} onClick={() => void createShareAction()}>
+          {nativeShare && <Button icon={<LinkOutlined />} disabled={!selectedNames.length} onClick={createShareAction}>
             分享{selectedNames.length ? ` (${selectedNames.length})` : ''}
           </Button>}
           {nativeShare && <Button icon={<ImportOutlined />} onClick={importShareAction}>导入分享</Button>}
@@ -737,14 +902,15 @@ export default function BrowserPage() {
                   className={`file-tile${item.foreign ? ' foreign' : ''}`}
                   onClick={() => onNameClick(item)}
                 >
-                  {!item.foreign && <Checkbox
+                  {/* 外来条目也可勾选：用于生成官网原生分享、或批量移动/复制/删除 */}
+                  <Checkbox
                     checked={selectedNames.includes(item.name)}
                     onClick={(event) => event.stopPropagation()}
                     onChange={(event) => setSelectedNames((current) => event.target.checked
                       ? [...current, item.name]
                       : current.filter((name) => name !== item.name))}
                     style={{ position: 'absolute', left: 10, top: 10 }}
-                  />}
+                  />
                   <div className="file-tile-icon">
                     {item.isDir ? (
                       <FolderOutlined style={{ color: '#faad14' }} />
@@ -781,7 +947,6 @@ export default function BrowserPage() {
         size="middle"
         rowSelection={{
           selectedRowKeys: selectedNames,
-          getCheckboxProps: (item) => ({ disabled: item.foreign }),
           onChange: (keys) => setSelectedNames(keys.map(String)),
         }}
         columns={[
@@ -796,9 +961,16 @@ export default function BrowserPage() {
                   <FileOutlined style={{ color: '#8c8c8c' }} />
                 )}
                 {item.foreign ? (
-                  <Typography.Text type="secondary">
-                    {item.name} <Tag>外来</Tag>
-                  </Typography.Text>
+                  <span>
+                    <Typography.Link onClick={() => onNameClick(item)}>{item.name}</Typography.Link>{' '}
+                    <Tooltip
+                      title={item.isDir
+                        ? '外来目录（如他人明文分享转存进来），可进入浏览；若是 SafeDrive 加密目录，可用密码解密纳管'
+                        : '外部明文文件（如他人明文分享），可正常预览/下载'}
+                    >
+                      <Tag>外来</Tag>
+                    </Tooltip>
+                  </span>
                 ) : (
                   <Typography.Link onClick={() => onNameClick(item)}>{item.name}</Typography.Link>
                 )}
@@ -852,7 +1024,7 @@ export default function BrowserPage() {
             render: (_, item) =>
               item.foreign ? (
                 <Space>
-                  {item.isDir && (
+                  {item.isDir ? (
                     <Tooltip title="输入密码解密">
                       <Button
                         size="small"
@@ -860,6 +1032,20 @@ export default function BrowserPage() {
                         onClick={() => adoptForeignAction(item)}
                       />
                     </Tooltip>
+                  ) : (
+                    <>
+                      {previewKind(item.name) !== 'none' && (
+                        <Tooltip title="预览">
+                          <Button size="small" icon={<EyeOutlined />} onClick={() => onNameClick(item)} />
+                        </Tooltip>
+                      )}
+                      <Tooltip title="下载">
+                        <Button size="small" icon={<DownloadOutlined />} onClick={() => downloadAction(item)} />
+                      </Tooltip>
+                      <Tooltip title="复制播放链接">
+                        <Button size="small" icon={<LinkOutlined />} onClick={() => void copyStreamLink(item)} />
+                      </Tooltip>
+                    </>
                   )}
                   <Tooltip title="删除外来条目">
                     <Button

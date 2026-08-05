@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use reqwest::Client;
-use reqwest::header::{HeaderName, SET_COOKIE, USER_AGENT};
+use reqwest::header::{HeaderName, ORIGIN, REFERER, SET_COOKIE, USER_AGENT};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::{CredentialPersister, ImportedEntry};
 use crate::error::{ApiError, ApiResult};
@@ -29,6 +30,17 @@ const AUTHORIZE_URL: &str = "https://auth.aliyundrive.com/v2/oauth/authorize";
 const AUTHORIZE_SID: &str = "m10qxi1syey6h";
 const AUTHORIZE_CLIENT_ID: &str = "25dzX3vbYqktVxyX";
 const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/// 官网数据接口（api.aliyundrive.com）的写操作（分享/转存等）走风控，必须带一整套
+/// 反滥用请求头，否则边缘 WAF 直接回 `403 Forbidden`（纯文本，不带 JSON code）。
+/// 这个 App UA 与下面的 `X_CANARY` 成对出现，比桌面浏览器 UA 更不容易触发风控。
+const APP_UA: &str = "AliApp(AYSD/5.8.0) com.alicloud.databox/37029260 Channel/36176927979800@rimet_android_5.8.0 language/zh-CN /Android Mobile";
+/// 风控放行标记（提升频率上限，声明客户端渠道/版本）。
+const X_CANARY: &str = "client=Android,app=adrive,version=v5.8.0";
+/// aligo 项目公开的固定设备签名与 **公钥**（均为公开常量，非私钥）。官网写接口需要
+/// 一份「设备会话」：用这套已知可用的静态签名 + 公钥调一次 create_session 注册设备，
+/// 之后带上同一 device-id + 签名即可通过，省掉引入 secp256k1 现场签名的依赖。
+const DEVICE_SIGNATURE: &str = "f4b7bed5d8524a04051bd2da876dd79afe922b8205226d65855d02b267422adb1e0d8a816b021eaf5c36d101892180f79df655c5712b348c2a540ca136e6b22001";
+const DEVICE_PUBKEY: &str = "04d9d2319e0480c840efeeb75751b86d0db0c5b9e72c6260a1d846958adceaf9dee789cab7472741d23aafc1a9c591f72e7ee77578656e6c8588098dea1488ac2a";
 const TOKEN_REFRESH_SKEW_SECS: u64 = 120;
 /// 分享密码取数字 2-9：阿里接受纯数字密码，且落在 `sd://` 的密码字母表内。
 const SHARE_PASSWORD_ALPHABET: &[u8] = b"23456789";
@@ -134,11 +146,14 @@ impl WebClient {
     /// 取可用的官网 access token；`stale` 是刚被上游判定失效的那个。
     async fn access_token(&self, stale: Option<&str>) -> ApiResult<String> {
         let usable = |tokens: &LiveTokens| {
-            !tokens.access_token.is_empty()
-                && Some(tokens.access_token.as_str()) != stale
-                && tokens
-                    .expires_at
-                    .is_some_and(|at| at > unix_time_secs() + TOKEN_REFRESH_SKEW_SECS)
+            if tokens.access_token.is_empty() || Some(tokens.access_token.as_str()) == stale {
+                return false;
+            }
+            // 官网 access_token 是 RS256 JWT：优先用 PDS 公钥验签并读它自带的 exp，
+            // 以令牌自身为准比盲信配置里存的 expires_at 可靠（验不出就退回存的值）。
+            let expiry = super::aliyun_apps::web_access_token_expiry(&tokens.access_token)
+                .or(tokens.expires_at);
+            expiry.is_some_and(|at| at > unix_time_secs() + TOKEN_REFRESH_SKEW_SECS)
         };
         if usable(&self.live()) {
             return Ok(self.live().access_token);
@@ -171,7 +186,9 @@ impl WebClient {
             .get("expires_in")
             .and_then(Value::as_u64)
             .unwrap_or(7200);
-        let expires_at = unix_time_secs().saturating_add(ttl);
+        // access_token 自带 exp，验签通过就以它为准；验不出再退回 now + expires_in。
+        let expires_at = super::aliyun_apps::web_access_token_expiry(&access)
+            .unwrap_or_else(|| unix_time_secs().saturating_add(ttl));
         TOKENS.lock().unwrap().insert(
             self.account.clone(),
             LiveTokens {
@@ -195,7 +212,55 @@ impl WebClient {
         refresh_web_token(&self.http, refresh_token).await
     }
 
-    /// 官网 POST 调用；令牌失效自动刷新重试一次。
+    /// 本账号稳定的 device-id：由账号派生，重启不变（aligo 的静态签名与
+    /// device-id 无关，只要 device-id 稳定并注册过设备会话即可）。
+    fn device_id(&self) -> String {
+        let digest = Sha256::digest(self.account.as_bytes());
+        hex::encode(digest)[..32].to_owned()
+    }
+
+    /// 给官网写接口挂上一整套反滥用请求头。少任何一项都可能被边缘 WAF 拦成 403。
+    fn apply_write_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+            .header(USER_AGENT, APP_UA)
+            .header(REFERER, "https://www.aliyundrive.com/")
+            .header(ORIGIN, "https://www.aliyundrive.com")
+            .header(HeaderName::from_static("x-canary"), X_CANARY)
+            .header(HeaderName::from_static("x-device-id"), self.device_id())
+            .header(HeaderName::from_static("x-signature"), DEVICE_SIGNATURE)
+            .header(
+                HeaderName::from_static("x-request-id"),
+                uuid::Uuid::new_v4().to_string(),
+            )
+    }
+
+    /// 注册设备会话。写接口报「设备会话签名无效 / 设备离线」时调一次，
+    /// 用固定公钥把当前 device-id 登记到服务端，然后重试原请求。
+    async fn create_session(&self, token: &str) -> ApiResult<()> {
+        let body = json!({
+            "deviceName": "SafeDrive",
+            "modelName": "SafeDrive",
+            "pubKey": DEVICE_PUBKEY,
+        });
+        let request = self
+            .http
+            .post(format!("{API_BASE}/users/v1/users/device/create_session"))
+            .bearer_auth(token)
+            .json(&body);
+        let response = self
+            .apply_write_headers(request)
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(format!("阿里云盘注册设备会话失败: {e}")))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            tracing::warn!("阿里云盘注册设备会话未成功（HTTP {status}）: {text}");
+        }
+        Ok(())
+    }
+
+    /// 官网 POST 调用；令牌失效自动刷新重试一次，设备会话缺失自动注册重试一次。
     async fn post(
         &self,
         path: &str,
@@ -204,13 +269,11 @@ impl WebClient {
         share_token: Option<&str>,
     ) -> ApiResult<Value> {
         let mut stale: Option<String> = None;
+        let mut session_retried = false;
         loop {
             let token = self.access_token(stale.as_deref()).await?;
             let mut request = self
-                .http
-                .post(format!("{API_BASE}{path}"))
-                .bearer_auth(&token)
-                .header(USER_AGENT, WEB_UA)
+                .apply_write_headers(self.http.post(format!("{API_BASE}{path}")).bearer_auth(&token))
                 .json(body);
             if let Some(share_token) = share_token {
                 request = request.header(share_token_header(), share_token);
@@ -230,19 +293,26 @@ impl WebClient {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
-            let token_dead = status == reqwest::StatusCode::UNAUTHORIZED
-                || matches!(
-                    code.as_str(),
-                    "AccessTokenInvalid" | "AccessTokenExpired" | "UserDeviceOffline"
-                );
-            if token_dead && stale.is_none() {
-                stale = Some(token);
-                continue;
-            }
             let message = value
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or(text.as_str());
+            // 设备会话缺失/失效：注册一次设备会话后重试（与令牌刷新各重试一次）。
+            let device_dead = matches!(code.as_str(), "DeviceSessionSignatureInvalid")
+                || message.contains("device session")
+                || message.contains("not found device info")
+                || (code == "UserDeviceOffline");
+            if device_dead && !session_retried {
+                session_retried = true;
+                self.create_session(&token).await?;
+                continue;
+            }
+            let token_dead = status == reqwest::StatusCode::UNAUTHORIZED
+                || matches!(code.as_str(), "AccessTokenInvalid" | "AccessTokenExpired");
+            if token_dead && stale.is_none() {
+                stale = Some(token);
+                continue;
+            }
             return Err(ApiError::Upstream(format!(
                 "阿里云盘{what}失败: HTTP {status} {code} {message}"
             )));
@@ -272,7 +342,7 @@ impl WebClient {
             "sync_to_homepage": false,
         });
         let value = self
-            .post("/adrive/v3/share_link/create", &body, "创建分享", None)
+            .post("/adrive/v2/share_link/create", &body, "创建分享", None)
             .await?;
         value
             .get("share_id")

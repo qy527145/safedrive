@@ -176,8 +176,10 @@ pub trait Storage: Send + Sync {
     async fn delete(&self, path: &str) -> ApiResult<()>;
     /// 重命名/移动（同一数据源内）。
     async fn rename(&self, from: &str, to: &str) -> ApiResult<()>;
-    /// 使用数据源的原生能力创建分享。`paths` 是存储端相对路径。
-    async fn share(&self, _paths: &[String]) -> ApiResult<CloudShare> {
+    /// 使用数据源的原生能力创建分享。`paths` 是存储端相对路径；`password`
+    /// 为 `Some` 时用作自定义提取码（走官网原生渠道分享时可用），`None` 则由
+    /// 适配器随机生成。
+    async fn share(&self, _paths: &[String], _password: Option<&str>) -> ApiResult<CloudShare> {
         Err(ApiError::BadRequest("该数据源不支持分享".into()))
     }
     /// 解析并转存原生分享到 `dest`，返回转存后在目标目录下的存储名。

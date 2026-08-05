@@ -1890,7 +1890,7 @@ impl Storage for BaiduPanFs {
         .map(|_| ())
     }
 
-    async fn share(&self, paths: &[String]) -> ApiResult<CloudShare> {
+    async fn share(&self, paths: &[String], password: Option<&str>) -> ApiResult<CloudShare> {
         if paths.is_empty() {
             return Err(ApiError::BadRequest("请至少选择一个分享条目".into()));
         }
@@ -1898,14 +1898,20 @@ impl Storage for BaiduPanFs {
         for path in paths {
             ids.push(self.object_id(path).await?);
         }
-        let alphabet = b"abcdefghjkmnpqrstuvwxyz23456789";
-        let mut random = [0u8; 4];
-        getrandom::fill(&mut random)
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("生成分享密码失败: {e}")))?;
-        let password: String = random
-            .into_iter()
-            .map(|byte| alphabet[byte as usize % alphabet.len()] as char)
-            .collect();
+        // 有自定义提取码就用它，否则随机 4 位。
+        let password = match password {
+            Some(custom) => custom.to_owned(),
+            None => {
+                let alphabet = b"abcdefghjkmnpqrstuvwxyz23456789";
+                let mut random = [0u8; 4];
+                getrandom::fill(&mut random)
+                    .map_err(|e| ApiError::Internal(anyhow::anyhow!("生成分享密码失败: {e}")))?;
+                random
+                    .into_iter()
+                    .map(|byte| alphabet[byte as usize % alphabet.len()] as char)
+                    .collect()
+            }
+        };
         let token = self.bdstoken().await?;
         let mut url = self.share_url("share/pset")?;
         url.query_pairs_mut()
@@ -3139,7 +3145,7 @@ mod tests {
             (&"renewed-token".to_string(), &"refresh-new-2".to_string())
         );
         assert!(second.2 >= unix_time_secs() + 3599);
-        let share = fs.share(&["cipher-dir".to_owned()]).await.unwrap();
+        let share = fs.share(&["cipher-dir".to_owned()], None).await.unwrap();
         assert_eq!(share.url, "https://pan.baidu.com/s/10Tu8WSOdLQVnJpX-oI8Fhg");
         assert_eq!(share.password.len(), 4);
         let imported = fs
