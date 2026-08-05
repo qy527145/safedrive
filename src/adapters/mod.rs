@@ -1,6 +1,7 @@
 pub mod aliyun_apps;
 pub mod aliyun_web;
 pub mod aliyundrive;
+pub mod baidu_apps;
 pub mod baidupan;
 pub mod localfs;
 pub mod quark;

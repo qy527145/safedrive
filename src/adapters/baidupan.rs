@@ -45,8 +45,6 @@ const PCS_FILE_API: &str = "https://pcs.baidu.com/rest/2.0/pcs/file";
 const PCS_UPLOAD_API: &str = "https://d.pcs.baidu.com/rest/2.0/pcs/superfile2";
 /// locateupload（动态上传域名调度）走 d.pcs 域（对齐 OpenList）。
 const PCS_LOCATE_UPLOAD_API: &str = "https://d.pcs.baidu.com/rest/2.0/pcs/file";
-const DEFAULT_CLIENT_ID: &str = "NqOMXF6XGhGRIGemsQ9nG0Na";
-const DEFAULT_CLIENT_SECRET: &str = "SVT6xpMdLcx6v4aCR4wT8BBOTbzFO8LM";
 const PAN_APP_ID: &str = "250528";
 const DEFAULT_DOWNLOAD_UA: &str = "netdisk;P2SP;2.2.61.31;android";
 const DEFAULT_WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -463,18 +461,12 @@ impl BaiduPanFs {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let (client_id, client_secret) = match (configured_client_id, configured_client_secret) {
-            (Some(id), Some(secret)) => (id.to_owned(), secret.to_owned()),
-            (None, None) => (
-                DEFAULT_CLIENT_ID.to_owned(),
-                DEFAULT_CLIENT_SECRET.to_owned(),
-            ),
-            _ => {
-                return Err(ApiError::BadRequest(
-                    "百度开放平台 API Key 与 Secret Key 必须同时填写或同时留空".into(),
-                ));
-            }
-        };
+        // 内置的 ES 文件管理器（默认）或用户自备应用，凭据解析与阿里云盘同构。
+        let (client_id, client_secret) = super::baidu_apps::resolve(
+            config.get("app").and_then(Value::as_str),
+            configured_client_id,
+            configured_client_secret,
+        )?;
         let upload_threads = config
             .get("uploadThreads")
             .and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok()))
@@ -2658,7 +2650,7 @@ mod tests {
         assert_eq!(query.get("openapi"), None);
         assert_eq!(
             query.get("client_id").map(String::as_str),
-            Some(DEFAULT_CLIENT_ID)
+            Some(crate::adapters::baidu_apps::find("es").unwrap().client_id)
         );
         match query.get("grant_type").map(String::as_str) {
             Some("device_token") => {
@@ -2693,7 +2685,7 @@ mod tests {
         assert_eq!(query.get("openapi"), None);
         assert_eq!(
             query.get("client_id").map(String::as_str),
-            Some(DEFAULT_CLIENT_ID)
+            Some(crate::adapters::baidu_apps::find("es").unwrap().client_id)
         );
         Json(json!({
             "device_code": "device-code",

@@ -68,7 +68,7 @@ export interface DsConfig {
   refreshToken?: string;
   accessTokenExpiresAt?: number;
   shareApiBase?: string;
-  /** 阿里云盘：内置第三方应用键，或 custom（自备 client_id/secret） */
+  /** 阿里云盘 / 百度网盘：内置第三方应用键，或 custom（自备 client_id/secret） */
   app?: string;
   /** 阿里云盘：resource（资源盘）/ backup（备份盘） */
   driveType?: string;
@@ -98,6 +98,15 @@ export interface AliyunAppInput {
   app?: string;
   clientId?: string;
   clientSecret?: string;
+}
+
+/** 内置的百度网盘第三方应用：密钥公开、直连开放平台，用户不必自建应用。 */
+export interface BaiduApp {
+  key: string;
+  name: string;
+  clientId: string;
+  /** 提示文案：这个应用的密钥怎么来的 */
+  note: string;
 }
 
 /** 官网扫码会话（passport Cookie + 二维码参数）。前端只负责原样带回，不解读。 */
@@ -229,6 +238,9 @@ export const api = {
     request<DsRecord>('/api/ds/import', { method: 'POST', body: JSON.stringify({ link }) }),
 
   // ---- 百度网盘扫码登录（自动获取 BDUSS） ----
+  /** 内置第三方应用清单；default 是扫码默认用的应用，custom 是「自备应用」的键。 */
+  baiduApps: () =>
+    request<{ apps: BaiduApp[]; default: string; custom: string }>('/api/baidu/apps'),
   baiduQrCreate: () =>
     request<{ sign: string; gid: string; img: string }>('/api/baidu/qrcode', { method: 'POST' }),
   baiduQrPoll: (sign: string, gid: string) =>

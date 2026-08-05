@@ -1,7 +1,7 @@
 import { QrcodeOutlined, ReloadOutlined } from '@ant-design/icons';
 import { App, Button, Card, Checkbox, Form, Input, Modal, QRCode, Select, Spin, Switch, Typography } from 'antd';
 import { useCallback, useEffect, useState } from 'react';
-import { api, type AliyunApp, type AliyunAppInput, type DsRecord, type DsType } from '../api/client';
+import { api, type AliyunApp, type AliyunAppInput, type BaiduApp, type DsRecord, type DsType } from '../api/client';
 import { useSources } from '../stores/sources';
 import { parseSize, sizeToInput } from '../utils/format';
 
@@ -28,6 +28,7 @@ const DS_TYPES: { label: string; value: DsType }[] = [
 const CUSTOM_APP = 'custom';
 /** 内置应用清单是常量表，取一次就够，弹窗反复开关不必重复请求。 */
 let aliyunAppsCache: { apps: AliyunApp[]; default: string; custom: string } | null = null;
+let baiduAppsCache: { apps: BaiduApp[]; default: string; custom: string } | null = null;
 
 const trim = (s?: string) => (s ?? '').trim();
 
@@ -57,8 +58,11 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
       return { root: trim(v.root), cookie: trim(v.cookie), apiBase: trim(v.apiBase) };
     default:
       // 编辑时若把 BDUSS 留空，视为沿用原值（表单里本来就是回填的）。
+      // 选了内置应用（默认 ES 文件管理器）就不带自备凭据，只有自定义应用才回填。
       return { root: v.root ?? '/safedrive', bduss: trim(v.bduss) || trim(editing?.config.bduss),
-        userAgent: v.userAgent ?? '', clientId: trim(v.clientId), clientSecret: trim(v.clientSecret) };
+        userAgent: v.userAgent ?? '', app: trim(v.app),
+        clientId: v.app === CUSTOM_APP ? trim(v.clientId) : '',
+        clientSecret: v.app === CUSTOM_APP ? trim(v.clientSecret) : '' };
   }
 }
 
@@ -73,6 +77,7 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
   const [aliQrOpen, setAliQrOpen] = useState(false);
   const [aliWebQrOpen, setAliWebQrOpen] = useState(false);
   const [aliApps, setAliApps] = useState(aliyunAppsCache);
+  const [baiduApps, setBaiduApps] = useState(baiduAppsCache);
   /** 手填 refresh_token 的识别结果提示 */
   const [aliDetected, setAliDetected] = useState('');
   /** 「用官网令牌静默授权」进行中 */
@@ -83,7 +88,8 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
   const volume = Form.useWatch('volumeEnabled', form) ?? true;
   const clientId = Form.useWatch('clientId', form) ?? '';
   const clientSecret = Form.useWatch('clientSecret', form) ?? '';
-  const aliApp = Form.useWatch('app', form) ?? '';
+  // `app` 字段由阿里云盘与百度网盘共用（同一时刻只有一种类型在编辑）。
+  const selectedApp = Form.useWatch('app', form) ?? '';
   const aliRefreshToken = Form.useWatch('refreshToken', form) ?? '';
   const aliWebRefreshToken = Form.useWatch('webRefreshToken', form) ?? '';
 
@@ -127,6 +133,23 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
     if (!open || type !== 'aliyundrive' || !aliApps) return;
     if (!trim(form.getFieldValue('app'))) form.setFieldsValue({ app: aliApps.default });
   }, [open, type, aliApps, form]);
+
+  // 百度网盘内置应用清单：进了百度表单才拉，取不到也不影响「自定义应用」。
+  useEffect(() => {
+    if (!open || type !== 'baidupan' || baiduAppsCache) return;
+    void (async () => {
+      try {
+        baiduAppsCache = await api.baiduApps();
+        setBaiduApps(baiduAppsCache);
+      } catch { /* 下拉框只剩自定义应用，用户仍可自己填凭据 */ }
+    })();
+  }, [open, type]);
+
+  // 新建百度网盘时给一个默认应用（默认 ES 文件管理器）。
+  useEffect(() => {
+    if (!open || type !== 'baidupan' || !baiduApps) return;
+    if (!trim(form.getFieldValue('app'))) form.setFieldsValue({ app: baiduApps.default });
+  }, [open, type, baiduApps, form]);
 
   /**
    * refresh_token 是 JWT，交给服务端验签 + 读 `aud`：不合法/过期都如实提示，
@@ -197,7 +220,7 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
 
   /** 自定义应用扫码前先确认凭据填了 —— 没有它们连二维码都换不到。 */
   const openAliyunQr = async () => {
-    if (aliApp === CUSTOM_APP) {
+    if (selectedApp === CUSTOM_APP) {
       try { await form.validateFields(['clientId', 'clientSecret']); } catch { return; }
     }
     setAliQrOpen(true);
@@ -252,7 +275,12 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
     ...(aliApps?.apps ?? []).map((app) => ({ label: app.name, value: app.key })),
     { label: '自定义应用（自备 client_id / client_secret）', value: CUSTOM_APP },
   ];
-  const aliAppNote = aliApps?.apps.find((app) => app.key === aliApp)?.note;
+  const aliAppNote = aliApps?.apps.find((app) => app.key === selectedApp)?.note;
+  const baiduAppOptions = [
+    ...(baiduApps?.apps ?? []).map((app) => ({ label: app.name, value: app.key })),
+    { label: '自定义应用（自备 API Key / Secret Key）', value: CUSTOM_APP },
+  ];
+  const baiduAppNote = baiduApps?.apps.find((app) => app.key === selectedApp)?.note;
 
   return <Modal title={editing?'编辑数据源':cloneFrom?'克隆数据源':'添加数据源'} open={open} confirmLoading={saving} onOk={()=>void onSubmit()} onCancel={confirmClose} destroyOnHidden width={620}>
     <Form form={form} layout="vertical" name="ds">
@@ -260,13 +288,16 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
       <Form.Item name="type" label="类型" rules={[{required:true}]}><Select disabled={!!editing} options={DS_TYPES}/></Form.Item>
       {type==='localfs'&&<Form.Item name="root" label="根目录" rules={[{required:true}]}><Input/></Form.Item>}
       {type==='webdav'&&<><Form.Item name="url" label="WebDAV 地址" rules={[{required:true},{pattern:/^https?:\/\//}]}><Input/></Form.Item><Form.Item name="username" label="用户名"><Input/></Form.Item><Form.Item name="password" label="密码"><Input.Password/></Form.Item></>}
-      {type==='baidupan'&&<><Form.Item name="root" label="网盘根目录" rules={[{required:true}]}><Input/></Form.Item><Form.Item name="clientId" label="开放平台 API Key（可选）"><Input/></Form.Item><Form.Item name="clientSecret" label="Secret Key（可选）"><Input.Password/></Form.Item>
+      {type==='baidupan'&&<><Form.Item name="root" label="网盘根目录" rules={[{required:true}]}><Input/></Form.Item>
+      <Form.Item name="app" label="第三方应用" extra={baiduAppNote ?? '内置应用无需自建：扫码拿到 BDUSS 后自动授权换取令牌'}><Select options={baiduAppOptions} placeholder="ES 文件管理器"/></Form.Item>
+      {selectedApp===CUSTOM_APP&&<><Form.Item name="clientId" label="API Key（client_id）" rules={[{required:true}]} extra="百度网盘开放平台自建应用的凭据；只在本机与百度官方接口之间流转"><Input/></Form.Item>
+      <Form.Item name="clientSecret" label="Secret Key（client_secret）" rules={[{required:true}]}><Input.Password/></Form.Item></>}
       <Form.Item name="bduss" label="BDUSS" rules={[{required:true,message:'请扫码登录获取，或手动粘贴'}]} extra={<Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>setQrOpen(true)}>扫码登录自动获取</Button>}><Input.Password placeholder="点击下方扫码登录自动获取，或手动粘贴 Cookie 中的 BDUSS"/></Form.Item>
       <Form.Item name="userAgent" label="下载 User-Agent" extra="留空使用默认值，仅影响下载数据流量的 UA 标识"><Input placeholder="netdisk;P2SP;2.2.61.31;android"/></Form.Item></>}
       {type==='aliyundrive'&&<><Form.Item name="root" label="网盘根目录" extra="留空即网盘根目录；建议单独用一个目录"><Input placeholder="/safedrive"/></Form.Item>
       <Form.Item name="webRefreshToken" label="官网令牌（推荐）" extra={<><Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>setAliWebQrOpen(true)}>扫码登录官网获取</Button><div><Typography.Text type="secondary">扫码登录后可免扫码换取下方开放平台 refresh_token；分享与转存走官网 PDS 接口，必须配置官网令牌才可用。不需要分享/转存可留空。</Typography.Text></div></>}><Input.Password placeholder="扫码登录官网自动填入，可免扫码授权下方应用"/></Form.Item>
       <Form.Item name="app" label="第三方应用" extra={aliAppNote ?? '内置应用无需自建：扫码即用；填入已有 refresh_token 时会自动识别归属'}><Select options={aliAppOptions} placeholder="阿里云盘TV"/></Form.Item>
-      {aliApp===CUSTOM_APP&&<><Form.Item name="clientId" label="client_id" rules={[{required:true}]} extra="阿里云盘开放平台自建应用的凭据；只在本机与阿里官方接口之间流转"><Input/></Form.Item>
+      {selectedApp===CUSTOM_APP&&<><Form.Item name="clientId" label="client_id" rules={[{required:true}]} extra="阿里云盘开放平台自建应用的凭据；只在本机与阿里官方接口之间流转"><Input/></Form.Item>
       <Form.Item name="clientSecret" label="client_secret" rules={[{required:true}]}><Input.Password/></Form.Item></>}
       <Form.Item name="refreshToken" label="refresh_token" rules={[{required:true,message:'请扫码授权获取，或手动粘贴'}]} extra={<><Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>void openAliyunQr()}>扫码授权自动获取</Button>{aliWebRefreshToken&&<Button type="link" size="small" loading={aliSilentLoading} style={{padding:0,marginLeft:12}} onClick={()=>void runSilentGrant()}>用官网令牌免扫码获取</Button>}{aliDetected&&<div><Typography.Text type="secondary">{aliDetected}</Typography.Text></div>}</>}><Input.Password placeholder="点击下方扫码授权自动获取，令牌过期会自动轮换"/></Form.Item></>}
       {type==='quark'&&<><Form.Item name="root" label="网盘根目录" extra="留空即网盘根目录；建议单独用一个目录"><Input placeholder="/safedrive"/></Form.Item>
@@ -284,7 +315,7 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
       </Card>
     </Form>
     <BaiduQrModal open={qrOpen} onClose={()=>setQrOpen(false)} onSuccess={onQrSuccess}/>
-    <AliyunQrModal open={aliQrOpen} app={aliApp} clientId={clientId} clientSecret={clientSecret}
+    <AliyunQrModal open={aliQrOpen} app={selectedApp} clientId={clientId} clientSecret={clientSecret}
       onClose={()=>setAliQrOpen(false)} onSuccess={onAliyunQrSuccess}/>
     <AliyunWebQrModal open={aliWebQrOpen} onClose={()=>setAliWebQrOpen(false)} onSuccess={onAliyunWebQrSuccess}/>
   </Modal>;

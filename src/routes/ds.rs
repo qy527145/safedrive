@@ -89,21 +89,14 @@ fn validate(body: &DsBody) -> ApiResult<()> {
             if !has_bduss && !legacy_cookie_has_bduss {
                 return Err(ApiError::BadRequest("百度网盘需要 BDUSS".into()));
             }
-            let has_client_id = body
-                .config
-                .get("clientId")
-                .and_then(|value| value.as_str())
-                .is_some_and(|value| !value.trim().is_empty());
-            let has_client_secret = body
-                .config
-                .get("clientSecret")
-                .and_then(|value| value.as_str())
-                .is_some_and(|value| !value.trim().is_empty());
-            if has_client_id != has_client_secret {
-                return Err(ApiError::BadRequest(
-                    "百度开放平台 API Key 与 Secret Key 必须同时填写或同时留空".into(),
-                ));
-            }
+            let text = config_text(body);
+            // 内置的 ES 文件管理器（默认）或用户自备应用；自定义应用要求
+            // API Key 与 Secret Key 成对填写。
+            crate::adapters::baidu_apps::resolve(
+                empty_to_none(text("app")),
+                empty_to_none(text("clientId")),
+                empty_to_none(text("clientSecret")),
+            )?;
             let root = body
                 .config
                 .get("root")

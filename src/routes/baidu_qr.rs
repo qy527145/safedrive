@@ -9,13 +9,14 @@
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use reqwest::header::{REFERER, SET_COOKIE, USER_AGENT};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::adapters::baidu_apps;
 use crate::error::{ApiError, ApiResult};
 use crate::registry::now_ms;
 use crate::state::AppState;
@@ -27,8 +28,18 @@ const TPL: &str = "netdisk";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/baidu/apps", get(list_apps))
         .route("/baidu/qrcode", post(create_qrcode))
         .route("/baidu/qrcode/poll", post(poll_qrcode))
+}
+
+/// 内置第三方应用清单（前端下拉框）。
+async fn list_apps() -> Json<Value> {
+    Json(json!({
+        "apps": baidu_apps::builtins(),
+        "default": baidu_apps::DEFAULT_APP,
+        "custom": baidu_apps::CUSTOM_APP,
+    }))
 }
 
 /// 扫码相关请求的整体超时。客户端来自 `AppState::passport`（不跟随重定向：
