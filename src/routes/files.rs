@@ -94,7 +94,10 @@ pub(crate) async fn plain_locate(
     Err(ApiError::NotFound(format!("路径不存在: {path}")))
 }
 
-pub(crate) async fn ensure_plain_dir(storage: &dyn crate::adapters::Storage, path: &str) -> ApiResult<()> {
+pub(crate) async fn ensure_plain_dir(
+    storage: &dyn crate::adapters::Storage,
+    path: &str,
+) -> ApiResult<()> {
     if path.is_empty() {
         return Ok(());
     }
@@ -318,7 +321,10 @@ pub(crate) async fn locate_any(
         return Err(ApiError::NotFound(format!("路径不存在: {path}")));
     }
     if !node.dir {
-        return Err(ApiError::NotFound(format!("{} 不是目录", segs[..depth].join("/"))));
+        return Err(ApiError::NotFound(format!(
+            "{} 不是目录",
+            segs[..depth].join("/")
+        )));
     }
     locate_foreign(storage, &node.enc_path, path, &segs[depth..]).await
 }
@@ -909,7 +915,9 @@ pub(crate) async fn rename_path(
             let (parent_enc, parent_is_dir) =
                 match locate_any(state, storage, ds, to_parent).await? {
                     Located::Managed(n) => (n.enc_path, n.dir),
-                    Located::Foreign { enc_path, is_dir, .. } => (enc_path, is_dir),
+                    Located::Foreign {
+                        enc_path, is_dir, ..
+                    } => (enc_path, is_dir),
                 };
             if !parent_is_dir {
                 return Err(ApiError::BadRequest(format!("{to_parent} 不是目录")));
@@ -2013,7 +2021,11 @@ async fn serve_object(
 ) -> ApiResult<Response> {
     let total = serve.layout.total;
     let mime = mime_guess::from_path(serve.display_name).first_or_octet_stream();
-    let disposition = if serve.download { "attachment" } else { "inline" };
+    let disposition = if serve.download {
+        "attachment"
+    } else {
+        "inline"
+    };
     let encoded_name = utf8_percent_encode(serve.display_name, NON_ALPHANUMERIC).to_string();
     let (spec, open_ended) = engine::parse_range(
         headers.get(header::RANGE).and_then(|v| v.to_str().ok()),

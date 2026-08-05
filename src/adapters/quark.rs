@@ -218,8 +218,8 @@ impl QuarkFs {
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned)
         };
-        let cookie = text("cookie")
-            .ok_or_else(|| ApiError::BadRequest("夸克网盘配置缺少 cookie".into()))?;
+        let cookie =
+            text("cookie").ok_or_else(|| ApiError::BadRequest("夸克网盘配置缺少 cookie".into()))?;
         let root = sanitize(text("root").as_deref().unwrap_or(""))?;
         let account = account_of(&cookie);
         COOKIES
@@ -332,7 +332,12 @@ impl QuarkFs {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
-            .unwrap_or_else(|| format!("HTTP {status} {}", text.chars().take(200).collect::<String>()));
+            .unwrap_or_else(|| {
+                format!(
+                    "HTTP {status} {}",
+                    text.chars().take(200).collect::<String>()
+                )
+            });
         Ok(Call::Failed { message })
     }
 
@@ -356,7 +361,14 @@ impl QuarkFs {
 
     async fn share_post(&self, path: &str, body: &Value, what: &str) -> ApiResult<Value> {
         match self
-            .call_on(&self.share_api_base, Method::POST, path, &[], Some(body), what)
+            .call_on(
+                &self.share_api_base,
+                Method::POST,
+                path,
+                &[],
+                Some(body),
+                what,
+            )
             .await?
         {
             Call::Ok(value) => Ok(value),
@@ -366,7 +378,12 @@ impl QuarkFs {
         }
     }
 
-    async fn share_get(&self, path: &str, query: &[(&str, String)], what: &str) -> ApiResult<Value> {
+    async fn share_get(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        what: &str,
+    ) -> ApiResult<Value> {
         match self
             .call_on(&self.share_api_base, Method::GET, path, query, None, what)
             .await?
@@ -573,7 +590,10 @@ impl QuarkFs {
             "file_name": name,
             "pdir_fid": parent_fid,
         });
-        match self.call(Method::POST, "/file", &[], Some(&body), "创建目录").await? {
+        match self
+            .call(Method::POST, "/file", &[], Some(&body), "创建目录")
+            .await?
+        {
             Call::Ok(value) => {
                 if let Some(fid) = value.pointer("/data/fid").and_then(Value::as_str) {
                     return Ok(fid.to_owned());
@@ -591,11 +611,13 @@ impl QuarkFs {
                 self.find_child(parent_fid, name)
                     .await?
                     .map(|item| item.fid)
-                    .ok_or_else(|| ApiError::Upstream(format!("夸克网盘创建目录冲突且找不到 {name}")))
+                    .ok_or_else(|| {
+                        ApiError::Upstream(format!("夸克网盘创建目录冲突且找不到 {name}"))
+                    })
             }
-            Call::Failed { message } => {
-                Err(ApiError::Upstream(format!("夸克网盘创建目录失败: {message}")))
-            }
+            Call::Failed { message } => Err(ApiError::Upstream(format!(
+                "夸克网盘创建目录失败: {message}"
+            ))),
         }
     }
 
@@ -667,7 +689,9 @@ impl QuarkFs {
                 .lock()
                 .unwrap()
                 .remove(&cache_key(&self.account, &file.fid));
-            return Err(ApiError::Upstream(format!("夸克网盘下载失败: HTTP {status}")));
+            return Err(ApiError::Upstream(format!(
+                "夸克网盘下载失败: HTTP {status}"
+            )));
         }
         let size = response.content_length();
         let stream = response.bytes_stream().map_err(std::io::Error::other);
@@ -739,7 +763,9 @@ impl QuarkFs {
             "auth_meta": auth_meta,
             "task_id": pre.task_id,
         });
-        let value = self.post("/file/upload/auth", &body, "换取上传签名").await?;
+        let value = self
+            .post("/file/upload/auth", &body, "换取上传签名")
+            .await?;
         value
             .pointer("/data/auth_key")
             .and_then(Value::as_str)
@@ -756,10 +782,7 @@ impl QuarkFs {
             .map(|(_, host)| host)
             .filter(|host| !host.is_empty())
             .ok_or_else(|| ApiError::Upstream("夸克网盘上传地址非法".into()))?;
-        Ok(format!(
-            "https://{}.{host}/{}",
-            pre.bucket, pre.obj_key
-        ))
+        Ok(format!("https://{}.{host}/{}", pre.bucket, pre.obj_key))
     }
 
     async fn up_part(
@@ -806,9 +829,8 @@ impl QuarkFs {
     }
 
     async fn up_commit(&self, pre: &UpPre, etags: &[String]) -> ApiResult<()> {
-        let mut body = String::from(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUpload>\n",
-        );
+        let mut body =
+            String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUpload>\n");
         for (index, etag) in etags.iter().enumerate() {
             body.push_str(&format!(
                 "<Part>\n<PartNumber>{}</PartNumber>\n<ETag>{etag}</ETag>\n</Part>\n",
@@ -982,7 +1004,11 @@ impl Storage for QuarkFs {
             .to_owned();
         // 换取公开短链与提取码。
         let value = self
-            .share_post("/share/password", &json!({ "share_id": share_id }), "获取分享链接")
+            .share_post(
+                "/share/password",
+                &json!({ "share_id": share_id }),
+                "获取分享链接",
+            )
             .await?;
         let url = value
             .pointer("/data/share_url")
@@ -1000,8 +1026,9 @@ impl Storage for QuarkFs {
     }
 
     async fn import_share(&self, share: &CloudShare, dest: &str) -> ApiResult<Vec<ImportedEntry>> {
-        let pwd_id = share_id_from_url(&share.url)
-            .ok_or_else(|| ApiError::BadRequest(format!("无法从夸克分享短链提取 pwd_id: {}", share.url)))?;
+        let pwd_id = share_id_from_url(&share.url).ok_or_else(|| {
+            ApiError::BadRequest(format!("无法从夸克分享短链提取 pwd_id: {}", share.url))
+        })?;
         let dest_fid = self.folder_fid(dest, true).await?;
         // 用 pwd_id + 提取码换取一次性 stoken。
         let token = self
@@ -1133,7 +1160,8 @@ impl Storage for QuarkFs {
 
         // 覆盖语义：同名先删（夸克允许同名共存，留着会让路径解析二义）。
         if let Some(existing) = self.find_child(&parent_fid, name).await? {
-            self.remove_fids(&[existing.fid], "覆盖前删除同名对象").await?;
+            self.remove_fids(&[existing.fid], "覆盖前删除同名对象")
+                .await?;
         }
 
         let pre = self.up_pre(&parent_fid, name, size).await?;
@@ -1188,16 +1216,15 @@ impl Storage for QuarkFs {
     }
 
     async fn rapid_put(&self, path: &str, source: &dyn RapidSource) -> ApiResult<bool> {
-        let (Some(md5), Some(sha1)) = (
-            source.hashes().md5.clone(),
-            source.hashes().sha1.clone(),
-        ) else {
+        let (Some(md5), Some(sha1)) = (source.hashes().md5.clone(), source.hashes().sha1.clone())
+        else {
             return Ok(false);
         };
         let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
         let parent_fid = self.folder_fid(parent, true).await?;
         if let Some(existing) = self.find_child(&parent_fid, name).await? {
-            self.remove_fids(&[existing.fid], "秒传前删除同名对象").await?;
+            self.remove_fids(&[existing.fid], "秒传前删除同名对象")
+                .await?;
         }
         let pre = self.up_pre(&parent_fid, name, source.size()).await?;
         evict_path_ids(&self.account, path);
@@ -1349,9 +1376,11 @@ mod tests {
     #[tokio::test]
     async fn share_creates_native_link_with_custom_passcode() {
         let base = spawn_mock().await;
-        let fs =
-            QuarkFs::from_config_with_persister(&config(&base), Client::new(), None).unwrap();
-        let share = fs.share(&["hello.txt".to_owned()], Some("ab12")).await.unwrap();
+        let fs = QuarkFs::from_config_with_persister(&config(&base), Client::new(), None).unwrap();
+        let share = fs
+            .share(&["hello.txt".to_owned()], Some("ab12"))
+            .await
+            .unwrap();
         assert_eq!(share.url, "https://pan.quark.cn/s/PWDID");
         assert_eq!(share.password, "ab12");
     }
@@ -1359,8 +1388,7 @@ mod tests {
     #[tokio::test]
     async fn import_share_transfers_root_entries() {
         let base = spawn_mock().await;
-        let fs =
-            QuarkFs::from_config_with_persister(&config(&base), Client::new(), None).unwrap();
+        let fs = QuarkFs::from_config_with_persister(&config(&base), Client::new(), None).unwrap();
         let imported = fs
             .import_share(
                 &CloudShare {

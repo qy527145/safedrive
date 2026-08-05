@@ -149,7 +149,10 @@ pub(super) fn encode(pack: &DsPack) -> Result<String, &'static str> {
     let mut cipher = Aes128Siv::new_from_slice(&V1_KEY).map_err(|_| "invalid protocol key")?;
     let version_bytes = [version];
     let mut wire = cipher
-        .encrypt([b"safedrive-ds".as_slice(), version_bytes.as_slice()], &plain)
+        .encrypt(
+            [b"safedrive-ds".as_slice(), version_bytes.as_slice()],
+            &plain,
+        )
         .map_err(|_| "datasource share encryption failed")?;
     let encrypted_pad = wire.first().ok_or("empty ciphertext")? & 0xf0;
     wire.push(encrypted_pad | version);
@@ -175,7 +178,10 @@ pub(super) fn decode(link: &str) -> Result<DsPack, DecodeError> {
     let mut cipher = Aes128Siv::new_from_slice(&V1_KEY).map_err(|_| DecodeError::Invalid)?;
     let version_bytes = [version];
     let plain = cipher
-        .decrypt([b"safedrive-ds".as_slice(), version_bytes.as_slice()], &wire)
+        .decrypt(
+            [b"safedrive-ds".as_slice(), version_bytes.as_slice()],
+            &wire,
+        )
         .map_err(|_| DecodeError::Invalid)?;
     decode_plain(&plain, version)
 }
@@ -294,7 +300,8 @@ fn write_url(bits: &mut BitWriter, url: &str) -> Result<(), &'static str> {
         }
         None => {
             bits.write_bit(true);
-            url.strip_prefix("http://").ok_or("webdav url needs http(s)")?
+            url.strip_prefix("http://")
+                .ok_or("webdav url needs http(s)")?
         }
     };
     write_compact(bits, rest)
@@ -306,7 +313,10 @@ fn read_url(bits: &mut BitReader<'_>) -> Result<String, DecodeError> {
     if rest.is_empty() {
         return Err(DecodeError::Invalid);
     }
-    Ok(format!("{}{rest}", if plain { "http://" } else { "https://" }))
+    Ok(format!(
+        "{}{rest}",
+        if plain { "http://" } else { "https://" }
+    ))
 }
 
 fn write_optional(bits: &mut BitWriter, value: Option<&str>) -> Result<(), &'static str> {
@@ -451,7 +461,8 @@ mod tests {
         }
     }
 
-    fn localfs_pack() -> DsPack {        DsPack {
+    fn localfs_pack() -> DsPack {
+        DsPack {
             ds_type: "localfs".into(),
             name: "local".into(),
             config: json!({ "root": "/tmp/safedrive" }),
@@ -500,7 +511,11 @@ mod tests {
         assert!(!link.contains(&pack.password));
         // BDUSS(87) + 密码(24) + 名称/根目录，6-bit 打包 + SIV 开销后应远小于
         // 直接 base64(JSON) 的长度（同配置约 500+ 字符）。
-        assert!(link.len() < 200, "unexpectedly long link: {} {link}", link.len());
+        assert!(
+            link.len() < 200,
+            "unexpectedly long link: {} {link}",
+            link.len()
+        );
     }
 
     #[test]

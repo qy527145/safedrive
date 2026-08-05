@@ -212,8 +212,9 @@ impl AliyunDriveFs {
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned)
         };
-        let refresh_token = text("refreshToken")
-            .ok_or_else(|| ApiError::BadRequest("阿里云盘配置缺少 refreshToken（请先扫码授权）".into()))?;
+        let refresh_token = text("refreshToken").ok_or_else(|| {
+            ApiError::BadRequest("阿里云盘配置缺少 refreshToken（请先扫码授权）".into())
+        })?;
         // client_id/secret 只有「自定义应用」才要用户填；内置应用的令牌
         // 流程由 aliyun_apps 负责，认不出的令牌也在那里降级为自定义应用。
         let app = aliyun_apps::resolve(
@@ -276,7 +277,8 @@ impl AliyunDriveFs {
     fn web(&self) -> ApiResult<&aliyun_web::WebClient> {
         self.web.as_ref().ok_or_else(|| {
             ApiError::BadRequest(
-                "阿里云盘未配置官网令牌：分享与转存依赖官网接口，请在数据源里扫码获取官网令牌".into(),
+                "阿里云盘未配置官网令牌：分享与转存依赖官网接口，请在数据源里扫码获取官网令牌"
+                    .into(),
             )
         })
     }
@@ -332,7 +334,9 @@ impl AliyunDriveFs {
 
         let tokens = self.app.refresh(&self.http, &current.refresh_token).await?;
         if tokens.access_token.is_empty() {
-            return Err(ApiError::Upstream("阿里云盘刷新令牌响应缺少 access_token".into()));
+            return Err(ApiError::Upstream(
+                "阿里云盘刷新令牌响应缺少 access_token".into(),
+            ));
         }
         let access = tokens.access_token;
         // 中转服务未必回 refresh_token；没回就说明旧的还能继续用。
@@ -464,7 +468,11 @@ impl AliyunDriveFs {
     }
 
     /// 列一个目录 ID 下的全部条目（marker 翻页），顺带把子项 ID 写进缓存。
-    async fn list_folder(&self, parent_id: &str, cache_prefix: Option<&str>) -> ApiResult<Vec<AliFile>> {
+    async fn list_folder(
+        &self,
+        parent_id: &str,
+        cache_prefix: Option<&str>,
+    ) -> ApiResult<Vec<AliFile>> {
         let drive_id = self.drive_id().await?;
         let mut marker = String::new();
         let mut out: Vec<AliFile> = Vec::new();
@@ -480,10 +488,9 @@ impl AliyunDriveFs {
             let value = self
                 .post("/adrive/v1.0/openFile/list", &body, "列目录")
                 .await?;
-            let items: Vec<AliFile> = serde_json::from_value(
-                value.get("items").cloned().unwrap_or_else(|| json!([])),
-            )
-            .map_err(|e| ApiError::Upstream(format!("阿里云盘列目录响应解析失败: {e}")))?;
+            let items: Vec<AliFile> =
+                serde_json::from_value(value.get("items").cloned().unwrap_or_else(|| json!([])))
+                    .map_err(|e| ApiError::Upstream(format!("阿里云盘列目录响应解析失败: {e}")))?;
             out.extend(items);
             marker = value
                 .get("next_marker")
@@ -628,7 +635,11 @@ impl AliyunDriveFs {
         let drive_id = self.drive_id().await?;
         let body = json!({ "drive_id": drive_id, "file_id": file_id, "expire_sec": 14400 });
         let value = self
-            .post("/adrive/v1.0/openFile/getDownloadUrl", &body, "获取下载直链")
+            .post(
+                "/adrive/v1.0/openFile/getDownloadUrl",
+                &body,
+                "获取下载直链",
+            )
             .await?;
         let url = value
             .get("url")
@@ -643,7 +654,11 @@ impl AliyunDriveFs {
         Ok(url)
     }
 
-    async fn fetch(&self, path: &str, range: Option<(u64, u64)>) -> ApiResult<(Option<u64>, ByteStream)> {
+    async fn fetch(
+        &self,
+        path: &str,
+        range: Option<(u64, u64)>,
+    ) -> ApiResult<(Option<u64>, ByteStream)> {
         let file = self.stat(path).await?;
         if file.is_dir() {
             return Err(ApiError::BadRequest(format!("{path} 是目录")));
@@ -664,7 +679,9 @@ impl AliyunDriveFs {
                 .lock()
                 .unwrap()
                 .remove(&cache_key(&self.account, &file.file_id));
-            return Err(ApiError::Upstream(format!("阿里云盘下载失败: HTTP {status}")));
+            return Err(ApiError::Upstream(format!(
+                "阿里云盘下载失败: HTTP {status}"
+            )));
         }
         let size = response.content_length();
         let stream = response.bytes_stream().map_err(std::io::Error::other);
@@ -735,7 +752,8 @@ impl AliyunDriveFs {
                 body[key] = value.clone();
             }
         }
-        self.call("/adrive/v1.0/openFile/create", &body, "创建文件").await
+        self.call("/adrive/v1.0/openFile/create", &body, "创建文件")
+            .await
     }
 
     /// `put` 语义是覆盖：同名已存在就先扔回收站。
@@ -746,7 +764,12 @@ impl AliyunDriveFs {
         Ok(())
     }
 
-    async fn upload_urls(&self, file_id: &str, upload_id: &str, parts: u64) -> ApiResult<Vec<String>> {
+    async fn upload_urls(
+        &self,
+        file_id: &str,
+        upload_id: &str,
+        parts: u64,
+    ) -> ApiResult<Vec<String>> {
         let drive_id = self.drive_id().await?;
         let body = json!({
             "drive_id": drive_id,
@@ -913,7 +936,8 @@ impl Storage for AliyunDriveFs {
             if from_name != to_name {
                 body["new_name"] = to_name.into();
             }
-            self.post("/adrive/v1.0/openFile/move", &body, "移动").await?;
+            self.post("/adrive/v1.0/openFile/move", &body, "移动")
+                .await?;
         }
         evict_path_ids(&self.account, from);
         evict_path_ids(&self.account, to);
@@ -1020,9 +1044,7 @@ impl Storage for AliyunDriveFs {
             "content_hash": sha1.to_uppercase(),
             "proof_version": "v1",
         });
-        if let Some((offset, length)) =
-            Self::proof_offset(&self.access_token(None).await?, size)
-        {
+        if let Some((offset, length)) = Self::proof_offset(&self.access_token(None).await?, size) {
             let sample = read_spool(&spool.path, offset, length as usize).await?;
             extra["proof_code"] = B64.encode(&sample).into();
         } else {

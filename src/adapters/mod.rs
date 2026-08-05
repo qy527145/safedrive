@@ -379,7 +379,10 @@ pub(crate) async fn read_spool(
 
 /// 流式算摘要，字节读完即丢。跨数据源复制在「源侧读廉价」时用它补齐
 /// 秒传凭据。
-pub(crate) async fn hash_stream(mut body: ByteStream, kinds: &[HashKind]) -> ApiResult<ContentHashes> {
+pub(crate) async fn hash_stream(
+    mut body: ByteStream,
+    kinds: &[HashKind],
+) -> ApiResult<ContentHashes> {
     use futures_util::StreamExt;
     use md5::Digest as _;
 

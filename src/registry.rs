@@ -372,7 +372,11 @@ mod tests {
         assert_eq!(reg2.get("a").unwrap().id, "a");
     }
 
-    fn baidu_tokens(access: &str, refresh: &str, expires_at: u64) -> Vec<(String, serde_json::Value)> {
+    fn baidu_tokens(
+        access: &str,
+        refresh: &str,
+        expires_at: u64,
+    ) -> Vec<(String, serde_json::Value)> {
         vec![
             ("accessToken".into(), access.into()),
             ("refreshToken".into(), refresh.into()),

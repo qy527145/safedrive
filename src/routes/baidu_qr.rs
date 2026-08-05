@@ -215,9 +215,8 @@ async fn exchange_bduss(http: &reqwest::Client, tmp: &str) -> ApiResult<String> 
         .filter_map(|value| value.to_str().ok())
         .map(str::to_owned)
         .collect();
-    bduss_from_set_cookies(cookies.iter().map(String::as_str)).ok_or_else(|| {
-        ApiError::Upstream("扫码登录成功，但百度响应未携带 BDUSS，请重试".into())
-    })
+    bduss_from_set_cookies(cookies.iter().map(String::as_str))
+        .ok_or_else(|| ApiError::Upstream("扫码登录成功，但百度响应未携带 BDUSS，请重试".into()))
 }
 
 /// 从若干 Set-Cookie 头中提取 BDUSS（注意区分 BDUSS_BFESS 等同前缀 Cookie）。

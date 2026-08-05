@@ -641,7 +641,10 @@ impl BaiduPanFs {
             .text()
             .await
             .map_err(|e| ApiError::Upstream(format!("读取百度{what}响应失败: {e}")))?;
-        tracing::debug!("百度{what}响应: HTTP {status} body: {}", mask_oauth_body(&text));
+        tracing::debug!(
+            "百度{what}响应: HTTP {status} body: {}",
+            mask_oauth_body(&text)
+        );
         serde_json::from_str(&text).map_err(|e| {
             ApiError::Upstream(format!(
                 "解析百度{what}响应失败 (HTTP {status}): {e}; {}",
@@ -811,7 +814,9 @@ impl BaiduPanFs {
                 tokio::time::sleep(Duration::from_secs(interval)).await;
             }
         }
-        Err(ApiError::Upstream("BDUSS 设备授权超时，请确认 BDUSS 有效".into()))
+        Err(ApiError::Upstream(
+            "BDUSS 设备授权超时，请确认 BDUSS 有效".into(),
+        ))
     }
 
     async fn refresh_access_token(&self, invalid_token: Option<&str>) -> ApiResult<String> {
@@ -2233,7 +2238,9 @@ fn extract_input_value(html: &str, name: &str) -> Option<String> {
     while let Some(pos) = search.find(&needle) {
         // 以该 input 标签为中心，截出 <input ...> 片段找 value=""。
         let tag_start = search[..pos].rfind('<').unwrap_or(0);
-        let tag_end = search[pos..].find('>').map_or(search.len(), |end| pos + end);
+        let tag_end = search[pos..]
+            .find('>')
+            .map_or(search.len(), |end| pos + end);
         let tag = &search[tag_start..tag_end];
         if let Some(value_pos) = tag.find("value=\"") {
             let rest = &tag[value_pos + "value=\"".len()..];
@@ -2253,7 +2260,9 @@ fn extract_granted_scopes(html: &str) -> String {
     let mut search = html;
     while let Some(pos) = search.find("name=\"grant_permissions_arr\"") {
         let tag_start = search[..pos].rfind('<').unwrap_or(0);
-        let tag_end = search[pos..].find('>').map_or(search.len(), |end| pos + end);
+        let tag_end = search[pos..]
+            .find('>')
+            .map_or(search.len(), |end| pos + end);
         let tag = &search[tag_start..tag_end];
         if let Some(value_pos) = tag.find("value=\"") {
             let rest = &tag[value_pos + "value=\"".len()..];
@@ -3084,7 +3093,10 @@ mod tests {
         let app = Router::new()
             .route("/oauth/token", get(oauth_token))
             .route("/oauth/device/code", get(oauth_device_code))
-            .route("/device", get(oauth_device_approve).post(oauth_device_confirm))
+            .route(
+                "/device",
+                get(oauth_device_approve).post(oauth_device_confirm),
+            )
             .route("/api/loginStatus", get(login_status))
             .route("/share/pset", post(share_pset))
             .route("/share/verify", post(share_verify))
@@ -3116,7 +3128,10 @@ mod tests {
             };
             *persisted_for_callback.lock().unwrap() = Some((
                 field("accessToken").as_str().unwrap_or_default().to_owned(),
-                field("refreshToken").as_str().unwrap_or_default().to_owned(),
+                field("refreshToken")
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
                 field("accessTokenExpiresAt").as_u64().unwrap_or_default(),
             ));
             Ok(())

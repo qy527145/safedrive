@@ -154,11 +154,7 @@ impl AppState {
             .registry
             .get(ds_id)
             .ok_or_else(|| ApiError::NotFound(format!("数据源不存在: {ds_id}")))?;
-        adapters::make_with_token_persister(
-            &ds,
-            self.http.clone(),
-            self.credential_persister(&ds),
-        )
+        adapters::make_with_token_persister(&ds, self.http.clone(), self.credential_persister(&ds))
     }
 
     /// `Arc` 版本（下载/上传引擎多任务共享）。

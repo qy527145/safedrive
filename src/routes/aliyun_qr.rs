@@ -121,9 +121,7 @@ async fn fetch_qr_image(http: &reqwest::Client, url: &str) -> String {
         return String::new();
     }
     match response.bytes().await {
-        Ok(bytes) if !bytes.is_empty() => {
-            base64::engine::general_purpose::STANDARD.encode(&bytes)
-        }
+        Ok(bytes) if !bytes.is_empty() => base64::engine::general_purpose::STANDARD.encode(&bytes),
         _ => String::new(),
     }
 }

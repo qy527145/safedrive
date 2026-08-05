@@ -265,13 +265,29 @@ mod tests {
     #[test]
     fn share_ids_survive_the_link_roundtrip() {
         for (ds_type, url, id) in [
-            ("baidupan", "https://pan.baidu.com/s/1qym_MmGtZhFrTpKqf", "qym_MmGtZhFrTpKqf"),
-            ("aliyundrive", "https://www.alipan.com/s/3XCkDNb1Cfa", "3XCkDNb1Cfa"),
-            ("quark", "https://pan.quark.cn/s/3a5f8b2c1d0e", "3a5f8b2c1d0e"),
+            (
+                "baidupan",
+                "https://pan.baidu.com/s/1qym_MmGtZhFrTpKqf",
+                "qym_MmGtZhFrTpKqf",
+            ),
+            (
+                "aliyundrive",
+                "https://www.alipan.com/s/3XCkDNb1Cfa",
+                "3XCkDNb1Cfa",
+            ),
+            (
+                "quark",
+                "https://pan.quark.cn/s/3a5f8b2c1d0e",
+                "3a5f8b2c1d0e",
+            ),
         ] {
             assert_eq!(share_id(ds_type, url).as_deref(), Some(id), "{ds_type}");
             let rebuilt = share_url(ds_type, id).expect("支持的类型都能还原短链");
-            assert_eq!(share_id(ds_type, &rebuilt).as_deref(), Some(id), "{ds_type}");
+            assert_eq!(
+                share_id(ds_type, &rebuilt).as_deref(),
+                Some(id),
+                "{ds_type}"
+            );
 
             let mut pack = sample(true);
             pack.source_type = ds_type.into();
@@ -290,10 +306,22 @@ mod tests {
     /// 原生分享短链能按域名自动识别数据源类型；非分享链接、陌生域名判 None。
     #[test]
     fn detects_native_source_from_url() {
-        assert_eq!(native_source("https://pan.baidu.com/s/1qym_MmGtZhFrTpKqf"), Some("baidupan"));
-        assert_eq!(native_source("https://www.alipan.com/s/3XCkDNb1Cfa"), Some("aliyundrive"));
-        assert_eq!(native_source(" https://www.aliyundrive.com/s/3XCkDNb1Cfa?x=1 "), Some("aliyundrive"));
-        assert_eq!(native_source("https://pan.quark.cn/s/3a5f8b2c1d0e"), Some("quark"));
+        assert_eq!(
+            native_source("https://pan.baidu.com/s/1qym_MmGtZhFrTpKqf"),
+            Some("baidupan")
+        );
+        assert_eq!(
+            native_source("https://www.alipan.com/s/3XCkDNb1Cfa"),
+            Some("aliyundrive")
+        );
+        assert_eq!(
+            native_source(" https://www.aliyundrive.com/s/3XCkDNb1Cfa?x=1 "),
+            Some("aliyundrive")
+        );
+        assert_eq!(
+            native_source("https://pan.quark.cn/s/3a5f8b2c1d0e"),
+            Some("quark")
+        );
         // 同域名但不是分享短链
         assert!(native_source("https://pan.baidu.com/disk/home").is_none());
         assert!(native_source("https://www.alipan.com/").is_none());

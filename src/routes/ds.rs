@@ -175,7 +175,9 @@ fn check_root(root: &str, what: &str) -> ApiResult<()> {
 fn check_api_base(base: &str, what: &str) -> ApiResult<()> {
     let ok = base.is_empty() || base.starts_with("http://") || base.starts_with("https://");
     if !ok {
-        return Err(ApiError::BadRequest(format!("{what}接口地址必须是 http(s)")));
+        return Err(ApiError::BadRequest(format!(
+            "{what}接口地址必须是 http(s)"
+        )));
     }
     Ok(())
 }
@@ -520,7 +522,11 @@ mod tests {
             }
             None => axum::body::Body::empty(),
         };
-        let resp = app.clone().oneshot(builder.body(body).unwrap()).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap();
         let (parts, body) = resp.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes();
         let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
@@ -554,8 +560,16 @@ mod tests {
         assert_eq!(status, 200, "{imported}");
         assert_eq!(imported["name"], "我的空间 (2)");
         assert_ne!(imported["id"], created["id"]);
-        for key in ["type", "config", "encryptionEnabled", "password",
-                    "volumeEnabled", "volumeSize", "volumeStrategy", "cacheEnabled"] {
+        for key in [
+            "type",
+            "config",
+            "encryptionEnabled",
+            "password",
+            "volumeEnabled",
+            "volumeSize",
+            "volumeStrategy",
+            "cacheEnabled",
+        ] {
             assert_eq!(imported[key], created[key], "field {key}");
         }
 
@@ -587,19 +601,63 @@ mod tests {
             "root": "/safedrive", "clientId": "cid", "clientSecret": "csec",
             "refreshToken": "rt", "driveType": "resource", "apiBase": "",
         });
-        let quark_base =
-            serde_json::json!({ "root": "safedrive", "cookie": "__pus=a; __puus=b", "apiBase": "" });
+        let quark_base = serde_json::json!({ "root": "safedrive", "cookie": "__pus=a; __puus=b", "apiBase": "" });
 
         for (ds_type, base, patch, expect) in [
-            ("aliyundrive", &aliyun_base, serde_json::json!({ "clientId": "  " }), "client_id"),
-            ("aliyundrive", &aliyun_base, serde_json::json!({ "clientSecret": "" }), "client_secret"),
-            ("aliyundrive", &aliyun_base, serde_json::json!({ "refreshToken": "" }), "refresh_token"),
-            ("aliyundrive", &aliyun_base, serde_json::json!({ "driveType": "vault" }), "盘位"),
-            ("aliyundrive", &aliyun_base, serde_json::json!({ "root": "../别人的盘" }), "根目录非法"),
-            ("aliyundrive", &aliyun_base, serde_json::json!({ "apiBase": "ftp://x" }), "http(s)"),
-            ("quark", &quark_base, serde_json::json!({ "cookie": " " }), "Cookie"),
-            ("quark", &quark_base, serde_json::json!({ "root": "a\\b" }), "根目录非法"),
-            ("quark", &quark_base, serde_json::json!({ "apiBase": "drive.quark.cn" }), "http(s)"),
+            (
+                "aliyundrive",
+                &aliyun_base,
+                serde_json::json!({ "clientId": "  " }),
+                "client_id",
+            ),
+            (
+                "aliyundrive",
+                &aliyun_base,
+                serde_json::json!({ "clientSecret": "" }),
+                "client_secret",
+            ),
+            (
+                "aliyundrive",
+                &aliyun_base,
+                serde_json::json!({ "refreshToken": "" }),
+                "refresh_token",
+            ),
+            (
+                "aliyundrive",
+                &aliyun_base,
+                serde_json::json!({ "driveType": "vault" }),
+                "盘位",
+            ),
+            (
+                "aliyundrive",
+                &aliyun_base,
+                serde_json::json!({ "root": "../别人的盘" }),
+                "根目录非法",
+            ),
+            (
+                "aliyundrive",
+                &aliyun_base,
+                serde_json::json!({ "apiBase": "ftp://x" }),
+                "http(s)",
+            ),
+            (
+                "quark",
+                &quark_base,
+                serde_json::json!({ "cookie": " " }),
+                "Cookie",
+            ),
+            (
+                "quark",
+                &quark_base,
+                serde_json::json!({ "root": "a\\b" }),
+                "根目录非法",
+            ),
+            (
+                "quark",
+                &quark_base,
+                serde_json::json!({ "apiBase": "drive.quark.cn" }),
+                "http(s)",
+            ),
         ] {
             let config = patched(base.clone(), patch.clone());
             let (status, resp) = send(&app, "POST", "/api/ds", Some(body(ds_type, config))).await;
@@ -610,12 +668,19 @@ mod tests {
 
         // 盘位留空 = 默认盘；夸克根目录可为空（即网盘根）。
         for (ds_type, config) in [
-            ("aliyundrive", patched(aliyun_base.clone(), serde_json::json!({ "driveType": "" }))),
+            (
+                "aliyundrive",
+                patched(aliyun_base.clone(), serde_json::json!({ "driveType": "" })),
+            ),
             ("aliyundrive", aliyun_base.clone()),
-            ("quark", patched(quark_base.clone(), serde_json::json!({ "root": "" }))),
+            (
+                "quark",
+                patched(quark_base.clone(), serde_json::json!({ "root": "" })),
+            ),
             ("quark", quark_base.clone()),
         ] {
-            let (status, created) = send(&app, "POST", "/api/ds", Some(body(ds_type, config))).await;
+            let (status, created) =
+                send(&app, "POST", "/api/ds", Some(body(ds_type, config))).await;
             assert_eq!(status, 200, "{ds_type} {created}");
             assert_eq!(created["type"], ds_type);
         }

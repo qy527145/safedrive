@@ -56,7 +56,11 @@ fn combine_native_url(ds_type: &str, url: &str, password: &str) -> String {
     if password.is_empty() || url.contains("pwd=") || url.contains("passcode=") {
         return url.to_owned();
     }
-    let param = if ds_type == "quark" { "passcode" } else { "pwd" };
+    let param = if ds_type == "quark" {
+        "passcode"
+    } else {
+        "pwd"
+    };
     let sep = if url.contains('?') { '&' } else { '?' };
     format!("{url}{sep}{param}={password}")
 }
@@ -117,7 +121,8 @@ async fn share_export(
     // 接收方毫无意义 —— 只有明文（未加密数据源，或加密数据源里的外来条目）可原生。
     if native && any_managed {
         return Err(ApiError::BadRequest(
-            "加密数据源的受管条目在云端是密文，官网原生分享对接收方没有意义；请改用 sd:// 标准分享".into(),
+            "加密数据源的受管条目在云端是密文，官网原生分享对接收方没有意义；请改用 sd:// 标准分享"
+                .into(),
         ));
     }
     // 自定义提取码只在原生分享时有意义（sd:// 密码受协议字母表约束，由服务端生成）。
@@ -126,7 +131,9 @@ async fn share_export(
     } else {
         None
     };
-    let cloud = storage.share(&storage_paths, custom_password.as_deref()).await?;
+    let cloud = storage
+        .share(&storage_paths, custom_password.as_deref())
+        .await?;
 
     // 原生分享：把提取码内嵌进官网短链，交给用户一条可直接打开的组合链接。
     if native {
@@ -138,9 +145,8 @@ async fn share_export(
         })));
     }
 
-    let share_id = codec::share_id(&datasource.ds_type, &cloud.url).ok_or_else(|| {
-        ApiError::Upstream(format!("无法从分享短链提取分享 ID: {}", cloud.url))
-    })?;
+    let share_id = codec::share_id(&datasource.ds_type, &cloud.url)
+        .ok_or_else(|| ApiError::Upstream(format!("无法从分享短链提取分享 ID: {}", cloud.url)))?;
     let pack = codec::Pack {
         source_type: datasource.ds_type,
         share_id,

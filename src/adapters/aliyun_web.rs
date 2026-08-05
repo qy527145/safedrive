@@ -117,11 +117,15 @@ impl WebClient {
         persist: Option<CredentialPersister>,
     ) -> Self {
         let key = format!("{account}\u{1}web");
-        TOKENS.lock().unwrap().entry(key.clone()).or_insert(LiveTokens {
-            access_token,
-            refresh_token,
-            expires_at,
-        });
+        TOKENS
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_insert(LiveTokens {
+                access_token,
+                refresh_token,
+                expires_at,
+            });
         Self {
             http,
             account: key,
@@ -273,7 +277,11 @@ impl WebClient {
         loop {
             let token = self.access_token(stale.as_deref()).await?;
             let mut request = self
-                .apply_write_headers(self.http.post(format!("{API_BASE}{path}")).bearer_auth(&token))
+                .apply_write_headers(
+                    self.http
+                        .post(format!("{API_BASE}{path}"))
+                        .bearer_auth(&token),
+                )
                 .json(body);
             if let Some(share_token) = share_token {
                 request = request.header(share_token_header(), share_token);
@@ -356,7 +364,12 @@ impl WebClient {
     pub async fn share_token(&self, share_id: &str, password: &str) -> ApiResult<String> {
         let body = json!({ "share_id": share_id, "share_pwd": password });
         let value = self
-            .post("/v2/share_link/get_share_token", &body, "校验分享密码", None)
+            .post(
+                "/v2/share_link/get_share_token",
+                &body,
+                "校验分享密码",
+                None,
+            )
             .await?;
         value
             .get("share_token")
@@ -388,7 +401,12 @@ impl WebClient {
                 body["marker"] = marker.clone().into();
             }
             let value = self
-                .post("/adrive/v3/file/list", &body, "读取分享内容", Some(share_token))
+                .post(
+                    "/adrive/v3/file/list",
+                    &body,
+                    "读取分享内容",
+                    Some(share_token),
+                )
                 .await?;
             for item in value
                 .get("items")
@@ -414,7 +432,9 @@ impl WebClient {
             }
         }
         if items.is_empty() {
-            return Err(ApiError::Upstream("该阿里云盘分享中没有可转存的内容".into()));
+            return Err(ApiError::Upstream(
+                "该阿里云盘分享中没有可转存的内容".into(),
+            ));
         }
         Ok(items)
     }
@@ -528,7 +548,11 @@ impl WebClient {
                     None,
                 )
                 .await?;
-            match value.get("state").and_then(Value::as_str).unwrap_or_default() {
+            match value
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+            {
                 "Succeed" | "done" => return Ok(()),
                 "Failed" => return Err(ApiError::Upstream("阿里云盘转存任务失败".into())),
                 _ => tokio::time::sleep(Duration::from_secs(1)).await,
@@ -541,7 +565,9 @@ impl WebClient {
 
     async fn file_name(&self, drive_id: &str, file_id: &str) -> ApiResult<String> {
         let body = json!({ "drive_id": drive_id, "file_id": file_id });
-        let value = self.post("/v2/file/get", &body, "读取转存结果", None).await?;
+        let value = self
+            .post("/v2/file/get", &body, "读取转存结果", None)
+            .await?;
         value
             .get("name")
             .and_then(Value::as_str)
@@ -566,7 +592,10 @@ async fn refresh_web_token(http: &Client, refresh_token: &str) -> ApiResult<Valu
     let text = response.text().await.unwrap_or_default();
     let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     if !status.is_success() {
-        let code = value.get("code").and_then(Value::as_str).unwrap_or_default();
+        let code = value
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let message = value
             .get("message")
             .and_then(Value::as_str)
@@ -789,8 +818,14 @@ mod tests {
     #[test]
     fn merges_set_cookie_into_a_single_header() {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.append(SET_COOKIE, "SESSIONID=abc; Path=/; HttpOnly".parse().unwrap());
-        headers.append(SET_COOKIE, "cna=xyz; Domain=.aliyundrive.com".parse().unwrap());
+        headers.append(
+            SET_COOKIE,
+            "SESSIONID=abc; Path=/; HttpOnly".parse().unwrap(),
+        );
+        headers.append(
+            SET_COOKIE,
+            "cna=xyz; Domain=.aliyundrive.com".parse().unwrap(),
+        );
         headers.append(SET_COOKIE, "dropme=; Path=/".parse().unwrap());
         let cookies = collect_cookies(&headers, "cna=old; keep=1");
         // 后来的值覆盖同名 Cookie，空值被忽略，其余保留

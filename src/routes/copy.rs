@@ -133,12 +133,7 @@ impl CopyReport {
 struct HashCache(HashMap<String, HashMap<String, ContentHashes>>);
 
 impl HashCache {
-    async fn get(
-        &mut self,
-        storage: &dyn Storage,
-        dir: &str,
-        name: &str,
-    ) -> ContentHashes {
+    async fn get(&mut self, storage: &dyn Storage, dir: &str, name: &str) -> ContentHashes {
         if !self.0.contains_key(dir) {
             // 拿不到摘要不是错误（多数数据源本来就不提供），静默退成空表。
             let hashes = storage.dir_content_hashes(dir).await.unwrap_or_else(|e| {
@@ -243,7 +238,9 @@ async fn copy_object(
                         progress
                             .encrypted
                             .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
-                        progress.uploaded.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+                        progress
+                            .uploaded
+                            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
                         return Ok(true);
                     }
                     Ok(false) => {}
@@ -457,9 +454,7 @@ async fn copy_file(
             .get(header::CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok())
-            .ok_or_else(|| {
-                ApiError::Internal(anyhow::anyhow!("无法确定 {src_path} 的明文大小"))
-            })?;
+            .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("无法确定 {src_path} 的明文大小")))?;
         let body = response
             .into_body()
             .into_data_stream()
@@ -511,7 +506,9 @@ async fn copy_file(
         for ((src_name, size), dst_name) in plan.volumes.iter().zip(dest.names.iter()) {
             let from = join_enc(&plan.container, src_name);
             let to = join_enc(&dest.container, dst_name);
-            let known = hashes.get(src_storage.as_ref(), &plan.container, src_name).await;
+            let known = hashes
+                .get(src_storage.as_ref(), &plan.container, src_name)
+                .await;
             let rapid = copy_object(
                 &src_storage,
                 &from,
@@ -724,12 +721,11 @@ fn copy_node<'a>(
             if child.foreign {
                 // 受管目录里夹带的外来（明文）子对象：按字面存储路径直传，
                 // 落地仍是外来条目（受管子对象才递归走信封搬运）。
-                let src_dir_enc = match locate_any(state, src_storage.as_ref(), src_ds, src_path)
-                    .await?
-                {
-                    Located::Managed(n) => n.enc_path,
-                    Located::Foreign { enc_path, .. } => enc_path,
-                };
+                let src_dir_enc =
+                    match locate_any(state, src_storage.as_ref(), src_ds, src_path).await? {
+                        Located::Managed(n) => n.enc_path,
+                        Located::Foreign { enc_path, .. } => enc_path,
+                    };
                 let dst_dir_enc =
                     ensure_dest_parent_enc(state, dst_storage.as_ref(), dst_ds, dst_path).await?;
                 let child_report = copy_foreign_node(
@@ -813,7 +809,9 @@ fn copy_foreign_node<'a>(
             match &existing {
                 Some(e) if e.is_dir => {} // 复用已存在的同名外来目录
                 Some(_) => {
-                    return Err(ApiError::BadRequest(format!("目标已存在且不是目录: {dst_enc}")));
+                    return Err(ApiError::BadRequest(format!(
+                        "目标已存在且不是目录: {dst_enc}"
+                    )));
                 }
                 None => dst_storage.mkdir(dst_enc).await?,
             }
@@ -914,12 +912,7 @@ mod tests {
             std::fs::create_dir_all(&root).unwrap();
             state
                 .registry
-                .create(datasource(
-                    id,
-                    root.to_str().unwrap(),
-                    *encrypted,
-                    *split,
-                ))
+                .create(datasource(id, root.to_str().unwrap(), *encrypted, *split))
                 .unwrap();
         }
         (state, dir)
@@ -958,10 +951,16 @@ mod tests {
 
     async fn read_back(state: &AppState, ds: &str, path: &str) -> bytes::Bytes {
         use http_body_util::BodyExt;
-        let response =
-            crate::routes::files::stream_file(state, ds, path, true, Method::GET, &HeaderMap::new())
-                .await
-                .unwrap();
+        let response = crate::routes::files::stream_file(
+            state,
+            ds,
+            path,
+            true,
+            Method::GET,
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
         response.into_body().collect().await.unwrap().to_bytes()
     }
 
@@ -972,7 +971,11 @@ mod tests {
             entries.sort_by_key(|e| e.file_name());
             for entry in entries {
                 let path = entry.path();
-                let rel = path.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
                 if path.is_dir() {
                     out.push(format!("{rel}/"));
                     walk(base, &path, out);
@@ -995,9 +998,17 @@ mod tests {
         let data = payload(150 * 1024); // 跨 3 卷
         put(&state, "src", "片子/a.mkv", &data).await;
 
-        let report = copy_path(&state, "src", "片子/a.mkv", "dst", "别的/b.mkv", false, None)
-            .await
-            .unwrap();
+        let report = copy_path(
+            &state,
+            "src",
+            "片子/a.mkv",
+            "dst",
+            "别的/b.mkv",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(report.files, 1);
         assert_eq!(report.transferred_volumes, 3);
         assert_eq!(report.reencrypted_files, 0);
@@ -1092,7 +1103,16 @@ mod tests {
         assert_eq!(read_back(&state, "dst", "拷贝/里层/b.bin").await, b);
 
         // 同名再来一次：overwrite=false 必须拒绝，=true 必须成功。
-        let again = copy_path(&state, "src", "顶层/a.bin", "dst", "拷贝/a.bin", false, None).await;
+        let again = copy_path(
+            &state,
+            "src",
+            "顶层/a.bin",
+            "dst",
+            "拷贝/a.bin",
+            false,
+            None,
+        )
+        .await;
         assert!(matches!(again, Err(ApiError::BadRequest(_))));
         copy_path(&state, "src", "顶层/a.bin", "dst", "拷贝/a.bin", true, None)
             .await
@@ -1157,14 +1177,27 @@ mod tests {
         );
 
         // 复制外来文件到受管子目录：落地仍是外来，字节原样。
-        copy_path(&state, "enc", "外来.txt", "enc", "受管夹/外来.txt", false, None)
+        copy_path(
+            &state,
+            "enc",
+            "外来.txt",
+            "enc",
+            "受管夹/外来.txt",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let managed = list_dir(&state, storage.as_ref(), "enc", "受管夹")
             .await
             .unwrap();
-        let managed = list_dir(&state, storage.as_ref(), "enc", "受管夹").await.unwrap();
         let copied = managed.iter().find(|e| e.name == "外来.txt").unwrap();
         assert!(copied.foreign, "复制进受管目录后仍是外来条目");
         assert_eq!(copied.size, 3000);
-        assert_eq!(read_back(&state, "enc", "受管夹/外来.txt").await, file_bytes);
+        assert_eq!(
+            read_back(&state, "enc", "受管夹/外来.txt").await,
+            file_bytes
+        );
 
         // 复制整棵外来目录：子对象也保持外来，字节原样。
         copy_path(&state, "enc", "外来夹", "enc", "受管夹/外来夹", false, None)
@@ -1175,7 +1208,10 @@ mod tests {
             .unwrap();
         let inner = sub.iter().find(|e| e.name == "inner.bin").unwrap();
         assert!(inner.foreign, "外来目录的子文件仍是外来条目");
-        assert_eq!(read_back(&state, "enc", "受管夹/外来夹/inner.bin").await, inner_bytes);
+        assert_eq!(
+            read_back(&state, "enc", "受管夹/外来夹/inner.bin").await,
+            inner_bytes
+        );
 
         // 复制进明文数据源：落成普通明文对象（明文源永不标外来）。
         copy_path(&state, "enc", "外来夹", "plain", "落地", false, None)
@@ -1194,9 +1230,15 @@ mod tests {
         );
 
         // 移动（rename）外来文件：仍是外来，旧名消失。
-        crate::routes::files::rename_path(&state, storage.as_ref(), "enc", "外来.txt", "外来改.txt")
-            .await
-            .unwrap();
+        crate::routes::files::rename_path(
+            &state,
+            storage.as_ref(),
+            "enc",
+            "外来.txt",
+            "外来改.txt",
+        )
+        .await
+        .unwrap();
         let root = list_dir(&state, storage.as_ref(), "enc", "").await.unwrap();
         assert!(
             root.iter().any(|e| e.name == "外来改.txt" && e.foreign),
@@ -1311,8 +1353,12 @@ mod tests {
         .await
         .unwrap();
         // 无论走哪条路，落地的字节都必须一致。
-        assert_eq!(std::fs::read(dst_root.join("v1.bin")).unwrap_or_default().len() as u64,
-                   if rapid { 0 } else { data.len() as u64 });
+        assert_eq!(
+            std::fs::read(dst_root.join("v1.bin"))
+                .unwrap_or_default()
+                .len() as u64,
+            if rapid { 0 } else { data.len() as u64 }
+        );
         assert_eq!(
             progress.uploaded.load(std::sync::atomic::Ordering::Relaxed),
             data.len() as u64,
@@ -1342,7 +1388,10 @@ mod tests {
     async fn failed_precheck_skips_hashing_entirely() {
         let (rapid, log) = run_copy_object(false, true, &[HashKind::Sha1]).await;
         assert!(!rapid);
-        assert!(!log.iter().any(|line| line.starts_with("rapid ")), "{log:?}");
+        assert!(
+            !log.iter().any(|line| line.starts_with("rapid ")),
+            "{log:?}"
+        );
         assert!(log.iter().any(|line| line.starts_with("put ")), "{log:?}");
     }
 

@@ -31,8 +31,7 @@ use crate::error::{ApiError, ApiResult};
 
 pub const DEFAULT_API_BASE: &str = "https://openapi.alipan.com";
 /// 静默授权接口：拿官网 access_token 直接给第三方应用授权，免扫码。
-const OAUTH_USERS_AUTHORIZE_URL: &str =
-    "https://open.aliyundrive.com/oauth/users/qrcode/authorize";
+const OAUTH_USERS_AUTHORIZE_URL: &str = "https://open.aliyundrive.com/oauth/users/qrcode/authorize";
 /// 官方文档给的授权 scope：读 + 写 + 基本信息。
 pub const OAUTH_SCOPES: &str = "user:base,file:all:read,file:all:write";
 /// 扫码授权默认走阿里云盘 TV：中转最稳，且不需要用户自备应用。
@@ -401,7 +400,12 @@ impl App {
                     "width": 430,
                     "height": 430,
                 });
-                send(http.post(self.open_url("/oauth/authorize/qrcode")).json(&body), what).await?
+                send(
+                    http.post(self.open_url("/oauth/authorize/qrcode"))
+                        .json(&body),
+                    what,
+                )
+                .await?
             }
             Flavor::Tv => {
                 tv_request(
@@ -412,21 +416,27 @@ impl App {
                 )
                 .await?
             }
-            Flavor::Alist => send(http.post(format!("{ALIST_BASE}/alist/ali_open/qr")), what).await?,
-            Flavor::Openlist => send(
-                http.get(format!("{OPENLIST_BASE}/alicloud/requests"))
-                    .query(&[("server_use", "true")]),
-                what,
-            )
-            .await?,
+            Flavor::Alist => {
+                send(http.post(format!("{ALIST_BASE}/alist/ali_open/qr")), what).await?
+            }
+            Flavor::Openlist => {
+                send(
+                    http.get(format!("{OPENLIST_BASE}/alicloud/requests"))
+                        .query(&[("server_use", "true")]),
+                    what,
+                )
+                .await?
+            }
             Flavor::AlistGo => {
                 send(http.post(format!("{ALISTGO_BASE}/alist/ali_open/qr")), what).await?
             }
-            Flavor::XiaoBai => send(
-                http.get(format!("{XIAOBAI_BASE}/api/oauth/authorize/qrcode")),
-                what,
-            )
-            .await?,
+            Flavor::XiaoBai => {
+                send(
+                    http.get(format!("{XIAOBAI_BASE}/api/oauth/authorize/qrcode")),
+                    what,
+                )
+                .await?
+            }
             Flavor::CloudDrive2 => {
                 send(http.get(format!("{CLOUDDRIVE2_BASE}/qrcode_url")), what).await?
             }
@@ -464,9 +474,8 @@ impl App {
         // 开放平台状态字面量：WaitLogin / ScanSuccess / LoginSuccess / QRCodeExpired
         match field(&value, &["status"]).unwrap_or_default() {
             "LoginSuccess" => {
-                let code = field(&value, &["authCode"]).ok_or_else(|| {
-                    ApiError::Upstream("扫码已确认但未返回 authCode".into())
-                })?;
+                let code = field(&value, &["authCode"])
+                    .ok_or_else(|| ApiError::Upstream("扫码已确认但未返回 authCode".into()))?;
                 Ok(QrStatus::Confirmed(code.to_owned()))
             }
             "ScanSuccess" => Ok(QrStatus::Scanned),
@@ -486,7 +495,11 @@ impl App {
                     "grant_type": "authorization_code",
                     "code": auth_code,
                 });
-                send(http.post(self.open_url("/oauth/access_token")).json(&body), what).await?
+                send(
+                    http.post(self.open_url("/oauth/access_token")).json(&body),
+                    what,
+                )
+                .await?
             }
             Flavor::Tv => {
                 tv_request(http, "/v4/token", &json!({ "code": auth_code }), what).await?
@@ -506,20 +519,25 @@ impl App {
                 .await?
             }
             // OpenList 的回调用 sid 反查授权结果，code 参数也传 sid。
-            Flavor::Openlist => send(
-                http.get(format!("{OPENLIST_BASE}/alicloud/callback"))
-                    .query(&[
-                        ("client_id", ""),
-                        ("client_secret", ""),
-                        ("server_use", "true"),
-                        ("grant_type", "authorization_code"),
-                        ("code", sid),
-                        ("sid", sid),
-                    ])
-                    .header(reqwest::header::COOKIE, "driver_txt=alicloud_qr; server_use=true"),
-                what,
-            )
-            .await?,
+            Flavor::Openlist => {
+                send(
+                    http.get(format!("{OPENLIST_BASE}/alicloud/callback"))
+                        .query(&[
+                            ("client_id", ""),
+                            ("client_secret", ""),
+                            ("server_use", "true"),
+                            ("grant_type", "authorization_code"),
+                            ("code", sid),
+                            ("sid", sid),
+                        ])
+                        .header(
+                            reqwest::header::COOKIE,
+                            "driver_txt=alicloud_qr; server_use=true",
+                        ),
+                    what,
+                )
+                .await?
+            }
             Flavor::AlistGo => {
                 let body = json!({
                     "client_id": "",
@@ -534,19 +552,23 @@ impl App {
                 )
                 .await?
             }
-            Flavor::XiaoBai => send(
-                http.get(format!("{XIAOBAI_BASE}/api/oauth/accessToken"))
-                    .query(&[("authCode", auth_code)]),
-                what,
-            )
-            .await?,
-            Flavor::CloudDrive2 => send(
-                http.get(format!(
-                    "{CLOUDDRIVE2_BASE}/access_token/authorization_code/{auth_code}"
-                )),
-                what,
-            )
-            .await?,
+            Flavor::XiaoBai => {
+                send(
+                    http.get(format!("{XIAOBAI_BASE}/api/oauth/accessToken"))
+                        .query(&[("authCode", auth_code)]),
+                    what,
+                )
+                .await?
+            }
+            Flavor::CloudDrive2 => {
+                send(
+                    http.get(format!(
+                        "{CLOUDDRIVE2_BASE}/access_token/authorization_code/{auth_code}"
+                    )),
+                    what,
+                )
+                .await?
+            }
             Flavor::Webdav => {
                 let body = json!({ "grant_type": "authorization_code", "code": auth_code });
                 send(
@@ -579,7 +601,11 @@ impl App {
                     "grant_type": "refresh_token",
                     "refresh_token": refresh_token,
                 });
-                send(http.post(self.open_url("/oauth/access_token")).json(&body), what).await?
+                send(
+                    http.post(self.open_url("/oauth/access_token")).json(&body),
+                    what,
+                )
+                .await?
             }
             Flavor::Tv => {
                 tv_request(
@@ -604,12 +630,14 @@ impl App {
                 )
                 .await?
             }
-            Flavor::Openlist => send(
-                http.get(format!("{OPENLIST_BASE}/alicloud/renewapi"))
-                    .query(&[("server_use", "true"), ("refresh_ui", refresh_token)]),
-                what,
-            )
-            .await?,
+            Flavor::Openlist => {
+                send(
+                    http.get(format!("{OPENLIST_BASE}/alicloud/renewapi"))
+                        .query(&[("server_use", "true"), ("refresh_ui", refresh_token)]),
+                    what,
+                )
+                .await?
+            }
             Flavor::AlistGo => {
                 let body = json!({
                     "client_id": "",
@@ -624,19 +652,23 @@ impl App {
                 )
                 .await?
             }
-            Flavor::XiaoBai => send(
-                http.get(format!("{XIAOBAI_BASE}/api/oauth/accessToken"))
-                    .query(&[("refreshToken", refresh_token)]),
-                what,
-            )
-            .await?,
-            Flavor::CloudDrive2 => send(
-                http.get(format!(
-                    "{CLOUDDRIVE2_BASE}/access_token/refresh_token/{refresh_token}"
-                )),
-                what,
-            )
-            .await?,
+            Flavor::XiaoBai => {
+                send(
+                    http.get(format!("{XIAOBAI_BASE}/api/oauth/accessToken"))
+                        .query(&[("refreshToken", refresh_token)]),
+                    what,
+                )
+                .await?
+            }
+            Flavor::CloudDrive2 => {
+                send(
+                    http.get(format!(
+                        "{CLOUDDRIVE2_BASE}/access_token/refresh_token/{refresh_token}"
+                    )),
+                    what,
+                )
+                .await?
+            }
             Flavor::Webdav => {
                 let body = json!({ "grant_type": "refresh_token", "refresh_token": refresh_token });
                 send(
@@ -695,9 +727,8 @@ impl App {
                 _ => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
             }
         }
-        let auth_code = auth_code.ok_or_else(|| {
-            ApiError::Upstream("阿里云盘静默授权未在预期时间内完成".into())
-        })?;
+        let auth_code = auth_code
+            .ok_or_else(|| ApiError::Upstream("阿里云盘静默授权未在预期时间内完成".into()))?;
         self.exchange(http, &qr.sid, &auth_code).await
     }
 }
@@ -765,7 +796,8 @@ fn ensure_business_ok(value: &Value, what: &str) -> ApiResult<()> {
 
 fn message_suffix(value: &Value) -> String {
     let code = field(value, &["code"]).unwrap_or_default();
-    let message = field(value, &["message", "msg", "error", "error_description"]).unwrap_or_default();
+    let message =
+        field(value, &["message", "msg", "error", "error_description"]).unwrap_or_default();
     if code.is_empty() && message.is_empty() {
         return String::new();
     }
@@ -1033,7 +1065,10 @@ mod tests {
     /// 回 None，官网令牌会被判成「读不出 exp」而每次都触发刷新（白白作废刷新令牌）。
     #[test]
     fn pds_access_token_pubkey_parses() {
-        assert!(PDS_AT_VERIFIER.is_some(), "官网（PDS）验签公钥 PEM 解析失败");
+        assert!(
+            PDS_AT_VERIFIER.is_some(),
+            "官网（PDS）验签公钥 PEM 解析失败"
+        );
     }
 
     /// 未签名 / 篡改 / 非 JWT 的官网令牌读不出 exp（验签这一关就过不去）。
