@@ -59,7 +59,8 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
     default:
       // 编辑时若把 BDUSS 留空，视为沿用原值（表单里本来就是回填的）。
       // 选了内置应用（默认 ES 文件管理器）就不带自备凭据，只有自定义应用才回填。
-      return { root: v.root ?? '/safedrive', bduss: trim(v.bduss) || trim(editing?.config.bduss),
+      // 根目录留空即网盘根目录（与阿里云盘、夸克网盘一致），不再强塞 /safedrive。
+      return { root: trim(v.root), bduss: trim(v.bduss) || trim(editing?.config.bduss),
         userAgent: v.userAgent ?? '', app: trim(v.app),
         clientId: v.app === CUSTOM_APP ? trim(v.clientId) : '',
         clientSecret: v.app === CUSTOM_APP ? trim(v.clientSecret) : '' };
@@ -128,10 +129,14 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
     })();
   }, [open, type]);
 
-  // 新建时给一个默认应用（扫码默认走的就是它）。
+  // 新建时给一个默认应用（扫码默认走的就是它）。`app` 字段被阿里云盘与百度
+  // 网盘共用，切换类型时上一家的选中值会残留（如百度冒出 tv、阿里冒出 es），
+  // 所以要判断当前值是否属于本家：不属于就重置为本家默认。
   useEffect(() => {
     if (!open || type !== 'aliyundrive' || !aliApps) return;
-    if (!trim(form.getFieldValue('app'))) form.setFieldsValue({ app: aliApps.default });
+    const cur = trim(form.getFieldValue('app'));
+    const known = cur === CUSTOM_APP || aliApps.apps.some((app) => app.key === cur);
+    if (!known) form.setFieldsValue({ app: aliApps.default });
   }, [open, type, aliApps, form]);
 
   // 百度网盘内置应用清单：进了百度表单才拉，取不到也不影响「自定义应用」。
@@ -145,10 +150,12 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
     })();
   }, [open, type]);
 
-  // 新建百度网盘时给一个默认应用（默认 ES 文件管理器）。
+  // 新建百度网盘时给一个默认应用（默认 ES 文件管理器）；同样要挡住阿里那边残留的选中值。
   useEffect(() => {
     if (!open || type !== 'baidupan' || !baiduApps) return;
-    if (!trim(form.getFieldValue('app'))) form.setFieldsValue({ app: baiduApps.default });
+    const cur = trim(form.getFieldValue('app'));
+    const known = cur === CUSTOM_APP || baiduApps.apps.some((app) => app.key === cur);
+    if (!known) form.setFieldsValue({ app: baiduApps.default });
   }, [open, type, baiduApps, form]);
 
   /**
@@ -288,11 +295,11 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
       <Form.Item name="type" label="类型" rules={[{required:true}]}><Select disabled={!!editing} options={DS_TYPES}/></Form.Item>
       {type==='localfs'&&<Form.Item name="root" label="根目录" rules={[{required:true}]}><Input/></Form.Item>}
       {type==='webdav'&&<><Form.Item name="url" label="WebDAV 地址" rules={[{required:true},{pattern:/^https?:\/\//}]}><Input/></Form.Item><Form.Item name="username" label="用户名"><Input/></Form.Item><Form.Item name="password" label="密码"><Input.Password/></Form.Item></>}
-      {type==='baidupan'&&<><Form.Item name="root" label="网盘根目录" rules={[{required:true}]}><Input/></Form.Item>
+      {type==='baidupan'&&<><Form.Item name="root" label="网盘根目录" extra="留空即网盘根目录；建议单独用一个目录"><Input placeholder="/safedrive"/></Form.Item>
+      <Form.Item name="bduss" label="BDUSS" rules={[{required:true,message:'请扫码登录获取，或手动粘贴'}]} extra={<Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>setQrOpen(true)}>扫码登录自动获取</Button>}><Input.Password placeholder="点击下方扫码登录自动获取，或手动粘贴 Cookie 中的 BDUSS"/></Form.Item>
       <Form.Item name="app" label="第三方应用" extra={baiduAppNote ?? '内置应用无需自建：扫码拿到 BDUSS 后自动授权换取令牌'}><Select options={baiduAppOptions} placeholder="ES 文件管理器"/></Form.Item>
       {selectedApp===CUSTOM_APP&&<><Form.Item name="clientId" label="API Key（client_id）" rules={[{required:true}]} extra="百度网盘开放平台自建应用的凭据；只在本机与百度官方接口之间流转"><Input/></Form.Item>
       <Form.Item name="clientSecret" label="Secret Key（client_secret）" rules={[{required:true}]}><Input.Password/></Form.Item></>}
-      <Form.Item name="bduss" label="BDUSS" rules={[{required:true,message:'请扫码登录获取，或手动粘贴'}]} extra={<Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>setQrOpen(true)}>扫码登录自动获取</Button>}><Input.Password placeholder="点击下方扫码登录自动获取，或手动粘贴 Cookie 中的 BDUSS"/></Form.Item>
       <Form.Item name="userAgent" label="下载 User-Agent" extra="留空使用默认值，仅影响下载数据流量的 UA 标识"><Input placeholder="netdisk;P2SP;2.2.61.31;android"/></Form.Item></>}
       {type==='aliyundrive'&&<><Form.Item name="root" label="网盘根目录" extra="留空即网盘根目录；建议单独用一个目录"><Input placeholder="/safedrive"/></Form.Item>
       <Form.Item name="webRefreshToken" label="官网令牌（推荐）" extra={<><Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>setAliWebQrOpen(true)}>扫码登录官网获取</Button><div><Typography.Text type="secondary">扫码登录后可免扫码换取下方开放平台 refresh_token；分享与转存走官网 PDS 接口，必须配置官网令牌才可用。不需要分享/转存可留空。</Typography.Text></div></>}><Input.Password placeholder="扫码登录官网自动填入，可免扫码授权下方应用"/></Form.Item>

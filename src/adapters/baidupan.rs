@@ -439,7 +439,7 @@ impl BaiduPanFs {
             config
                 .get("root")
                 .and_then(Value::as_str)
-                .unwrap_or("/safedrive"),
+                .unwrap_or(""),
         )?;
         let parse_url = |field: &str, default: &str| -> ApiResult<Url> {
             let url = Url::parse(config.get(field).and_then(Value::as_str).unwrap_or(default))
