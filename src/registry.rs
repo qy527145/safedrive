@@ -180,31 +180,46 @@ impl Registry {
     }
 }
 
-/// 每种数据源的凭证形态：
-/// - `identity`：改动即代表换账号，运行期缓存的令牌必须作废；
+/// 一组同进退的凭证：
+/// - `identity`：改动即代表换账号，本组运行期缓存的令牌必须作废；
 /// - `rotating`：既是用户填的初值、又会被后台轮换（阿里云盘 refreshToken、
 ///   夸克 cookie）。表单回填的可能是轮换后的值，也可能是最初的种子值，
 ///   两者都算「没改」，因此额外记一份 `<字段>Seed`；
-/// - `live`：纯运行期产物，跟随 identity 一起保留或丢弃。
-fn credential_spec(
-    ds_type: &str,
-) -> Option<(
-    &'static [&'static str],
-    &'static [&'static str],
-    &'static [&'static str],
-)> {
+/// - `live`：纯运行期产物，跟随本组 identity 一起保留或丢弃。
+struct CredentialGroup {
+    identity: &'static [&'static str],
+    rotating: &'static [&'static str],
+    live: &'static [&'static str],
+}
+
+/// 每种数据源的凭证分组。分组是必要的：阿里云盘的开放平台令牌与官网令牌
+/// 各自独立轮换，编辑其中一个不能把另一个回退成表单里的旧值。
+fn credential_spec(ds_type: &str) -> Option<&'static [CredentialGroup]> {
     match ds_type {
-        "baidupan" => Some((
-            &["bduss", "clientId", "clientSecret"],
-            &[],
-            &["accessToken", "refreshToken", "accessTokenExpiresAt"],
-        )),
-        "aliyundrive" => Some((
-            &["clientId", "clientSecret"],
-            &["refreshToken"],
-            &["accessToken", "accessTokenExpiresAt", "driveId"],
-        )),
-        "quark" => Some((&[], &["cookie"], &[])),
+        "baidupan" => Some(&[CredentialGroup {
+            identity: &["bduss", "clientId", "clientSecret"],
+            rotating: &[],
+            live: &["accessToken", "refreshToken", "accessTokenExpiresAt"],
+        }]),
+        "aliyundrive" => Some(&[
+            // 开放平台：日常读写
+            CredentialGroup {
+                identity: &["app", "clientId", "clientSecret"],
+                rotating: &["refreshToken"],
+                live: &["accessToken", "accessTokenExpiresAt", "driveId"],
+            },
+            // 官网（PDS）：仅分享与转存，可以不配
+            CredentialGroup {
+                identity: &[],
+                rotating: &["webRefreshToken"],
+                live: &["webAccessToken", "webAccessTokenExpiresAt"],
+            },
+        ]),
+        "quark" => Some(&[CredentialGroup {
+            identity: &[],
+            rotating: &["cookie"],
+            live: &[],
+        }]),
         _ => None,
     }
 }
@@ -215,13 +230,13 @@ fn seed_field(field: &str) -> String {
 
 /// 新建/保存时把轮换字段的当前值记为种子，供后续「用户到底改没改」的判定。
 fn seed_rotating_secrets(datasource: &mut DataSource) {
-    let Some((_, rotating, _)) = credential_spec(&datasource.ds_type) else {
+    let Some(groups) = credential_spec(&datasource.ds_type) else {
         return;
     };
     let Some(config) = datasource.config.as_object_mut() else {
         return;
     };
-    for field in rotating {
+    for field in groups.iter().flat_map(|group| group.rotating) {
         let seed = seed_field(field);
         if !config.contains_key(&seed)
             && let Some(value) = config.get(*field).cloned()
@@ -247,44 +262,54 @@ fn preserve_live_credentials(current: &DataSource, replacement: &mut DataSource)
     if current.ds_type != replacement.ds_type {
         return;
     }
-    let Some((identity, rotating, live)) = credential_spec(&current.ds_type) else {
+    let Some(groups) = credential_spec(&current.ds_type) else {
         return;
     };
     // driveId 是由 driveType 查出来的：换了盘就不能留旧 ID，否则会继续
     // 读写上一个盘。删掉即可，适配器下次会重新问一遍并回写。
     let drive_changed = current.ds_type == "aliyundrive"
         && drive_type_of(&current.config) != drive_type_of(&replacement.config);
-    let same_identity = identity
+    // 每组独立判定：动了官网令牌不该影响开放平台那组，反之亦然。
+    let verdicts: Vec<bool> = groups
         .iter()
-        .all(|field| current.config.get(field) == replacement.config.get(field));
-    // 轮换字段：等于当前值或等于种子值都说明用户没动过。
-    let same_rotating = rotating.iter().all(|field| {
-        let submitted = replacement.config.get(*field);
-        submitted.is_none()
-            || submitted == current.config.get(*field)
-            || submitted == current.config.get(seed_field(field).as_str())
-    });
+        .map(|group| {
+            let same_identity = group
+                .identity
+                .iter()
+                .all(|field| current.config.get(field) == replacement.config.get(field));
+            // 轮换字段：等于当前值或等于种子值都说明用户没动过。
+            let same_rotating = group.rotating.iter().all(|field| {
+                let submitted = replacement.config.get(*field);
+                submitted.is_none()
+                    || submitted == current.config.get(*field)
+                    || submitted == current.config.get(seed_field(field).as_str())
+            });
+            same_identity && same_rotating
+        })
+        .collect();
     let Some(target) = replacement.config.as_object_mut() else {
         return;
     };
-    if !(same_identity && same_rotating) {
-        // 换账号了：连种子一起重置，别把旧账号的令牌带进来。
-        for field in rotating {
+    for (group, unchanged) in groups.iter().zip(verdicts) {
+        if !unchanged {
+            // 换账号了：连种子一起重置，别把旧账号的令牌带进来。
+            for field in group.rotating {
+                let seed = seed_field(field);
+                match target.get(*field).cloned() {
+                    Some(value) => target.insert(seed, value),
+                    None => target.remove(&seed),
+                };
+            }
+            continue;
+        }
+        for field in group.rotating.iter().chain(group.live.iter()) {
+            if let Some(value) = current.config.get(field) {
+                target.insert((*field).into(), value.clone());
+            }
             let seed = seed_field(field);
-            match target.get(*field).cloned() {
-                Some(value) => target.insert(seed, value),
-                None => target.remove(&seed),
-            };
-        }
-        return;
-    }
-    for field in rotating.iter().chain(live.iter()) {
-        if let Some(value) = current.config.get(field) {
-            target.insert((*field).into(), value.clone());
-        }
-        let seed = seed_field(field);
-        if let Some(value) = current.config.get(seed.as_str()) {
-            target.insert(seed, value.clone());
+            if let Some(value) = current.config.get(seed.as_str()) {
+                target.insert(seed, value.clone());
+            }
         }
     }
     if drive_changed {
@@ -479,6 +504,67 @@ mod tests {
         assert_eq!(updated.config["refreshToken"], "another-account");
         assert_eq!(updated.config["refreshTokenSeed"], "another-account");
         assert!(updated.config.get("accessToken").is_none());
+    }
+
+    /// 阿里云盘的开放平台令牌与官网令牌各自独立：只改其中一个，另一个
+    /// 后台轮换出来的值必须原样留住。
+    #[test]
+    fn aliyun_web_and_open_tokens_rotate_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("datasources.json");
+        let registry = Registry::load(path.clone()).unwrap();
+        let mut source = ds("ali");
+        source.ds_type = "aliyundrive".into();
+        source.config = serde_json::json!({
+            "app": "tv",
+            "refreshToken": "seed-refresh",
+            "webRefreshToken": "seed-web",
+        });
+        registry.create(source.clone()).unwrap();
+        registry
+            .update_credentials(
+                "ali",
+                vec![
+                    ("accessToken".into(), "fresh-access".into()),
+                    ("refreshToken".into(), "rotated-refresh".into()),
+                    ("webAccessToken".into(), "fresh-web-access".into()),
+                    ("webRefreshToken".into(), "rotated-web".into()),
+                ],
+            )
+            .unwrap();
+
+        // 用户只换了官网令牌（表单里的开放平台令牌还是最初的种子值）
+        source.config = serde_json::json!({
+            "app": "tv",
+            "refreshToken": "seed-refresh",
+            "webRefreshToken": "pasted-new-web",
+        });
+        registry.update("ali", source.clone()).unwrap();
+        let updated = Registry::load(path.clone()).unwrap().get("ali").unwrap();
+        assert_eq!(updated.config["refreshToken"], "rotated-refresh");
+        assert_eq!(updated.config["accessToken"], "fresh-access");
+        assert_eq!(updated.config["webRefreshToken"], "pasted-new-web");
+        assert_eq!(updated.config["webRefreshTokenSeed"], "pasted-new-web");
+        assert!(updated.config.get("webAccessToken").is_none());
+
+        // 反向：只换开放平台令牌，官网那组照旧
+        registry
+            .update_credentials(
+                "ali",
+                vec![("webAccessToken".into(), "web-access-2".into())],
+            )
+            .unwrap();
+        source.config = serde_json::json!({
+            "app": "tv",
+            "refreshToken": "pasted-new-open",
+            "webRefreshToken": "pasted-new-web",
+        });
+        registry.update("ali", source).unwrap();
+        let updated = Registry::load(path).unwrap().get("ali").unwrap();
+        assert_eq!(updated.config["refreshToken"], "pasted-new-open");
+        assert!(updated.config.get("accessToken").is_none());
+        assert_eq!(updated.config["webAccessToken"], "web-access-2");
+        assert_eq!(updated.config["webRefreshToken"], "pasted-new-web");
     }
 
     /// 夸克的 __puus 每次请求都可能轮换，同样不能被设置页回写覆盖。

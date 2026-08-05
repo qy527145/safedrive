@@ -22,6 +22,9 @@ use super::bits::{BitReader, BitWriter, DecodeError, MAX_STRING_BYTES, validate_
 pub(super) const SCHEME: &str = "sdds://";
 
 const VERSION: u8 = 1;
+/// v2 只在阿里云盘尾部多了「第三方应用 + 官网令牌」两段，其余布局与 v1 逐位
+/// 相同。没用到这两段的链接仍按 v1 签发，老版本客户端照旧能导入。
+const VERSION_ALIYUN_APP: u8 = 2;
 const SOURCE_LOCALFS: u8 = 1;
 const SOURCE_WEBDAV: u8 = 2;
 const SOURCE_BAIDUPAN: u8 = 3;
@@ -97,6 +100,16 @@ pub(super) fn encode(pack: &DsPack) -> Result<String, &'static str> {
     }
 
     let field = |key: &str| pack.config.get(key).and_then(Value::as_str).unwrap_or("");
+    // 阿里云盘选了内置应用、或配了官网令牌，才需要 v2 的尾部两段。
+    let version = if source == SOURCE_ALIYUNDRIVE
+        && ["app", "webRefreshToken"]
+            .iter()
+            .any(|key| !field(key).is_empty())
+    {
+        VERSION_ALIYUN_APP
+    } else {
+        VERSION
+    };
     match source {
         SOURCE_LOCALFS => write_compact(&mut bits, field("root"))?,
         SOURCE_WEBDAV => {
@@ -111,6 +124,11 @@ pub(super) fn encode(pack: &DsPack) -> Result<String, &'static str> {
             write_compact(&mut bits, field("refreshToken"))?;
             for key in ["driveType", "apiBase"] {
                 write_optional(&mut bits, Some(field(key)).filter(|v| !v.is_empty()))?;
+            }
+            if version >= VERSION_ALIYUN_APP {
+                for key in ["app", "webRefreshToken"] {
+                    write_optional(&mut bits, Some(field(key)).filter(|v| !v.is_empty()))?;
+                }
             }
         }
         SOURCE_QUARK => {
@@ -129,12 +147,12 @@ pub(super) fn encode(pack: &DsPack) -> Result<String, &'static str> {
 
     let plain = bits.finish();
     let mut cipher = Aes128Siv::new_from_slice(&V1_KEY).map_err(|_| "invalid protocol key")?;
-    let version = [VERSION];
+    let version_bytes = [version];
     let mut wire = cipher
-        .encrypt([b"safedrive-ds".as_slice(), version.as_slice()], &plain)
+        .encrypt([b"safedrive-ds".as_slice(), version_bytes.as_slice()], &plain)
         .map_err(|_| "datasource share encryption failed")?;
     let encrypted_pad = wire.first().ok_or("empty ciphertext")? & 0xf0;
-    wire.push(encrypted_pad | VERSION);
+    wire.push(encrypted_pad | version);
     Ok(format!("{SCHEME}{}", URL_SAFE_NO_PAD.encode(wire)))
 }
 
@@ -151,7 +169,7 @@ pub(super) fn decode(link: &str) -> Result<DsPack, DecodeError> {
     if wire.first().map(|byte| byte & 0xf0) != Some(trailer & 0xf0) {
         return Err(DecodeError::Invalid);
     }
-    if version != VERSION {
+    if version != VERSION && version != VERSION_ALIYUN_APP {
         return Err(DecodeError::UnsupportedVersion(version));
     }
     let mut cipher = Aes128Siv::new_from_slice(&V1_KEY).map_err(|_| DecodeError::Invalid)?;
@@ -159,10 +177,10 @@ pub(super) fn decode(link: &str) -> Result<DsPack, DecodeError> {
     let plain = cipher
         .decrypt([b"safedrive-ds".as_slice(), version_bytes.as_slice()], &wire)
         .map_err(|_| DecodeError::Invalid)?;
-    decode_plain(&plain)
+    decode_plain(&plain, version)
 }
 
-fn decode_plain(plain: &[u8]) -> Result<DsPack, DecodeError> {
+fn decode_plain(plain: &[u8], version: u8) -> Result<DsPack, DecodeError> {
     let mut bits = BitReader::new(plain);
     let source = bits.read_bits(4)? as u8;
     let ds_type = match source {
@@ -205,14 +223,21 @@ fn decode_plain(plain: &[u8]) -> Result<DsPack, DecodeError> {
             "username": read_optional(&mut bits)?.unwrap_or_default(),
             "password": read_optional(&mut bits)?.unwrap_or_default(),
         }),
-        SOURCE_ALIYUNDRIVE => json!({
-            "root": read_compact(&mut bits)?,
-            "clientId": read_compact(&mut bits)?,
-            "clientSecret": read_compact(&mut bits)?,
-            "refreshToken": read_compact(&mut bits)?,
-            "driveType": read_optional(&mut bits)?.unwrap_or_else(|| "default".into()),
-            "apiBase": read_optional(&mut bits)?.unwrap_or_default(),
-        }),
+        SOURCE_ALIYUNDRIVE => {
+            let mut config = json!({
+                "root": read_compact(&mut bits)?,
+                "clientId": read_compact(&mut bits)?,
+                "clientSecret": read_compact(&mut bits)?,
+                "refreshToken": read_compact(&mut bits)?,
+                "driveType": read_optional(&mut bits)?.unwrap_or_else(|| "default".into()),
+                "apiBase": read_optional(&mut bits)?.unwrap_or_default(),
+            });
+            if version >= VERSION_ALIYUN_APP {
+                config["app"] = read_optional(&mut bits)?.unwrap_or_default().into();
+                config["webRefreshToken"] = read_optional(&mut bits)?.unwrap_or_default().into();
+            }
+            config
+        }
         SOURCE_QUARK => json!({
             "root": read_compact(&mut bits)?,
             "cookie": read_compact(&mut bits)?,
@@ -515,5 +540,38 @@ mod tests {
         let decoded = decode(&link).unwrap();
         assert!(decoded.config.get("accessToken").is_none());
         assert!(decoded.config.get("refreshToken").is_none());
+    }
+
+    /// 内置应用键与官网令牌只在 v2 里传；没用到就仍签 v1（老客户端能导入）。
+    #[test]
+    fn aliyun_app_and_web_token_ride_along_in_v2() {
+        let version_of = |link: &str| {
+            *URL_SAFE_NO_PAD
+                .decode(link.strip_prefix(SCHEME).unwrap())
+                .unwrap()
+                .last()
+                .unwrap()
+                & 0x0f
+        };
+        assert_eq!(version_of(&encode(&aliyun_pack()).unwrap()), VERSION);
+
+        let mut pack = aliyun_pack();
+        pack.config["app"] = "tv".into();
+        pack.config["webRefreshToken"] = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ3LTEifQ.c2ln".into();
+        let link = encode(&pack).unwrap();
+        assert_eq!(version_of(&link), VERSION_ALIYUN_APP);
+        assert_eq!(decode(&link), Ok(normalized(pack)));
+
+        // 运行期令牌不进链接（导入端用 refresh_token 自己换）。
+        let mut with_live = aliyun_pack();
+        with_live.config["app"] = "tv".into();
+        with_live.config["webAccessToken"] = "live".into();
+        with_live.config["accessToken"] = "live".into();
+        let decoded = decode(&encode(&with_live).unwrap()).unwrap();
+        assert!(decoded.config.get("webAccessToken").is_none());
+        assert!(decoded.config.get("accessToken").is_none());
+        assert_eq!(decoded.config["app"], "tv");
+        // 官网令牌没配 → 导入后也是没配（不支持分享/转存）。
+        assert_eq!(decoded.config["webRefreshToken"], "");
     }
 }

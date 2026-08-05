@@ -8,7 +8,7 @@ import {
 } from 'antd';
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, type DsRecord } from '../api/client';
+import { api, type DsRecord, type DsType } from '../api/client';
 import SourceModal from '../components/SourceModal';
 import { useSources } from '../stores/sources';
 import { formatTime } from '../utils/format';
@@ -236,14 +236,17 @@ export default function DataPage() {
     );
   }
 
-  const typeTag = (d: DsRecord) =>
-    d.type === 'localfs' ? (
-      <Tag color="geekblue">本地文件系统</Tag>
-    ) : d.type === 'baidupan' ? (
-      <Tag color="blue">百度网盘</Tag>
-    ) : (
-      <Tag color="cyan">WebDAV</Tag>
-    );
+  const typeTag = (d: DsRecord) => {
+    const tags: Record<DsType, { label: string; color: string }> = {
+      localfs: { label: '本地文件系统', color: 'geekblue' },
+      webdav: { label: 'WebDAV', color: 'cyan' },
+      baidupan: { label: '百度网盘', color: 'blue' },
+      aliyundrive: { label: '阿里云盘', color: 'orange' },
+      quark: { label: '夸克网盘', color: 'purple' },
+    };
+    const tag = tags[d.type];
+    return <Tag color={tag.color}>{tag.label}</Tag>;
+  };
 
   if (view === 'list') {
     return (

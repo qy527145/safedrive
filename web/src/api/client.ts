@@ -68,15 +68,40 @@ export interface DsConfig {
   refreshToken?: string;
   accessTokenExpiresAt?: number;
   shareApiBase?: string;
+  /** 阿里云盘：内置第三方应用键，或 custom（自备 client_id/secret） */
+  app?: string;
   /** 阿里云盘：resource（资源盘）/ backup（备份盘） */
   driveType?: string;
   /** 阿里云盘：开放平台接口地址，留空用默认 */
   apiBase?: string;
   driveId?: string;
+  /** 阿里云盘：官网令牌（可选），配了才支持分享/转存 */
+  webRefreshToken?: string;
+  webAccessToken?: string;
+  webAccessTokenExpiresAt?: number;
   /** 夸克网盘：浏览器 Cookie 全串 */
   cookie?: string;
 }
 export type DsInput = Omit<DsRecord, 'id' | 'createdAt' | 'password'> & { password?: string };
+
+/** 内置的阿里云盘第三方应用：扫码与刷新走该应用作者的中转服务，用户不必自备应用。 */
+export interface AliyunApp {
+  key: string;
+  name: string;
+  clientId: string;
+  /** 提示文案：这个应用的令牌由谁签发/刷新 */
+  note: string;
+}
+
+/** 开放平台应用入参。app 省略即默认内置应用；custom 时才需要 client 凭据。 */
+export interface AliyunAppInput {
+  app?: string;
+  clientId?: string;
+  clientSecret?: string;
+}
+
+/** 官网扫码会话（passport Cookie + 二维码参数）。前端只负责原样带回，不解读。 */
+export type AliyunWebSession = Record<string, unknown>;
 
 /** 一次跨数据源复制的成绩单。mode 直接决定 UI 上说「秒传」还是「普通传输」。 */
 export interface CopyReport {
@@ -207,18 +232,59 @@ export const api = {
     ),
 
   // ---- 阿里云盘扫码授权（自动获取 refreshToken） ----
-  aliyunQrCreate: (app: { clientId: string; clientSecret: string; apiBase?: string }) =>
-    request<{ qrCodeUrl: string; sid: string; img: string }>('/api/aliyun/qrcode', {
+  /** 内置第三方应用清单；default 是扫码默认用的应用，custom 是「自备应用」的键。 */
+  aliyunApps: () =>
+    request<{ apps: AliyunApp[]; default: string; custom: string }>('/api/aliyun/apps'),
+  /**
+   * 校验手填的 refresh_token：valid=验签通过（确是开放平台令牌），expired=已过期，
+   * app 为识别到的内置应用键（null 即认不出，需自填 client_id/secret）。
+   */
+  aliyunDetect: (refreshToken: string) =>
+    request<{
+      valid: boolean;
+      expired: boolean;
+      expiresAt?: number | null;
+      app: string | null;
+      name?: string;
+      note?: string;
+    }>('/api/aliyun/detect', {
       method: 'POST',
-      body: JSON.stringify(app),
+      body: JSON.stringify({ refreshToken }),
     }),
-  aliyunQrPoll: (app: { clientId: string; clientSecret: string; apiBase?: string; sid: string }) =>
+  aliyunQrCreate: (app: AliyunAppInput) =>
+    request<{ app: string; appName: string; qrCodeUrl: string; sid: string; img: string }>(
+      '/api/aliyun/qrcode',
+      { method: 'POST', body: JSON.stringify(app) },
+    ),
+  aliyunQrPoll: (app: AliyunAppInput & { sid: string }) =>
     request<{
       status: 'waiting' | 'scanned' | 'confirmed' | 'expired';
+      app?: string;
       refreshToken?: string;
       accessToken?: string;
       accessTokenExpiresAt?: number;
     }>('/api/aliyun/qrcode/poll', { method: 'POST', body: JSON.stringify(app) }),
+  /**
+   * 用官网令牌静默授权第三方应用，免扫码换开放平台 refresh_token。
+   * app 省略即默认内置应用（阿里云盘TV）。
+   */
+  aliyunSilent: (webRefreshToken: string, app?: AliyunAppInput) =>
+    request<{ app: string; appName: string; refreshToken: string; accessToken?: string; accessTokenExpiresAt?: number }>(
+      '/api/aliyun/silent',
+      { method: 'POST', body: JSON.stringify({ webRefreshToken, ...app }) },
+    ),
+
+  // ---- 阿里云盘官网扫码（可选令牌，分享/转存专用） ----
+  /** 官网二维码是纯文本，由前端自己渲染；session 无状态，轮询时原样带回。 */
+  aliyunWebQrCreate: () =>
+    request<{ codeContent: string; session: AliyunWebSession }>('/api/aliyun/web/qrcode', {
+      method: 'POST',
+    }),
+  aliyunWebQrPoll: (session: AliyunWebSession) =>
+    request<{
+      status: 'waiting' | 'scanned' | 'confirmed' | 'expired';
+      webRefreshToken?: string;
+    }>('/api/aliyun/web/qrcode/poll', { method: 'POST', body: JSON.stringify({ session }) }),
 
   getSettings: () => request<TransferSettings>('/api/settings'),
   updateSettings: (body: TransferSettings) =>

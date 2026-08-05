@@ -17,12 +17,14 @@ license = false
 eula = false
 
 [dependencies]
-anyhow = "1"
+aes = "0.8"
 aes-siv = "0.7"
+anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
 bytes = "1"
+cbc = "0.1"
 chacha20 = "0.9"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
@@ -37,6 +39,7 @@ md-5 = "0.10"
 percent-encoding = "2"
 quick-xml = "0.37"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls-native-roots"] }
+rsa = { version = "0.9", features = ["sha2"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

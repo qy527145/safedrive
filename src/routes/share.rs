@@ -60,8 +60,9 @@ async fn share_export(
         }
     }
     let cloud = storage.share(&storage_paths).await?;
-    let share_id = codec::baidu_share_id(&cloud.url)
-        .ok_or_else(|| ApiError::Upstream("无法从百度分享短链提取分享 ID".into()))?;
+    let share_id = codec::share_id(&datasource.ds_type, &cloud.url).ok_or_else(|| {
+        ApiError::Upstream(format!("无法从分享短链提取分享 ID: {}", cloud.url))
+    })?;
     let pack = codec::Pack {
         source_type: datasource.ds_type,
         share_id,
@@ -121,7 +122,9 @@ async fn share_import(
         .as_ref()
         .map_or(dir.as_str(), |node| node.enc_path.as_str());
     let cloud = CloudShare {
-        url: format!("https://pan.baidu.com/s/1{}", pack.share_id),
+        url: codec::share_url(&pack.source_type, &pack.share_id).ok_or_else(|| {
+            ApiError::BadRequest(format!("{} 数据源不支持转存分享", pack.source_type))
+        })?,
         password: pack.password.clone(),
     };
     let transferred = storage.import_share(&cloud, dest).await?;
@@ -132,7 +135,7 @@ async fn share_import(
         let parent = parent.expect("加密数据源必有目标父节点");
         if transferred.len() != pack.item_count {
             return Err(ApiError::Upstream(format!(
-                "百度转存返回 {} 个条目，分享包包含 {} 个，无法安全重建加密文件名",
+                "转存返回 {} 个条目，分享包包含 {} 个，无法安全重建加密文件名",
                 transferred.len(),
                 pack.item_count
             )));

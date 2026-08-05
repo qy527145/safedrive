@@ -1,3 +1,5 @@
+pub mod aliyun_apps;
+pub mod aliyun_web;
 pub mod aliyundrive;
 pub mod baidupan;
 pub mod localfs;

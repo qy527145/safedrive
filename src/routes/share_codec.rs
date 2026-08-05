@@ -18,6 +18,7 @@ pub(super) use super::bits::DecodeError;
 
 const VERSION: u8 = 1;
 const SOURCE_BAIDUPAN: u8 = 1;
+const SOURCE_ALIYUNDRIVE: u8 = 2;
 const MAX_ITEMS: usize = 100;
 const PASSWORD_ALPHABET: &[u8; 31] = b"abcdefghjkmnpqrstuvwxyz23456789";
 
@@ -41,19 +42,37 @@ pub(super) struct Pack {
     pub parent_keys: Vec<[u8; 16]>,
 }
 
-pub(super) fn baidu_share_id(url: &str) -> Option<String> {
-    let url = reqwest::Url::parse(url).ok()?;
-    url.path_segments()?
-        .collect::<Vec<_>>()
-        .windows(2)
-        .find(|parts| parts[0] == "s")
-        .map(|parts| parts[1].strip_prefix('1').unwrap_or(parts[1]).to_owned())
-        .filter(|id| !id.is_empty() && id.len() <= MAX_STRING_BYTES)
+/// 从云盘原生分享短链里取出要打包进 `sd://` 的分享 ID。
+pub(super) fn share_id(ds_type: &str, url: &str) -> Option<String> {
+    let id = match ds_type {
+        // 百度短链固定是 `/s/1xxxx`，前导 1 是固定前缀，不进包。
+        "baidupan" => {
+            let url = reqwest::Url::parse(url).ok()?;
+            url.path_segments()?
+                .collect::<Vec<_>>()
+                .windows(2)
+                .find(|parts| parts[0] == "s")
+                .map(|parts| parts[1].strip_prefix('1').unwrap_or(parts[1]).to_owned())?
+        }
+        "aliyundrive" => crate::adapters::aliyun_web::share_id_from_url(url)?,
+        _ => return None,
+    };
+    (!id.is_empty() && id.len() <= MAX_STRING_BYTES).then_some(id)
+}
+
+/// 分享 ID 还原成云盘原生短链（转存时交给适配器）。
+pub(super) fn share_url(ds_type: &str, share_id: &str) -> Option<String> {
+    match ds_type {
+        "baidupan" => Some(format!("https://pan.baidu.com/s/1{share_id}")),
+        "aliyundrive" => Some(crate::adapters::aliyun_web::share_url(share_id)),
+        _ => None,
+    }
 }
 
 pub(super) fn encode(pack: &Pack) -> Result<String, &'static str> {
     let source = match pack.source_type.as_str() {
         "baidupan" => SOURCE_BAIDUPAN,
+        "aliyundrive" => SOURCE_ALIYUNDRIVE,
         _ => return Err("unsupported datasource type"),
     };
     if pack.item_count == 0 || pack.item_count > MAX_ITEMS {
@@ -120,6 +139,7 @@ fn decode_plain(plain: &[u8]) -> Result<Pack, DecodeError> {
     let mut bits = BitReader::new(plain);
     let source_type = match bits.read_bits(4)? as u8 {
         SOURCE_BAIDUPAN => "baidupan".to_owned(),
+        SOURCE_ALIYUNDRIVE => "aliyundrive".to_owned(),
         _ => return Err(DecodeError::Invalid),
     };
     let encrypted = bits.read_bit()?;
@@ -159,13 +179,13 @@ fn decode_plain(plain: &[u8]) -> Result<Pack, DecodeError> {
 fn write_password(bits: &mut BitWriter, password: &str) -> Result<(), &'static str> {
     let bytes = password.as_bytes();
     if bytes.len() != 4 {
-        return Err("Baidu password must contain four characters");
+        return Err("share password must contain four characters");
     }
     for byte in bytes {
         let index = PASSWORD_ALPHABET
             .iter()
             .position(|candidate| candidate == byte)
-            .ok_or("Baidu password contains an unsupported character")?;
+            .ok_or("share password contains an unsupported character")?;
         bits.write_bits(index as u64, 5);
     }
     Ok(())
@@ -202,6 +222,31 @@ mod tests {
             let link = encode(&pack).unwrap();
             assert_eq!(decode(&link), Ok(pack));
         }
+    }
+
+    /// 每种云盘的分享 ID 都能在「短链 → 包 → 短链」之间无损往返。
+    #[test]
+    fn share_ids_survive_the_link_roundtrip() {
+        for (ds_type, url, id) in [
+            ("baidupan", "https://pan.baidu.com/s/1qym_MmGtZhFrTpKqf", "qym_MmGtZhFrTpKqf"),
+            ("aliyundrive", "https://www.alipan.com/s/3XCkDNb1Cfa", "3XCkDNb1Cfa"),
+        ] {
+            assert_eq!(share_id(ds_type, url).as_deref(), Some(id), "{ds_type}");
+            let rebuilt = share_url(ds_type, id).expect("支持的类型都能还原短链");
+            assert_eq!(share_id(ds_type, &rebuilt).as_deref(), Some(id), "{ds_type}");
+
+            let mut pack = sample(true);
+            pack.source_type = ds_type.into();
+            pack.share_id = id.into();
+            let decoded = decode(&encode(&pack).unwrap()).unwrap();
+            assert_eq!(decoded, pack);
+        }
+        // 不支持原生分享的类型不该被塞进链接
+        assert!(share_id("localfs", "https://x/s/1abc").is_none());
+        assert!(share_url("localfs", "abc").is_none());
+        let mut unsupported = sample(true);
+        unsupported.source_type = "localfs".into();
+        assert!(encode(&unsupported).is_err());
     }
 
     #[test]

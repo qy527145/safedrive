@@ -112,15 +112,20 @@ fn validate(body: &DsBody) -> ApiResult<()> {
         }
         "aliyundrive" => {
             let text = config_text(body);
-            for (key, label) in [
-                ("clientId", "client_id"),
-                ("clientSecret", "client_secret"),
-                ("refreshToken", "refresh_token（请先扫码授权）"),
-            ] {
-                if text(key).is_empty() {
-                    return Err(ApiError::BadRequest(format!("阿里云盘需要 {label}")));
-                }
+            if text("refreshToken").is_empty() {
+                return Err(ApiError::BadRequest(
+                    "阿里云盘需要 refresh_token（请先扫码授权）".into(),
+                ));
             }
+            // 内置第三方应用自带 client_id（密钥在应用作者的中转服务那边）；
+            // 认不出的令牌降级为自定义应用，这时才要用户自己填 client_id/secret。
+            crate::adapters::aliyun_apps::resolve(
+                empty_to_none(text("app")),
+                empty_to_none(text("clientId")),
+                empty_to_none(text("clientSecret")),
+                Some(text("refreshToken")),
+                empty_to_none(text("apiBase")),
+            )?;
             // 盘位决定用哪个 *_drive_id，写错了会一直查不到盘。
             if !matches!(text("driveType"), "" | "default" | "resource" | "backup") {
                 return Err(ApiError::BadRequest(
@@ -151,6 +156,11 @@ fn config_text<'a>(body: &'a DsBody) -> impl Fn(&str) -> &'a str {
             .map(str::trim)
             .unwrap_or("")
     }
+}
+
+/// 配置项留空等于「没填」。
+fn empty_to_none(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
 }
 
 /// 网盘根目录是相对网盘根的明文路径片段，别让它爬出授权范围。

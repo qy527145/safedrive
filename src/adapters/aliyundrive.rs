@@ -23,14 +23,13 @@ use serde_json::{Value, json};
 use sha1::Sha1;
 
 use super::{
-    ByteStream, ContentHashes, CredentialPersister, Entry, HashKind, ProgressFn, RapidSource,
-    Storage, read_spool, sanitize, spool_with_hashes,
+    ByteStream, CloudShare, ContentHashes, CredentialPersister, Entry, HashKind, ImportedEntry,
+    ProgressFn, RapidSource, Storage, aliyun_apps, aliyun_web, read_spool, sanitize,
+    spool_with_hashes,
 };
 use crate::error::{ApiError, ApiResult};
 
-pub const DEFAULT_API_BASE: &str = "https://openapi.alipan.com";
-/// 官方文档给的授权 scope：读 + 写 + 基本信息。
-pub const OAUTH_SCOPES: &str = "user:base,file:all:read,file:all:write";
+use aliyun_apps::DEFAULT_API_BASE;
 
 /// 阿里云盘对 100 KiB 以下的小文件不做秒传（openlist 同款阈值）。
 const RAPID_MIN_SIZE: u64 = 100 * 1024;
@@ -79,12 +78,7 @@ fn mask_secret(value: &str) -> String {
 /// 阿里云盘的 refresh_token 是 JWT，`sub` 在轮换中保持不变 —— 拿它当账号
 /// 标识，令牌缓存才不会因为一次轮换就整体失效。
 fn jwt_sub(token: &str) -> Option<String> {
-    let payload = token.split('.').nth(1)?;
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()?;
-    let value: Value = serde_json::from_slice(&raw).ok()?;
-    value.get("sub")?.as_str().map(str::to_owned)
+    aliyun_apps::jwt_claim(token, "sub")
 }
 
 fn cache_key(account: &str, path: &str) -> String {
@@ -104,18 +98,30 @@ fn evict_path_ids(account: &str, path: &str) {
 #[derive(Debug, Clone, Deserialize)]
 struct AliFile {
     file_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     file_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     size: u64,
-    #[serde(default, rename = "type")]
+    #[serde(default, rename = "type", deserialize_with = "null_default")]
     kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     content_hash: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     updated_at: String,
+}
+
+/// 阿里对文件夹会把 `content_hash`、`size` 等字段直接给成 `null`（而不是省略），
+/// 而 serde 的 `default` 只兜「字段缺失」不兜「显式 null」—— 否则 `null` 落到
+/// `String`/`u64` 上就会报「invalid type: null, expected a string」。这里统一把
+/// `null` 当默认值处理。
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl AliFile {
@@ -179,13 +185,15 @@ pub struct AliyunDriveFs {
     api_base: Url,
     /// 明文根目录（相对网盘根，已 sanitize）。
     root: String,
-    client_id: String,
-    client_secret: String,
+    /// 负责令牌流程的第三方应用（内置中转应用或用户自备应用）。
+    app: aliyun_apps::App,
     /// `default`（备份盘）或 `resource`（资源库）。
     drive_type: String,
     /// 账号标识：令牌 / 路径 / 直链缓存的命名空间。
     account: String,
     drive_id: Mutex<Option<String>>,
+    /// 官网（PDS）客户端。只有配了官网刷新令牌才有，用于分享与转存。
+    web: Option<aliyun_web::WebClient>,
     persist: Option<CredentialPersister>,
     http: Client,
 }
@@ -204,18 +212,24 @@ impl AliyunDriveFs {
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned)
         };
-        let client_id = text("clientId")
-            .ok_or_else(|| ApiError::BadRequest("阿里云盘配置缺少 clientId".into()))?;
-        let client_secret = text("clientSecret")
-            .ok_or_else(|| ApiError::BadRequest("阿里云盘配置缺少 clientSecret".into()))?;
         let refresh_token = text("refreshToken")
             .ok_or_else(|| ApiError::BadRequest("阿里云盘配置缺少 refreshToken（请先扫码授权）".into()))?;
+        // client_id/secret 只有「自定义应用」才要用户填；内置应用的令牌
+        // 流程由 aliyun_apps 负责，认不出的令牌也在那里降级为自定义应用。
+        let app = aliyun_apps::resolve(
+            text("app").as_deref(),
+            text("clientId").as_deref(),
+            text("clientSecret").as_deref(),
+            Some(&refresh_token),
+            text("apiBase").as_deref(),
+        )?;
         let api_base = Url::parse(text("apiBase").as_deref().unwrap_or(DEFAULT_API_BASE))
             .map_err(|e| ApiError::BadRequest(format!("阿里云盘 apiBase 非法: {e}")))?;
         let root = sanitize(text("root").as_deref().unwrap_or(""))?;
         let drive_type = text("driveType").unwrap_or_else(|| "default".into());
         let account = format!(
-            "{client_id}\u{1}{}",
+            "{}\u{1}{}",
+            app.client_id,
             jwt_sub(&refresh_token).unwrap_or_else(|| refresh_token.clone())
         );
 
@@ -231,16 +245,39 @@ impl AliyunDriveFs {
             });
         }
 
+        // 官网令牌是可选项：没配就只是不支持分享/转存，其余功能照常。
+        let web = text("webRefreshToken").map(|web_refresh| {
+            aliyun_web::WebClient::new(
+                http.clone(),
+                account.clone(),
+                web_refresh,
+                text("webAccessToken").unwrap_or_default(),
+                config
+                    .get("webAccessTokenExpiresAt")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok())),
+                persist.clone(),
+            )
+        });
+
         Ok(Self {
             api_base,
             root,
-            client_id,
-            client_secret,
+            app,
             drive_type,
             account,
             drive_id: Mutex::new(text("driveId")),
+            web,
             persist,
             http,
+        })
+    }
+
+    /// 官网客户端；没配官网令牌时给出可操作的提示。
+    fn web(&self) -> ApiResult<&aliyun_web::WebClient> {
+        self.web.as_ref().ok_or_else(|| {
+            ApiError::BadRequest(
+                "阿里云盘未配置官网令牌：分享与转存依赖官网接口，请在数据源里扫码获取官网令牌".into(),
+            )
         })
     }
 
@@ -293,29 +330,18 @@ impl AliyunDriveFs {
             ));
         }
 
-        let body = json!({
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "grant_type": "refresh_token",
-            "refresh_token": current.refresh_token,
-        });
-        let value = self.oauth_token(&body).await?;
-        let access = value
-            .get("access_token")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| ApiError::Upstream("阿里云盘刷新令牌响应缺少 access_token".into()))?
-            .to_owned();
-        let refresh = value
-            .get("refresh_token")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&current.refresh_token)
-            .to_owned();
-        let ttl = value
-            .get("expires_in")
-            .and_then(Value::as_u64)
-            .unwrap_or(7200);
+        let tokens = self.app.refresh(&self.http, &current.refresh_token).await?;
+        if tokens.access_token.is_empty() {
+            return Err(ApiError::Upstream("阿里云盘刷新令牌响应缺少 access_token".into()));
+        }
+        let access = tokens.access_token;
+        // 中转服务未必回 refresh_token；没回就说明旧的还能继续用。
+        let refresh = if tokens.refresh_token.is_empty() {
+            current.refresh_token.clone()
+        } else {
+            tokens.refresh_token
+        };
+        let ttl = tokens.expires_in;
         let expires_at = unix_time_secs().saturating_add(ttl);
 
         TOKENS.lock().unwrap().insert(
@@ -334,40 +360,27 @@ impl AliyunDriveFs {
             ])?;
         }
         tracing::info!(
-            "阿里云盘令牌已刷新: {} (有效期 {ttl}s)",
+            "阿里云盘令牌已刷新（{}）: {} (有效期 {ttl}s)",
+            self.app.name,
             mask_secret(&access)
         );
         Ok(access)
     }
 
-    /// OAuth 端点（不带 Authorization，也不参与 401 重试）。
-    async fn oauth_token(&self, body: &Value) -> ApiResult<Value> {
-        let url = self.endpoint("/oauth/access_token")?;
-        let response = self
-            .http
-            .post(url.clone())
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| ApiError::Upstream(format!("阿里云盘换取令牌失败: {e}")))?;
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        if !status.is_success() {
-            let code = value
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-            let message = value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or(text.as_str());
-            return Err(ApiError::Upstream(format!(
-                "阿里云盘换取令牌失败: HTTP {status} {code} {message}"
-            )));
+    /// 官网令牌与开放平台令牌可以属于不同账号（各自独立扫码）。真发生了
+    /// 只警告不拦：分享/转存会落在官网令牌那个账号上，日志里得看得出来。
+    async fn warn_account_mismatch(&self, web: &aliyun_web::WebClient) {
+        let open_user = self.account.split('\u{1}').nth(1).unwrap_or_default();
+        let Ok(web_user) = web.user_id().await else {
+            return;
+        };
+        if !web_user.is_empty() && !open_user.is_empty() && web_user != open_user {
+            tracing::warn!(
+                "阿里云盘官网令牌与开放平台令牌不是同一个账号（官网 {} ≠ 开放平台 {}）：分享与转存以官网账号为准",
+                mask_secret(&web_user),
+                mask_secret(open_user)
+            );
         }
-        Ok(value)
     }
 
     /// 开放平台 POST 调用；令牌失效自动刷新重试一次。
@@ -907,6 +920,44 @@ impl Storage for AliyunDriveFs {
         Ok(())
     }
 
+    /// 原生分享。开放平台没有分享接口，走官网（PDS）——因此必须配官网令牌。
+    async fn share(&self, paths: &[String]) -> ApiResult<CloudShare> {
+        if paths.is_empty() {
+            return Err(ApiError::BadRequest("请至少选择一个条目".into()));
+        }
+        let web = self.web()?;
+        let drive_id = self.drive_id().await?;
+        self.warn_account_mismatch(web).await;
+        let mut file_ids = Vec::with_capacity(paths.len());
+        for path in paths {
+            file_ids.push(self.stat(path).await?.file_id);
+        }
+        let password = aliyun_web::gen_share_password()?;
+        let share_id = web.create_share(&drive_id, &file_ids, &password).await?;
+        Ok(CloudShare {
+            url: aliyun_web::share_url(&share_id),
+            password,
+        })
+    }
+
+    async fn import_share(&self, share: &CloudShare, dest: &str) -> ApiResult<Vec<ImportedEntry>> {
+        let web = self.web()?;
+        let share_id = aliyun_web::share_id_from_url(&share.url).ok_or_else(|| {
+            ApiError::BadRequest(format!("无法从阿里云盘分享链接提取分享 ID: {}", share.url))
+        })?;
+        let drive_id = self.drive_id().await?;
+        self.warn_account_mismatch(web).await;
+        let dest_id = self.folder_id(dest, true).await?;
+        let share_token = web.share_token(&share_id, &share.password).await?;
+        let items = web.share_root_items(&share_id, &share_token).await?;
+        let imported = web
+            .copy_from_share(&share_id, &share_token, &items, &drive_id, &dest_id)
+            .await?;
+        // 转存是云端直接落地，目标目录的本地 ID 缓存跟着失效。
+        evict_path_ids(&self.account, dest);
+        Ok(imported)
+    }
+
     async fn get(&self, path: &str) -> ApiResult<(Option<u64>, ByteStream)> {
         self.fetch(path, None).await
     }
@@ -1105,126 +1156,6 @@ impl Storage for AliyunDriveFs {
     }
 }
 
-/// 扫码授权：向开放平台申请二维码，返回 (授权页地址, sid)。
-pub async fn qr_authorize(
-    http: &Client,
-    api_base: &str,
-    client_id: &str,
-    client_secret: &str,
-) -> ApiResult<(String, String)> {
-    let url = format!("{}/oauth/authorize/qrcode", api_base.trim_end_matches('/'));
-    let body = json!({
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "scopes": OAUTH_SCOPES.split(',').collect::<Vec<_>>(),
-        "width": 430,
-        "height": 430,
-    });
-    let value = post_json(http, &url, &body, "申请授权二维码").await?;
-    let qr = value
-        .get("qrCodeUrl")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| ApiError::Upstream("阿里云盘授权二维码为空".into()))?
-        .to_owned();
-    let sid = value
-        .get("sid")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    Ok((qr, sid))
-}
-
-/// 轮询扫码状态。返回 (状态, 可换令牌的 authCode)。
-pub async fn qr_status(http: &Client, api_base: &str, sid: &str) -> ApiResult<(String, String)> {
-    let url = format!(
-        "{}/oauth/qrcode/{sid}/status",
-        api_base.trim_end_matches('/')
-    );
-    let response = http
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| ApiError::Upstream(format!("阿里云盘查询扫码状态失败: {e}")))?;
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(ApiError::Upstream(format!(
-            "阿里云盘查询扫码状态失败: HTTP {status}"
-        )));
-    }
-    let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    Ok((
-        value
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        value
-            .get("authCode")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-    ))
-}
-
-/// authCode → refresh_token（配置里只存 refresh_token，AT 由适配器自己刷）。
-pub async fn exchange_auth_code(
-    http: &Client,
-    api_base: &str,
-    client_id: &str,
-    client_secret: &str,
-    auth_code: &str,
-) -> ApiResult<(String, String, u64)> {
-    let url = format!("{}/oauth/access_token", api_base.trim_end_matches('/'));
-    let body = json!({
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "grant_type": "authorization_code",
-        "code": auth_code,
-    });
-    let value = post_json(http, &url, &body, "换取令牌").await?;
-    let access = value
-        .get("access_token")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let refresh = value
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| ApiError::Upstream("阿里云盘授权响应缺少 refresh_token".into()))?
-        .to_owned();
-    let ttl = value
-        .get("expires_in")
-        .and_then(Value::as_u64)
-        .unwrap_or(7200);
-    Ok((access, refresh, unix_time_secs().saturating_add(ttl)))
-}
-
-async fn post_json(http: &Client, url: &str, body: &Value, what: &str) -> ApiResult<Value> {
-    let response = http
-        .post(url)
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| ApiError::Upstream(format!("阿里云盘{what}失败: {e}")))?;
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    if !status.is_success() {
-        let code = value.get("code").and_then(Value::as_str).unwrap_or("");
-        let message = value
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or(text.as_str());
-        return Err(ApiError::Upstream(format!(
-            "阿里云盘{what}失败: HTTP {status} {code} {message}"
-        )));
-    }
-    Ok(value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1268,5 +1199,37 @@ mod tests {
         );
         assert_eq!(jwt_sub(&token).as_deref(), Some("user-1"));
         assert_eq!(jwt_sub("not-a-jwt"), None);
+    }
+
+    /// 文件夹条目会带一串 `null` 字段（content_hash / size / updated_at）。
+    /// 反序列化必须把它们当默认值，而不是报「invalid type: null」把整次列目录搞挂。
+    #[test]
+    fn list_item_with_null_fields_parses() {
+        let items = json!([
+            {
+                "file_id": "folder-1",
+                "name": "相册",
+                "type": "folder",
+                "size": null,
+                "content_hash": null,
+                "updated_at": null,
+            },
+            {
+                "file_id": "file-1",
+                "file_name": "a.bin",
+                "type": "file",
+                "size": 1024,
+                "content_hash": "ABCDEF",
+                "updated_at": "2026-08-04T12:00:00.000Z",
+            }
+        ]);
+        let parsed: Vec<AliFile> = serde_json::from_value(items).expect("null 字段应被当默认值");
+        assert_eq!(parsed[0].display_name(), "相册");
+        assert!(parsed[0].is_dir());
+        assert_eq!(parsed[0].size, 0);
+        assert!(parsed[0].content_hash.is_empty());
+        assert_eq!(parsed[0].mtime_ms(), 0);
+        assert_eq!(parsed[1].display_name(), "a.bin");
+        assert_eq!(parsed[1].size, 1024);
     }
 }

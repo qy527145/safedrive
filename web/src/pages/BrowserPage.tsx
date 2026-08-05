@@ -121,6 +121,10 @@ export default function BrowserPage() {
   const enqueue = useTasks((s) => s.enqueue);
 
   const ds = sources.list.find((d) => d.id === dsId);
+  // 云盘原生分享/转存：百度网盘直接支持；阿里云盘要配了官网令牌才有
+  // （开放平台没有分享与转存接口）。
+  const nativeShare =
+    ds?.type === 'baidupan' || (ds?.type === 'aliyundrive' && !!ds.config.webRefreshToken);
   // 当前目录放在 URL 查询参数里（?path=a/b），进入子目录会 push 历史记录，
   // 浏览器前进/后退沿目录层级走，刷新也能停留在原目录。
   const [searchParams, setSearchParams] = useSearchParams();
@@ -689,10 +693,10 @@ export default function BrowserPage() {
               上传 <DownOutlined />
             </Button>
           </Dropdown>
-          {ds?.type === 'baidupan' && <Button icon={<LinkOutlined />} disabled={!selectedNames.length} onClick={() => void createShareAction()}>
+          {nativeShare && <Button icon={<LinkOutlined />} disabled={!selectedNames.length} onClick={() => void createShareAction()}>
             分享{selectedNames.length ? ` (${selectedNames.length})` : ''}
           </Button>}
-          {ds?.type === 'baidupan' && <Button icon={<ImportOutlined />} onClick={importShareAction}>导入分享</Button>}
+          {nativeShare && <Button icon={<ImportOutlined />} onClick={importShareAction}>导入分享</Button>}
           <Button icon={<FolderAddOutlined />} onClick={newFolderAction}>
             新建目录
           </Button>

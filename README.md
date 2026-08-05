@@ -67,11 +67,24 @@ bun run dev
 
 ### 阿里云盘凭证
 
-走[阿里云盘开放平台](https://www.alipan.com/developer)的自建应用：填入自己的 `client_id` 与 `client_secret`，然后点「扫码授权自动获取」—— 二维码由 SafeDrive 服务端向 `openapi.alipan.com` 申请并代理下发，手机确认后 `refresh_token` 直接回填表单，凭证不经过任何第三方中转。（后续会内置若干已知的开放应用，做成下拉选择。）
+日常读写走[阿里云盘开放平台](https://www.alipan.com/developer)。开放平台的 `client_secret` 只有应用作者拿得到，所以表单里内置了一批常见的第三方应用（阿里云盘TV、AList、OpenList、CloudDrive2、小雅、Infuse、VidHub…），下拉选一个再点「扫码授权自动获取」即可，无需自己去申请应用；默认用**阿里云盘TV**。二维码由 SafeDrive 服务端代取后同源下发，手机确认后 `refresh_token` 回填表单。
 
+- **已有令牌直接粘贴**：`refresh_token` 是 RS256 签名的 JWT，粘进来会先用开放平台公钥**验签并读 `exp` 判断是否过期**（验签失败会提示「不是有效的开放平台令牌」，多半是把官网令牌填错了栏），验签通过后再看 `aud`（即签发它的 `client_id`）自动反查属于哪个内置应用并选中它。认不出的令牌降级为「自定义应用」：填入自己的 `client_id` 与 `client_secret`，直接走开放平台标准刷新
+- **凭证流向**：直连型应用（自定义应用及密钥已公开的几个）全程只跟 `openapi.alipan.com` 打交道；中转型应用（TV / AList / OpenList…）的「authCode → refresh_token」与「refresh_token → access_token」按各家协议经该应用作者的中转服务完成 —— 这是拿到其 `client_secret` 的唯一途径。无论哪种，SafeDrive 都不做转发或留存
+- **接口地址**：固定用 `openapi.alipan.com`，不再作为配置项暴露（老的 `sdds://` 分享链接里若带了它也照常兼容，只是被忽略）
 - **盘位**：默认盘 / 资源库 / 备份盘，对应 `getDriveInfo` 的 `default_drive_id` / `resource_drive_id` / `backup_drive_id`；改盘位后缓存的 `driveId` 自动作废，重新查询
 - **令牌轮换**：access token 到期前自动用 refresh token 换新，阿里每次都会轮换 refresh token，新值原子写回 `datasources.json`。设置页若是在轮换之前打开的，保存时不会把旧令牌写回去（按“种子值”判定用户到底改没改）
 - **秒传**：先用头 1 KiB 的 `pre_hash` 做廉价预检，命中 `PreHashMatched` 才计算全量 SHA1 与 `proof_code` 正式秒传；小于 100 KiB 的对象不走秒传。列目录自带 `content_hash`，所以阿里云盘之间互相复制连摘要都不用自己算
+
+#### 官网令牌（推荐，免扫码 + 分享转存）
+
+阿里云盘官网（PDS）令牌一份顶两用，因此表单里放在最前：
+
+- **免扫码换开放平台令牌**：在「官网令牌」点扫码登录（走 `passport.aliyundrive.com` 网页版登录协议，二维码内容是纯文本，由浏览器本地渲染）后，SafeDrive 用它先换官网 access token，再拿这个 access token 替你**静默授权**选中的第三方应用（默认阿里云盘TV），直接拿到开放平台 `refresh_token` 回填 —— 省掉第二次扫码。扫完官网码若开放平台令牌还空着会自动触发；也可在 `refresh_token` 一栏点「用官网令牌免扫码获取」手动重来（自定义应用需先填好 `client_id` / `client_secret`）。静默授权只跟 `open.aliyundrive.com` / `openapi.alipan.com` 官方域名打交道
+- **分享与转存**：开放平台没有这两个接口，只能走官网 PDS 接口，所以它们也依赖这份官网令牌
+
+官网令牌可留空 —— 那就退回「扫码授权第三方应用」的老路，且该数据源不支持分享/转存，其余功能照常。两条令牌线各自独立轮换、互不影响，编辑数据源时也不会把对方回退成表单里的旧值。
+
 
 ### 夸克网盘凭证
 
@@ -138,7 +151,7 @@ Windows        映射网络驱动器 → http://<host>:5266/dav （HTTP 下需�
 
 - **云端看不到**：文件名与各节点密钥（v5 信封编码：一段随机汉字，无格式特征）、内容（ChaCha20）、目录结构语义
 - **服务器持有**：各加密数据源的根密码 —— 服务器被攻破即数据泄露，这是有意的取舍（换取免解锁、外部播放器直连）
-- 百度网盘 BDUSS、阿里云盘 client_secret / refresh_token、夸克 Cookie、自动轮换的 Access/Refresh Token 及绝对到期时间明文保存在 `datasources.json`；必须像根密码一样保护 `--data-dir`
+- 百度网盘 BDUSS、阿里云盘 refresh token（开放平台与官网各一份）与自定义应用的 client_secret、夸克 Cookie、自动轮换的 Access/Refresh Token 及绝对到期时间明文保存在 `datasources.json`；必须像根密码一样保护 `--data-dir`
 - **跨目录移动/重命名**：仅一次云端 rename，内容永不重加密；分享目录 = 交出该目录密钥（快照与长期分享皆可）
 - **跨数据源复制会保留文件密钥**：两份副本的密文逐字节相同，云端因此能看出「这两个对象内容一样」（秒传的固有代价）。介意的话用下载 + 重新上传代替
 - 内容加密无完整性校验（ChaCha20 无 MAC）：云端篡改密文会解出乱码而不会被检测
