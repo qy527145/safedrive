@@ -6,9 +6,9 @@
 //! getqrcode 取二维码 → channel/unicast 轮询扫码事件 →
 //! qrbdusslogin 用扫码返回的临时凭证换取正式 Cookie（含 BDUSS）。
 
-use std::sync::OnceLock;
 use std::time::Duration;
 
+use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -31,26 +31,23 @@ pub fn routes() -> Router<AppState> {
         .route("/baidu/qrcode/poll", post(poll_qrcode))
 }
 
-/// 扫码登录专用客户端：qrbdusslogin 的 Set-Cookie 挂在首个响应上，
-/// 不能跟随重定向；unicast 是服务端长轮询，需要独立的整体超时。
-fn passport_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(35))
-            .build()
-            .expect("初始化百度扫码登录 HTTP 客户端失败")
-    })
-}
+/// 扫码相关请求的整体超时。客户端来自 `AppState::passport`（不跟随重定向：
+/// qrbdusslogin 的 Set-Cookie 挂在首个响应上），代理与附加 CA 与其他上游一致；
+/// unicast 是服务端长轮询，所以超时放在这里按请求设置。
+const QR_TIMEOUT: Duration = Duration::from_secs(35);
 
-async fn passport_json(url: String, query: &[(&str, &str)], what: &str) -> ApiResult<Value> {
-    let response = passport_client()
+async fn passport_json(
+    http: &reqwest::Client,
+    url: String,
+    query: &[(&str, &str)],
+    what: &str,
+) -> ApiResult<Value> {
+    let response = http
         .get(url)
         .query(query)
         .header(USER_AGENT, WEB_UA)
         .header(REFERER, "https://pan.baidu.com/")
+        .timeout(QR_TIMEOUT)
         .send()
         .await
         .map_err(|e| ApiError::Upstream(format!("{what}失败: {e}")))?;
@@ -69,10 +66,11 @@ async fn passport_json(url: String, query: &[(&str, &str)], what: &str) -> ApiRe
 
 /// 生成登录二维码。二维码图片以 base64 返回，前端同源展示，
 /// 不依赖浏览器直连百度域名。
-async fn create_qrcode() -> ApiResult<Json<Value>> {
+async fn create_qrcode(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let gid = uuid::Uuid::new_v4().to_string().to_uppercase();
     let tt = now_ms().to_string();
     let body = passport_json(
+        &state.passport,
         format!("{PASSPORT_BASE}/v2/api/getqrcode"),
         &[
             ("lp", "pc"),
@@ -100,9 +98,11 @@ async fn create_qrcode() -> ApiResult<Json<Value>> {
     } else {
         format!("https://{imgurl}")
     };
-    let image = passport_client()
+    let image = state
+        .passport
         .get(&imgurl)
         .header(USER_AGENT, WEB_UA)
+        .timeout(QR_TIMEOUT)
         .send()
         .await
         .map_err(|e| ApiError::Upstream(format!("下载二维码图片失败: {e}")))?
@@ -125,9 +125,13 @@ struct PollBody {
 /// 轮询一次扫码状态。返回 status：
 /// waiting（等待扫码）/ scanned（已扫码待手机确认）/
 /// confirmed（已确认，附 bduss）/ expired（二维码失效或被取消）。
-async fn poll_qrcode(Json(body): Json<PollBody>) -> ApiResult<Json<Value>> {
+async fn poll_qrcode(
+    State(state): State<AppState>,
+    Json(body): Json<PollBody>,
+) -> ApiResult<Json<Value>> {
     let tt = now_ms().to_string();
-    let response = passport_client()
+    let response = state
+        .passport
         .get(format!("{PASSPORT_BASE}/channel/unicast"))
         .query(&[
             ("channel_id", body.sign.as_str()),
@@ -138,6 +142,7 @@ async fn poll_qrcode(Json(body): Json<PollBody>) -> ApiResult<Json<Value>> {
         ])
         .header(USER_AGENT, WEB_UA)
         .header(REFERER, "https://pan.baidu.com/")
+        .timeout(QR_TIMEOUT)
         .send()
         .await;
     let response = match response {
@@ -171,7 +176,7 @@ async fn poll_qrcode(Json(body): Json<PollBody>) -> ApiResult<Json<Value>> {
                 .and_then(Value::as_str)
                 .filter(|v| !v.is_empty())
                 .ok_or_else(|| ApiError::Upstream("扫码确认事件缺少临时凭证".into()))?;
-            let bduss = exchange_bduss(tmp).await?;
+            let bduss = exchange_bduss(&state.passport, tmp).await?;
             Ok(Json(json!({ "status": "confirmed", "bduss": bduss })))
         }
         _ => Ok(Json(json!({ "status": "waiting" }))),
@@ -179,11 +184,11 @@ async fn poll_qrcode(Json(body): Json<PollBody>) -> ApiResult<Json<Value>> {
 }
 
 /// 用扫码确认返回的临时凭证换取正式登录 Cookie，提取其中的 BDUSS。
-async fn exchange_bduss(tmp: &str) -> ApiResult<String> {
+async fn exchange_bduss(http: &reqwest::Client, tmp: &str) -> ApiResult<String> {
     let now = now_ms();
     let tt = now.to_string();
     let time = (now / 1000).to_string();
-    let response = passport_client()
+    let response = http
         .get(format!("{PASSPORT_BASE}/v3/login/main/qrbdusslogin"))
         .query(&[
             ("v", tt.as_str()),
@@ -199,6 +204,7 @@ async fn exchange_bduss(tmp: &str) -> ApiResult<String> {
         ])
         .header(USER_AGENT, WEB_UA)
         .header(REFERER, "https://pan.baidu.com/")
+        .timeout(QR_TIMEOUT)
         .send()
         .await
         .map_err(|e| ApiError::Upstream(format!("换取登录 Cookie 失败: {e}")))?;

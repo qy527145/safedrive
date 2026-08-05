@@ -8,7 +8,7 @@
 //! 得多（等同网页登录），所以除了分享/转存，其他读写一律仍走开放平台。
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -593,19 +593,10 @@ pub async fn web_access_token(http: &Client, refresh_token: &str) -> ApiResult<S
 
 // ---------------- 官网扫码登录 ----------------
 
-/// 扫码登录专用客户端：passport 的会话 Cookie 挂在 302 响应上，
-/// 不能跟随重定向。
-fn passport_client() -> &'static Client {
-    static CLIENT: OnceLock<Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("初始化阿里云盘扫码登录 HTTP 客户端失败")
-    })
-}
+/// 扫码登录整体超时。客户端由调用方（`AppState::passport`）提供，
+/// 与其他上游共享代理、附加 CA 以及「不跟随重定向」的策略 ——
+/// passport 的会话 Cookie 挂在 302 响应上，跟随重定向就丢了。
+const QR_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 一次扫码会话。SafeDrive 自己不存会话态：整个对象原样回给前端，
 /// 轮询时再带回来。
@@ -618,8 +609,7 @@ pub struct WebQrSession {
 }
 
 /// 申请官网登录二维码，返回 (二维码内容, 会话)。二维码是纯文本，由前端渲染。
-pub async fn qr_generate() -> ApiResult<(String, WebQrSession)> {
-    let http = passport_client();
+pub async fn qr_generate(http: &Client) -> ApiResult<(String, WebQrSession)> {
     // 先摸一次授权页：拿会话 Cookie。带 sid 才能拿到可刷新的令牌。
     let authorize = http
         .get(AUTHORIZE_URL)
@@ -632,6 +622,7 @@ pub async fn qr_generate() -> ApiResult<(String, WebQrSession)> {
             ("state", r#"{"origin":"file://"}"#),
         ])
         .header(USER_AGENT, WEB_UA)
+        .timeout(QR_TIMEOUT)
         .send()
         .await
         .map_err(|e| ApiError::Upstream(format!("阿里云盘官网授权页访问失败: {e}")))?;
@@ -641,6 +632,7 @@ pub async fn qr_generate() -> ApiResult<(String, WebQrSession)> {
         .get(format!("{PASSPORT_BASE}/newlogin/qrcode/generate.do"))
         .query(&[("appName", "aliyun_drive")])
         .header(USER_AGENT, WEB_UA)
+        .timeout(QR_TIMEOUT)
         .send()
         .await
         .map_err(|e| ApiError::Upstream(format!("获取阿里云盘官网二维码失败: {e}")))?;
@@ -672,14 +664,15 @@ pub enum WebQrStatus {
     Confirmed(String),
 }
 
-pub async fn qr_query(session: &WebQrSession) -> ApiResult<WebQrStatus> {
+pub async fn qr_query(http: &Client, session: &WebQrSession) -> ApiResult<WebQrStatus> {
     let form = form_pairs(&session.data);
-    let response = passport_client()
+    let response = http
         .post(format!("{PASSPORT_BASE}/newlogin/qrcode/query.do"))
         .query(&[("appName", "aliyun_drive")])
         .header(USER_AGENT, WEB_UA)
         .header(reqwest::header::COOKIE, session.cookies.clone())
         .form(&form)
+        .timeout(QR_TIMEOUT)
         .send()
         .await
         .map_err(|e| ApiError::Upstream(format!("查询阿里云盘官网扫码状态失败: {e}")))?;

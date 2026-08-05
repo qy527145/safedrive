@@ -38,7 +38,10 @@ mime_guess = "2"
 md-5 = "0.10"
 percent-encoding = "2"
 quick-xml = "0.37"
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls-native-roots"] }
+# system-proxy：读取 macOS/Windows 的系统代理设置（default-features = false 会丢掉它）。
+# native-roots 会在 SSL_CERT_FILE / SSL_CERT_DIR 存在时改用其中的 CA（并覆盖系统钥匙串），
+# 同时保留 webpki-roots 兜底，避免只塞一张 mitmproxy CA 就连不上公网。
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls-native-roots", "rustls-tls-webpki-roots", "system-proxy"] }
 rsa = { version = "0.9", features = ["sha2"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 serde = { version = "1", features = ["derive"] }

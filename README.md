@@ -33,29 +33,48 @@ safedrive --bind 0.0.0.0:5266 --admin-password <管理密码>
 | `--bind` | 监听地址，默认 `127.0.0.1:5266` |
 | `--data-dir` | 数据目录（数据源注册表、缓存和设置），默认 `~/.safedrive` |
 | `--admin-password` / 环境变量 `SAFEDRIVE_ADMIN_PASSWORD` | 管理密码；不设置则免登录（仅建议本机使用） |
-| `--http-proxy` / `SAFEDRIVE_HTTP_PROXY` | 数据源上游代理，例如 `http://127.0.0.1:8080` |
 | `--http-ca-cert` / `SAFEDRIVE_HTTP_CA_CERT` | 额外信任的 PEM/DER CA；mitmproxy 通常为 `~/.mitmproxy/mitmproxy-ca-cert.pem` |
 | `--insecure-tls` / `SAFEDRIVE_INSECURE_TLS=true` | 跳过上游证书校验，仅用于临时抓包调试 |
 
 > 数据源文件 `datasources.json` 含连接凭据和加密根密码，明文存放在 `--data-dir`。**根密码丢失 = 对应加密数据源永久无法解密**。公网部署请置于 HTTPS 反向代理之后，并备份该文件。
 
+### 代理与证书
+
+所有发往上游（网盘、WebDAV、扫码登录）的请求共用一套客户端配置。**代理没有命令行参数，一律跟随当前环境**：
+
+| 来源 | 说明 |
+| --- | --- |
+| `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` | 大小写均可；启动时读取一次，改环境需重启 |
+| 系统代理 | macOS「系统设置 → 网络 → 代理」、Windows「Internet 选项」中的 HTTP/HTTPS 代理与例外列表（不支持 PAC 脚本）；仅在没有代理环境变量时生效 |
+| `SSL_CERT_FILE` / `SSL_CERT_DIR` | 追加的 TLS 根证书；同时保留内置 Mozilla 根证书，因此只塞一张抓包 CA 也不影响其他站点 |
+
+`--http-ca-cert` 是在 `SSL_CERT_FILE` 之上再追加一张证书。启动日志会打印当前实际生效的代理来源与根证书来源。
+
+要临时强制直连，把 `NO_PROXY` 设成 `*` 或在启动时清掉代理环境变量即可。
+
+浏览器访问 SafeDrive 自身监听地址的流量不受以上配置影响。
+
 ### 使用 mitmproxy 抓取上游请求
 
-SafeDrive 的上游客户端会读取 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 环境变量，也可使用独立参数显式配置。Windows 的“系统代理”不会自动转换成这些环境变量，建议使用以下方式启动：
+设置环境变量即可，无需任何命令行参数（抓包范围覆盖网盘 API、上传下载与扫码登录）：
 
-```powershell
-cargo run -- `
-  --http-proxy http://127.0.0.1:8080 `
-  --http-ca-cert "$HOME\.mitmproxy\mitmproxy-ca-cert.pem"
+```bash
+export HTTPS_PROXY=http://127.0.0.1:8080
+export HTTP_PROXY=http://127.0.0.1:8080
+export SSL_CERT_FILE="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+safedrive
 ```
 
-使用 `bun run dev` 时可通过环境变量传给后端：
+PowerShell：
 
 ```powershell
-$env:SAFEDRIVE_HTTP_PROXY = "http://127.0.0.1:8080"
-$env:SAFEDRIVE_HTTP_CA_CERT = "$HOME\.mitmproxy\mitmproxy-ca-cert.pem"
-bun run dev
+$env:HTTPS_PROXY = "http://127.0.0.1:8080"
+$env:HTTP_PROXY = "http://127.0.0.1:8080"
+$env:SSL_CERT_FILE = "$HOME\.mitmproxy\mitmproxy-ca-cert.pem"
+safedrive
 ```
+
+使用 `bun run dev` 时，上述环境变量同样会传给后端进程。
 
 如果只是临时排查证书问题，可改用 `--insecure-tls`，但不要在正常运行时启用。该选项会关闭 SafeDrive 到所有上游数据源的 HTTPS 证书校验。
 

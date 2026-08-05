@@ -29,10 +29,8 @@ struct Cli {
     /// 管理密码；不设置则免登录（仅建议本机使用）
     #[arg(long, env = "SAFEDRIVE_ADMIN_PASSWORD")]
     admin_password: Option<String>,
-    /// 上游 HTTP/HTTPS 代理，例如 http://127.0.0.1:8080
-    #[arg(long, env = "SAFEDRIVE_HTTP_PROXY")]
-    http_proxy: Option<String>,
-    /// 额外信任的 PEM/DER CA 证书（mitmproxy 通常使用 mitmproxy-ca-cert.pem）
+    /// 额外信任的 PEM/DER CA 证书（mitmproxy 通常使用 mitmproxy-ca-cert.pem）。
+    /// 也可改用标准的 SSL_CERT_FILE / SSL_CERT_DIR 环境变量
     #[arg(long, env = "SAFEDRIVE_HTTP_CA_CERT")]
     http_ca_cert: Option<std::path::PathBuf>,
     /// 跳过上游 HTTPS 证书校验；仅限临时抓包调试
@@ -77,11 +75,27 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    if cli.http_proxy.is_some() {
-        tracing::info!("已为上游数据源请求启用显式 HTTP 代理");
+    // 代理完全跟随环境：这里只把实际生效的来源打进日志，
+    // 免得抓包时「以为走了代理其实没走」。环境变量在启动时读取一次
+    // （reqwest 只在建客户端时读一遍），改环境需重启。
+    let env_proxy = ["ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY"]
+        .into_iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .or_else(|_| std::env::var(key.to_lowercase()))
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("{key}={value}"))
+        });
+    match env_proxy {
+        Some(found) => tracing::info!("上游数据源请求跟随环境变量代理: {found}"),
+        None => tracing::info!("上游数据源请求跟随系统代理设置（未检测到代理环境变量）"),
     }
     if let Some(path) = &cli.http_ca_cert {
         tracing::info!("已加载上游 HTTP 附加 CA: {}", path.display());
+    }
+    if let Ok(path) = std::env::var("SSL_CERT_FILE") {
+        tracing::info!("SSL_CERT_FILE 生效，上游 TLS 根证书取自: {path}");
     }
     if cli.insecure_tls {
         tracing::warn!("已禁用上游 HTTPS 证书校验；仅应在临时抓包调试时使用");
@@ -90,7 +104,6 @@ async fn main() -> anyhow::Result<()> {
         data_dir,
         cli.admin_password,
         state::HttpClientOptions {
-            proxy: cli.http_proxy,
             ca_cert: cli.http_ca_cert,
             insecure_tls: cli.insecure_tls,
         },

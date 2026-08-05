@@ -217,8 +217,8 @@ struct WebPollBody {
     session: aliyun_web::WebQrSession,
 }
 
-async fn create_web_qrcode() -> ApiResult<Json<Value>> {
-    let (code_content, session) = aliyun_web::qr_generate().await?;
+async fn create_web_qrcode(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let (code_content, session) = aliyun_web::qr_generate(&state.passport).await?;
     Ok(Json(json!({
         // 官网二维码是纯文本，由前端自己渲染（服务端没有二维码编码器）。
         "codeContent": code_content,
@@ -226,8 +226,11 @@ async fn create_web_qrcode() -> ApiResult<Json<Value>> {
     })))
 }
 
-async fn poll_web_qrcode(Json(body): Json<WebPollBody>) -> ApiResult<Json<Value>> {
-    match aliyun_web::qr_query(&body.session).await? {
+async fn poll_web_qrcode(
+    State(state): State<AppState>,
+    Json(body): Json<WebPollBody>,
+) -> ApiResult<Json<Value>> {
+    match aliyun_web::qr_query(&state.passport, &body.session).await? {
         aliyun_web::WebQrStatus::Confirmed(refresh_token) => Ok(Json(json!({
             "status": "confirmed",
             "webRefreshToken": refresh_token,

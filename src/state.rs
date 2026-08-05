@@ -9,39 +9,67 @@ use crate::registry::Registry;
 use crate::settings::SettingsStore;
 use crate::vault::PathCache;
 
-/// SafeDrive 发往数据源的 HTTP 客户端配置。代理和调试 TLS 只影响上游请求，
+/// SafeDrive 发往数据源的 HTTP 客户端配置。只影响上游请求，
 /// 不影响浏览器访问 SafeDrive 自身的监听地址。
+///
+/// 代理没有对应的配置项：一律跟随当前环境，无需任何参数 ——
+/// * `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`（大小写均可）；
+/// * macOS「系统设置 → 网络 → 代理」与 Windows「Internet 选项」里的系统代理
+///   （靠 reqwest 的 `system-proxy` 特性读取，不支持 PAC 脚本）。
+///
+/// 附加 CA 同理优先走环境：`SSL_CERT_FILE` / `SSL_CERT_DIR` 由 rustls 自动
+/// 读取，`ca_cert` 只是在此之上再追加一张证书。
 #[derive(Debug, Clone, Default)]
 pub struct HttpClientOptions {
-    pub proxy: Option<String>,
     pub ca_cert: Option<PathBuf>,
     pub insecure_tls: bool,
 }
 
+impl HttpClientOptions {
+    /// 所有上游客户端共用的基础配置。新增客户端一律从这里派生，否则
+    /// 代理与附加 CA 会漏掉那条链路（抓包时表现为「大部分请求能抓到，
+    /// 扫码登录抓不到」）。
+    ///
+    /// 这里不碰 `proxy()` / `no_proxy()`：保持 reqwest 默认行为，
+    /// 即自动应用环境变量与系统代理。
+    fn base_builder(&self) -> anyhow::Result<reqwest::ClientBuilder> {
+        let mut builder = reqwest::Client::builder();
+        if let Some(path) = self.ca_cert.as_deref() {
+            let bytes = std::fs::read(path).map_err(|error| {
+                anyhow::anyhow!("读取 HTTP CA 证书 {} 失败: {error}", path.display())
+            })?;
+            let certificate = reqwest::Certificate::from_pem(&bytes)
+                .or_else(|_| reqwest::Certificate::from_der(&bytes))
+                .map_err(|error| {
+                    anyhow::anyhow!("解析 HTTP CA 证书 {} 失败: {error}", path.display())
+                })?;
+            builder = builder.add_root_certificate(certificate);
+        }
+        if self.insecure_tls {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        Ok(builder)
+    }
+}
+
 fn build_http_client(options: &HttpClientOptions) -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
+    let builder = options
+        .base_builder()?
         .connect_timeout(std::time::Duration::from_secs(10))
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .pool_max_idle_per_host(64)
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .tcp_nodelay(true);
-    if let Some(proxy) = options.proxy.as_deref() {
-        builder = builder.proxy(reqwest::Proxy::all(proxy)?);
-    }
-    if let Some(path) = options.ca_cert.as_deref() {
-        let bytes = std::fs::read(path).map_err(|error| {
-            anyhow::anyhow!("读取 HTTP CA 证书 {} 失败: {error}", path.display())
-        })?;
-        let certificate = reqwest::Certificate::from_pem(&bytes)
-            .or_else(|_| reqwest::Certificate::from_der(&bytes))
-            .map_err(|error| {
-                anyhow::anyhow!("解析 HTTP CA 证书 {} 失败: {error}", path.display())
-            })?;
-        builder = builder.add_root_certificate(certificate);
-    }
-    if options.insecure_tls {
-        builder = builder.danger_accept_invalid_certs(true);
-    }
+    Ok(builder.build()?)
+}
+
+/// 扫码登录专用客户端：passport 的会话 Cookie 挂在 302 响应上，不能跟随
+/// 重定向。整体超时按接口特性（含服务端长轮询）在各调用点单独设置。
+fn build_passport_client(options: &HttpClientOptions) -> anyhow::Result<reqwest::Client> {
+    let builder = options
+        .base_builder()?
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10));
     Ok(builder.build()?)
 }
 
@@ -74,6 +102,9 @@ pub struct Inner {
     pub mkdir_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub admin_password: Option<String>,
     pub http: reqwest::Client,
+    /// 扫码登录专用客户端（不跟随重定向）。与 `http` 同源配置，
+    /// 保证代理 / 附加 CA 对登录链路同样生效。
+    pub passport: reqwest::Client,
 }
 
 impl std::ops::Deref for AppState {
@@ -98,6 +129,7 @@ impl AppState {
         let settings = SettingsStore::load(data_dir.join("settings.json"))?;
         let content_cache = Arc::new(crate::cache::CacheStore::new(data_dir.join("cache"))?);
         let http = build_http_client(&http_options)?;
+        let passport = build_passport_client(&http_options)?;
         Ok(Self(Arc::new(Inner {
             registry,
             settings,
@@ -112,6 +144,7 @@ impl AppState {
             mkdir_locks: Mutex::new(HashMap::new()),
             admin_password,
             http,
+            passport,
         })))
     }
 
