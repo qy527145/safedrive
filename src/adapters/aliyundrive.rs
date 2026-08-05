@@ -110,6 +110,10 @@ struct AliFile {
     content_hash: String,
     #[serde(default, deserialize_with = "null_default")]
     updated_at: String,
+    /// 文件所在的 PDS 区域（如 `bj29`），拼分享用的 PDS 上游网关域名；开放平台
+    /// 列表未必回这个字段，缺了由官网令牌兜底。
+    #[serde(default, deserialize_with = "null_default")]
+    domain_id: String,
 }
 
 /// 阿里对文件夹会把 `content_hash`、`size` 等字段直接给成 `null`（而不是省略），
@@ -187,10 +191,16 @@ pub struct AliyunDriveFs {
     root: String,
     /// 负责令牌流程的第三方应用（内置中转应用或用户自备应用）。
     app: aliyun_apps::App,
-    /// `default`（备份盘）或 `resource`（资源库）。
+    /// `resource`（资源库，默认）或 `backup`（备份盘）；老配置里的 `default`
+    /// 仍兼容读取，按备份盘查询。
     drive_type: String,
-    /// 账号标识：令牌 / 路径 / 直链缓存的命名空间。
+    /// 账号标识（`client_id\u{1}jwt_sub`）：令牌缓存与官网客户端的命名空间。
+    /// 全盘共享一份 refresh_token，故令牌不能按盘位隔离，否则并发刷新会互相作废。
     account: String,
+    /// 路径 / 直链缓存的命名空间（`account\u{1}drive_type`）。同一账号在不同
+    /// 盘位下「明文路径 → file_id」映射不同，必须按盘位隔离，否则切盘后会读到
+    /// 上一个盘的 ID。
+    cache_ns: String,
     drive_id: Mutex<Option<String>>,
     /// 官网（PDS）客户端。只有配了官网刷新令牌才有，用于分享与转存。
     web: Option<aliyun_web::WebClient>,
@@ -227,12 +237,15 @@ impl AliyunDriveFs {
         let api_base = Url::parse(text("apiBase").as_deref().unwrap_or(DEFAULT_API_BASE))
             .map_err(|e| ApiError::BadRequest(format!("阿里云盘 apiBase 非法: {e}")))?;
         let root = sanitize(text("root").as_deref().unwrap_or(""))?;
-        let drive_type = text("driveType").unwrap_or_else(|| "default".into());
+        // 盘位缺省为资源库；老配置里的 `default` 原样保留（drive_id() 会按
+        // `default_drive_id` 查，语义等同备份盘）。
+        let drive_type = text("driveType").unwrap_or_else(|| "resource".into());
         let account = format!(
             "{}\u{1}{}",
             app.client_id,
             jwt_sub(&refresh_token).unwrap_or_else(|| refresh_token.clone())
         );
+        let cache_ns = format!("{account}\u{1}{drive_type}");
 
         // 进程内已有更新的令牌就用它（配置里的可能已经被轮换掉了）。
         {
@@ -266,6 +279,7 @@ impl AliyunDriveFs {
             app,
             drive_type,
             account,
+            cache_ns,
             drive_id: Mutex::new(text("driveId")),
             web,
             persist,
@@ -510,7 +524,10 @@ impl AliyunDriveFs {
                 } else {
                     format!("{prefix}/{}", item.display_name())
                 };
-                cache.insert(cache_key(&self.account, &path), (item.file_id.clone(), now));
+                cache.insert(
+                    cache_key(&self.cache_ns, &path),
+                    (item.file_id.clone(), now),
+                );
             }
         }
         Ok(out)
@@ -557,7 +574,7 @@ impl AliyunDriveFs {
             } else {
                 format!("{prefix}/{seg}")
             };
-            let key = cache_key(&self.account, &prefix);
+            let key = cache_key(&self.cache_ns, &prefix);
             if let Some((id, at)) = PATH_IDS.lock().unwrap().get(&key).cloned()
                 && at.elapsed() < PATH_ID_TTL
             {
@@ -626,7 +643,7 @@ impl AliyunDriveFs {
     }
 
     async fn download_url(&self, file_id: &str) -> ApiResult<String> {
-        let key = cache_key(&self.account, file_id);
+        let key = cache_key(&self.cache_ns, file_id);
         if let Some((url, at)) = DOWNLOAD_URLS.lock().unwrap().get(&key).cloned()
             && at.elapsed() < DOWNLOAD_URL_TTL
         {
@@ -678,7 +695,7 @@ impl AliyunDriveFs {
             DOWNLOAD_URLS
                 .lock()
                 .unwrap()
-                .remove(&cache_key(&self.account, &file.file_id));
+                .remove(&cache_key(&self.cache_ns, &file.file_id));
             return Err(ApiError::Upstream(format!(
                 "阿里云盘下载失败: HTTP {status}"
             )));
@@ -876,44 +893,6 @@ impl AliyunDriveFs {
         }
         Ok(())
     }
-
-    /// 用**开放平台**接口创建原生分享，返回规范短链。开放平台令牌是每个阿里云盘
-    /// 数据源都持有的主令牌，无需额外的官网令牌，因此优先走它；备份盘 / 应用无分享
-    /// 权限时会失败，再由 `share` 降级到官网接口乃至快传。
-    async fn open_create_share(
-        &self,
-        drive_id: &str,
-        file_ids: &[String],
-        password: &str,
-    ) -> ApiResult<String> {
-        let body = json!({
-            "driveId": drive_id,
-            "fileIdList": file_ids,
-            // 空 = 永久有效。
-            "expiration": "",
-            "sharePwd": password,
-        });
-        let value = self
-            .post("/adrive/v1.0/openFile/createShare", &body, "创建分享")
-            .await?;
-        // 用响应的 share_id 拼规范短链（响应自带的 share_url 可能是 stg 域名）；
-        // 缺 share_id 才退回响应里的 share_url。
-        if let Some(share_id) = value
-            .get("share_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-        {
-            return Ok(aliyun_web::share_url(share_id));
-        }
-        value
-            .get("share_url")
-            .and_then(Value::as_str)
-            .filter(|url| !url.is_empty())
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                ApiError::Upstream("阿里云盘开放平台创建分享响应缺少 share_id / share_url".into())
-            })
-    }
 }
 
 #[async_trait]
@@ -947,7 +926,7 @@ impl Storage for AliyunDriveFs {
         }
         let file = self.stat(path).await?;
         self.trash(&file.file_id).await?;
-        evict_path_ids(&self.account, path);
+        evict_path_ids(&self.cache_ns, path);
         Ok(())
     }
 
@@ -977,51 +956,42 @@ impl Storage for AliyunDriveFs {
             self.post("/adrive/v1.0/openFile/move", &body, "移动")
                 .await?;
         }
-        evict_path_ids(&self.account, from);
-        evict_path_ids(&self.account, to);
+        evict_path_ids(&self.cache_ns, from);
+        evict_path_ids(&self.cache_ns, to);
         Ok(())
     }
 
-    /// 原生分享。优先走开放平台接口（人人都有的主令牌，无需官网令牌）；失败再
-    /// 降级到官网（PDS）普通分享，仍失败则退回快传（备份盘唯一可行的路）。
+    /// 原生分享：走官网 PDS 上游接口（官网令牌 + 文件所在区域网关）。分享必须
+    /// 配置官网令牌 —— 开放平台没有分享接口。备份盘文件普通分享会被拒，自动降级
+    /// 到快传（没有提取码、语义是临时链接，备份盘唯一可行的路）。
     async fn share(&self, paths: &[String], password: Option<&str>) -> ApiResult<CloudShare> {
         if paths.is_empty() {
             return Err(ApiError::BadRequest("请至少选择一个条目".into()));
         }
+        let web = self.web()?;
         let drive_id = self.drive_id().await?;
         let mut file_ids = Vec::with_capacity(paths.len());
+        // 分享用的 PDS 网关域名取自文件的 domain_id（同一用户各文件一致）；开放平台
+        // 列表未必回这个字段，取到第一个非空即可，缺了由官网令牌兜底。
+        let mut domain_id = String::new();
         for path in paths {
-            file_ids.push(self.stat(path).await?.file_id);
+            let file = self.stat(path).await?;
+            if domain_id.is_empty() {
+                domain_id = file.domain_id.clone();
+            }
+            file_ids.push(file.file_id);
         }
         let password = match password {
             Some(custom) => custom.to_owned(),
             None => aliyun_web::gen_share_password()?,
         };
+        self.warn_account_mismatch(web).await;
 
-        // 1) 开放平台分享：不需要官网令牌，优先。
-        let open_err = match self
-            .open_create_share(&drive_id, &file_ids, &password)
+        // 1) PDS 普通分享（官网令牌 + 文件所在区域网关）。
+        let share_err = match web
+            .create_share(&domain_id, &drive_id, &file_ids, &password)
             .await
         {
-            Ok(url) => {
-                return Ok(CloudShare {
-                    url,
-                    password,
-                    quick: false,
-                });
-            }
-            Err(open_err) => open_err,
-        };
-        tracing::info!("阿里云盘开放平台分享失败，改用官网接口: {open_err}");
-
-        // 2) 官网普通分享（需要官网令牌）。没配官网令牌就没有 2)/3) 可退。
-        let web = self.web().map_err(|_| {
-            ApiError::Upstream(format!(
-                "阿里云盘开放平台分享失败：{open_err}；未配置官网令牌，无法降级到官网分享 / 快传"
-            ))
-        })?;
-        self.warn_account_mismatch(web).await;
-        let web_err = match web.create_share(&drive_id, &file_ids, &password).await {
             Ok(share_id) => {
                 return Ok(CloudShare {
                     url: aliyun_web::share_url(&share_id),
@@ -1029,18 +999,18 @@ impl Storage for AliyunDriveFs {
                     quick: false,
                 });
             }
-            Err(web_err) => web_err,
+            Err(share_err) => share_err,
         };
-        tracing::info!("阿里云盘官网普通分享失败，改用快传: {web_err}");
+        tracing::info!("阿里云盘普通分享失败，改用快传: {share_err}");
 
-        // 3) 快传：备份盘文件会被普通分享拒（Forbidden），只有这一条路。
+        // 2) 快传：备份盘文件会被普通分享拒（Forbidden），只有这一条路。
         //    没有提取码、语义是临时链接。
         let url = web
             .create_quick_share(&drive_id, &file_ids)
             .await
             .map_err(|quick_err| {
                 ApiError::Upstream(format!(
-                    "阿里云盘分享失败：开放平台 [{open_err}]；官网普通分享 [{web_err}]；快传 [{quick_err}]"
+                    "阿里云盘分享失败：普通分享 [{share_err}]；快传 [{quick_err}]"
                 ))
             })?;
         Ok(CloudShare {
@@ -1071,7 +1041,7 @@ impl Storage for AliyunDriveFs {
             .copy_from_share(&share_id, &share_token, &items, &drive_id, &dest_id)
             .await?;
         // 转存是云端直接落地，目标目录的本地 ID 缓存跟着失效。
-        evict_path_ids(&self.account, dest);
+        evict_path_ids(&self.cache_ns, dest);
         Ok(imported)
     }
 
@@ -1148,7 +1118,7 @@ impl Storage for AliyunDriveFs {
                 )));
             }
         };
-        evict_path_ids(&self.account, path);
+        evict_path_ids(&self.cache_ns, path);
         if created
             .get("rapid_upload")
             .and_then(Value::as_bool)
@@ -1255,7 +1225,7 @@ impl Storage for AliyunDriveFs {
                 )));
             }
         };
-        evict_path_ids(&self.account, path);
+        evict_path_ids(&self.cache_ns, path);
         if created
             .get("rapid_upload")
             .and_then(Value::as_bool)

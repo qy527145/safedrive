@@ -128,6 +128,28 @@ impl Registry {
         Ok(saved)
     }
 
+    /// 切换阿里云盘盘位：写入新的 `driveType` 并丢弃缓存的 `driveId`
+    /// （否则会继续读写上一个盘）。返回更新后的数据源。
+    pub fn set_drive_type(&self, id: &str, drive_type: &str) -> ApiResult<DataSource> {
+        let mut guard = self.inner.lock().unwrap();
+        let datasource = guard
+            .iter_mut()
+            .find(|datasource| datasource.id == id)
+            .ok_or_else(|| ApiError::NotFound(format!("数据源不存在: {id}")))?;
+        if datasource.ds_type != "aliyundrive" {
+            return Err(ApiError::BadRequest("只有阿里云盘支持切换盘位".into()));
+        }
+        let config = datasource
+            .config
+            .as_object_mut()
+            .ok_or_else(|| ApiError::BadRequest("数据源配置不是对象".into()))?;
+        config.insert("driveType".into(), drive_type.into());
+        config.remove("driveId");
+        let saved = datasource.clone();
+        self.save(&guard)?;
+        Ok(saved)
+    }
+
     /// 适配器轮换凭证后原子写回 `config`，避免服务重启退回已作废的旧令牌。
     /// 键即 config 字段名，由适配器自己决定（accessToken / cookie / …）。
     pub fn update_credentials(
@@ -624,5 +646,36 @@ mod tests {
         let updated = Registry::load(path).unwrap().get("ali").unwrap();
         assert!(updated.config.get("driveId").is_none());
         assert_eq!(updated.config["accessToken"], "fresh-access");
+    }
+
+    /// 药丸切盘走的 `set_drive_type`：写入新盘位、丢弃旧 driveId，非阿里源拒绝。
+    #[test]
+    fn set_drive_type_updates_drive_and_drops_cached_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("datasources.json");
+        let registry = Registry::load(path.clone()).unwrap();
+        let mut source = ds("ali");
+        source.ds_type = "aliyundrive".into();
+        source.config = serde_json::json!({
+            "clientId": "app",
+            "clientSecret": "secret",
+            "refreshToken": "seed-refresh",
+            "driveType": "resource",
+            "driveId": "drive-of-resource"
+        });
+        registry.create(source).unwrap();
+
+        let saved = registry.set_drive_type("ali", "backup").unwrap();
+        assert_eq!(saved.config["driveType"], "backup");
+        assert!(saved.config.get("driveId").is_none());
+
+        // 落盘后重新加载仍是新盘位、无旧 driveId。
+        let reloaded = Registry::load(path).unwrap().get("ali").unwrap();
+        assert_eq!(reloaded.config["driveType"], "backup");
+        assert!(reloaded.config.get("driveId").is_none());
+
+        // 非阿里云盘不支持切盘。
+        registry.create(ds("local")).unwrap();
+        assert!(registry.set_drive_type("local", "backup").is_err());
     }
 }

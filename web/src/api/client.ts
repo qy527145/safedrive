@@ -215,6 +215,12 @@ export const api = {
   deleteDs: (id: string) => request<{ ok: boolean }>(`/api/ds/${id}`, { method: 'DELETE' }),
   testDs: (id: string) =>
     request<{ ok: boolean; entries: number }>(`/api/ds/${id}/test`, { method: 'POST' }),
+  /** 切换阿里云盘盘位（resource 资源库 / backup 备份盘）；服务端会丢弃旧 driveId、清缓存并在新盘按需建根目录。 */
+  setDsDrive: (id: string, driveType: 'resource' | 'backup') =>
+    request<{ ok: boolean; driveType: string }>(`/api/ds/${id}/drive`, {
+      method: 'POST',
+      body: JSON.stringify({ driveType }),
+    }),
   /** 生成 sdds:// 配置分享链接（包含凭证与根密码，链接即密钥）。 */
   shareDs: (id: string) =>
     request<{ link: string }>(`/api/ds/${id}/share`, { method: 'POST' }),

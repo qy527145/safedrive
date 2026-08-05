@@ -17,6 +17,7 @@ pub fn routes() -> Router<AppState> {
         .route("/ds/import", post(import))
         .route("/ds/{id}", put(update).delete(remove))
         .route("/ds/{id}/test", post(test))
+        .route("/ds/{id}/drive", post(set_drive))
         .route("/ds/{id}/share", post(share))
 }
 
@@ -421,6 +422,36 @@ async fn test(
         Err(e) => return Err(e),
     };
     Ok(Json(json!({ "ok": true, "entries": entries.len() })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DriveBody {
+    drive_type: String,
+}
+
+/// 切换阿里云盘盘位（资源库 / 备份盘）。写入新盘位并丢弃缓存的 driveId 与
+/// 路径缓存，随后 `mkdir("")` 在新盘里按需建出配置的根目录。
+async fn set_drive(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<DriveBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let drive_type = body.drive_type.trim();
+    if !matches!(drive_type, "resource" | "backup") {
+        return Err(ApiError::BadRequest(
+            "阿里云盘盘位只能是资源库（resource）或备份盘（backup）".into(),
+        ));
+    }
+    state.registry.set_drive_type(&id, drive_type)?;
+    // 同一明文路径在两个盘里对应不同的云端目录，切盘后必须清掉路径与内容缓存。
+    state.cache.evict_datasource(&id);
+    if let Err(error) = state.content_cache.clear_datasource(&id) {
+        tracing::warn!("切换盘位后清理数据源缓存失败: ds={id} err={error}");
+    }
+    // 配置里设了根目录时，在新盘里按需建出来（root 为空即网盘根，什么都不建）。
+    state.adapter(&id)?.mkdir("").await?;
+    Ok(Json(json!({ "ok": true, "driveType": drive_type })))
 }
 
 /// 生成 `sdds://` 配置分享链接。链接包含凭证与根密码，属于不记名密钥，

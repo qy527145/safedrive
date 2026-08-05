@@ -1,11 +1,13 @@
-//! 阿里云盘**官网**接口（PDS，api.aliyundrive.com）。
+//! 阿里云盘**官网**接口（PDS）。
 //!
 //! 开放平台没有分享/转存能力，要把别人的阿里云盘分享转存进自己的盘只能
 //! 走官网接口，而官网令牌与开放平台令牌是两套体系 —— 因此数据源里有一项
 //! 可选的「官网刷新令牌」，配了才支持分享与转存。
 //!
-//! 官网令牌同样只在本机与阿里官方域名之间流动。它的权限比开放平台令牌大
-//! 得多（等同网页登录），所以除了分享/转存，其他读写一律仍走开放平台。
+//! 令牌校验/转存走消费级网关 `api.aliyundrive.com`；创建分享走风控更松的 PDS
+//! 上游网关 `{domain_id}.api.aliyunpds.com`（域名随用户所在区域变化）。官网令牌
+//! 同样只在本机与阿里官方域名之间流动。它的权限比开放平台令牌大得多（等同网页
+//! 登录），所以除了分享/转存，其他读写一律仍走开放平台。
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -352,6 +354,48 @@ impl WebClient {
         }
     }
 
+    /// 直接向指定 URL 发起官网 POST（PDS 上游网关的域名随区域变化，不能拿固定
+    /// `API_BASE` 拼）。令牌失效自动刷新重试一次；PDS 上游网关只认 Bearer 令牌，
+    /// 不必带设备会话与反滥用请求头 —— 这正是它比消费级网关限制更少的原因。
+    async fn post_url(&self, url: &str, body: &Value, what: &str) -> ApiResult<Value> {
+        let mut stale: Option<String> = None;
+        loop {
+            let token = self.access_token(stale.as_deref()).await?;
+            let response = self
+                .http
+                .post(url)
+                .bearer_auth(&token)
+                .json(body)
+                .send()
+                .await
+                .map_err(|e| ApiError::Upstream(format!("阿里云盘{what}请求失败: {e}")))?;
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            if status.is_success() {
+                return Ok(value);
+            }
+            let code = value
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let message = value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or(text.as_str());
+            let token_dead = status == reqwest::StatusCode::UNAUTHORIZED
+                || matches!(code.as_str(), "AccessTokenInvalid" | "AccessTokenExpired");
+            if token_dead && stale.is_none() {
+                stale = Some(token);
+                continue;
+            }
+            return Err(ApiError::Upstream(format!(
+                "阿里云盘{what}失败: HTTP {status} {code} {message}"
+            )));
+        }
+    }
+
     /// 官网令牌对应的用户 ID（access token 是 JWT，`sub` 即 user_id）。
     /// 用于提醒用户「官网令牌和开放平台令牌不是同一个账号」。
     pub async fn user_id(&self) -> ApiResult<String> {
@@ -359,23 +403,29 @@ impl WebClient {
         Ok(super::aliyun_apps::jwt_claim(&token, "sub").unwrap_or_default())
     }
 
-    /// 创建原生分享，返回 (share_id, 分享密码)。
+    /// 用 PDS 上游接口创建原生分享，返回 share_id。
+    ///
+    /// PDS 上游网关（`{domain_id}.api.aliyunpds.com`）比消费级网关
+    /// （api.aliyundrive.com）风控宽松：只需 Bearer 官网令牌，不必带设备会话与
+    /// 反滥用请求头，因此创建分享的限制更少。`domain_id` 决定用户所在区域的网关
+    /// 前缀（如 `bj29`），取自文件的 `domain_id`；传空则退回从官网令牌里读。
     pub async fn create_share(
         &self,
+        domain_id: &str,
         drive_id: &str,
         file_ids: &[String],
         password: &str,
     ) -> ApiResult<String> {
+        let base = self.pds_host(domain_id).await?;
         let body = json!({
             "drive_id": drive_id,
             "file_id_list": file_ids,
             "share_pwd": password,
-            // 空字符串 = 永久有效；首页不同步，避免出现在个人主页。
+            // 空字符串 = 永久有效。
             "expiration": "",
-            "sync_to_homepage": false,
         });
         let value = self
-            .post("/adrive/v2/share_link/create", &body, "创建分享", None)
+            .post_url(&format!("{base}/v2/share_link/create"), &body, "创建分享")
             .await?;
         value
             .get("share_id")
@@ -383,6 +433,24 @@ impl WebClient {
             .filter(|id| !id.is_empty())
             .map(str::to_owned)
             .ok_or_else(|| ApiError::Upstream("阿里云盘创建分享响应缺少 share_id".into()))
+    }
+
+    /// PDS 上游网关地址：前缀是用户所在区域的 `domain_id`（如 `bj29`）。优先用
+    /// 调用方从文件元数据带来的值；为空时退回从官网令牌 JWT 的 `domain_id` 声明读
+    /// （只用于路由、不验签）。两者都取不到才报错。
+    async fn pds_host(&self, domain_id: &str) -> ApiResult<String> {
+        let domain = if domain_id.is_empty() {
+            let token = self.access_token(None).await?;
+            super::aliyun_apps::jwt_claim(&token, "domain_id").unwrap_or_default()
+        } else {
+            domain_id.to_owned()
+        };
+        if domain.is_empty() {
+            return Err(ApiError::Upstream(
+                "无法确定阿里云盘 PDS 区域（缺少 domain_id），请重新扫码获取官网令牌".into(),
+            ));
+        }
+        Ok(format!("https://{domain}.api.aliyunpds.com"))
     }
 
     /// 创建**快传**分享，返回快传短链。备份盘文件无法走普通分享（会被拒），

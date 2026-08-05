@@ -1,17 +1,26 @@
 import {
   ApiOutlined, AppstoreOutlined, BarsOutlined, CopyOutlined, DatabaseOutlined, DeleteOutlined,
-  ImportOutlined, LinkOutlined, MoreOutlined, PlusOutlined,
+  ImportOutlined, LinkOutlined, MoreOutlined, PlusOutlined, SearchOutlined,
 } from '@ant-design/icons';
 import {
-  App, Button, Card, Checkbox, Col, Dropdown, Empty, Input, Row, Segmented, Skeleton, Space,
+  App, Button, Card, Checkbox, Col, Dropdown, Empty, Input, Row, Segmented, Select, Skeleton, Space,
   Table, Tag, Typography, type MenuProps,
 } from 'antd';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, type DsRecord, type DsType } from '../api/client';
 import SourceModal from '../components/SourceModal';
 import { useSources } from '../stores/sources';
 import { formatTime } from '../utils/format';
+
+/** 数据源类型的展示标签与配色，筛选下拉与类型标签共用一份。 */
+const DS_TYPE_META: Record<DsType, { label: string; color: string }> = {
+  localfs: { label: '本地文件系统', color: 'geekblue' },
+  webdav: { label: 'WebDAV', color: 'cyan' },
+  baidupan: { label: '百度网盘', color: 'blue' },
+  aliyundrive: { label: '阿里云盘', color: 'orange' },
+  quark: { label: '夸克网盘', color: 'purple' },
+};
 
 /** 数据管理首页：数据源入口（卡片/列表两种呈现）+ 添加/编辑/克隆/分享/批量管理。 */
 export default function DataPage() {
@@ -31,6 +40,17 @@ export default function DataPage() {
     setView(v);
     localStorage.setItem('sd.view.sources', v);
   };
+  // 顶部筛选：按名称搜索 + 按类型过滤（数据源多了便于快速定位）
+  const [query, setQuery] = useState('');
+  const [typeFilter, setTypeFilter] = useState<DsType | 'all'>('all');
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return sources.list.filter(
+      (d) =>
+        (typeFilter === 'all' || d.type === typeFilter) &&
+        (!q || d.name.toLowerCase().includes(q)),
+    );
+  }, [sources.list, query, typeFilter]);
 
   useEffect(() => {
     void sources.refresh().catch((e: unknown) => message.error(String(e)));
@@ -219,6 +239,37 @@ export default function DataPage() {
       </Button>
     </Space>
   );
+  const filterBar = (
+    <div className="ds-toolbar">
+      <Input
+        className="ds-toolbar-search"
+        prefix={<SearchOutlined />}
+        allowClear
+        placeholder="搜索数据源名称"
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+      />
+      <Select<DsType | 'all'>
+        className="ds-toolbar-type"
+        value={typeFilter}
+        onChange={setTypeFilter}
+        popupMatchSelectWidth={false}
+        options={[
+          { value: 'all', label: '全部类型' },
+          ...(Object.keys(DS_TYPE_META) as DsType[]).map((t) => ({
+            value: t,
+            label: DS_TYPE_META[t].label,
+          })),
+        ]}
+      />
+      {(query.trim() || typeFilter !== 'all') && (
+        <span className="ds-toolbar-count">
+          匹配 {filtered.length} / {sources.list.length}
+        </span>
+      )}
+    </div>
+  );
+  const noMatch = <Empty description="没有匹配的数据源" />;
 
   if (!sources.loaded) return <>{heading}{modalNode}<Row gutter={[16,16]}>{[0,1,2].map((key) => <Col key={key} xs={24} sm={12} lg={8}><Card><Skeleton active avatar paragraph={{rows:2}} /></Card></Col>)}</Row></>;
   if (sources.list.length === 0) {
@@ -237,24 +288,18 @@ export default function DataPage() {
   }
 
   const typeTag = (d: DsRecord) => {
-    const tags: Record<DsType, { label: string; color: string }> = {
-      localfs: { label: '本地文件系统', color: 'geekblue' },
-      webdav: { label: 'WebDAV', color: 'cyan' },
-      baidupan: { label: '百度网盘', color: 'blue' },
-      aliyundrive: { label: '阿里云盘', color: 'orange' },
-      quark: { label: '夸克网盘', color: 'purple' },
-    };
-    const tag = tags[d.type];
+    const tag = DS_TYPE_META[d.type];
     return <Tag color={tag.color}>{tag.label}</Tag>;
   };
 
   if (view === 'list') {
     return (
       <>{heading}{modalNode}<Card styles={{ body: { paddingTop: 16 } }}>
+        {filterBar}
         {batchBar}
         <Table<DsRecord>
           rowKey="id"
-          dataSource={sources.list}
+          dataSource={filtered}
           pagination={false}
           size="middle"
           rowSelection={{
@@ -313,8 +358,10 @@ export default function DataPage() {
   }
 
   return (
-    <>{heading}{modalNode}{batchBar}<Row gutter={[18, 18]}>
-      {sources.list.map((d) => {
+    <>{heading}{modalNode}{filterBar}{batchBar}
+    {filtered.length === 0 ? noMatch : (
+    <Row gutter={[18, 18]}>
+      {filtered.map((d) => {
         return (
           <Col key={d.id} xs={24} sm={12} lg={8} xl={6}>
             <Card className="source-card"
@@ -357,7 +404,8 @@ export default function DataPage() {
           </Col>
         );
       })}
-    </Row></>
+    </Row>
+    )}</>
   );
 }
 

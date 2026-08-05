@@ -11,7 +11,7 @@ interface FormValues {
   clientId?: string; clientSecret?: string; refreshToken?: string;
   /** 阿里云盘：内置第三方应用键，或 CUSTOM_APP */
   app?: string; webRefreshToken?: string;
-  driveType?: string; apiBase?: string; cookie?: string; encryptionEnabled: boolean;
+  apiBase?: string; cookie?: string; encryptionEnabled: boolean;
   encryptionPassword?: string; volumeEnabled: boolean; volumeText: string;
   volumeStrategy: 'fixed' | 'random'; volumeNameFormat: string; cacheEnabled: boolean;
 }
@@ -48,7 +48,9 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
       const custom = v.app === CUSTOM_APP;
       return { root: trim(v.root), app: trim(v.app),
         clientId: custom ? trim(v.clientId) : '', clientSecret: custom ? trim(v.clientSecret) : '',
-        refreshToken: trim(v.refreshToken), driveType: v.driveType || 'default',
+        refreshToken: trim(v.refreshToken),
+        // 盘位不在此表单里配置，进数据源后用药丸随时切换：编辑时原样保留、新建默认资源库。
+        driveType: editing?.config.driveType || 'resource',
         webRefreshToken: trim(v.webRefreshToken) };
     }
     case 'quark':
@@ -95,8 +97,8 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
       form.setFieldsValue({ name:editing?d.name:`${d.name} 副本`, type:d.type, root:d.config.root, url:d.config.url,
         username:d.config.username, password:d.config.password, bduss:d.config.bduss,
         userAgent:d.config.userAgent, clientId:d.config.clientId, clientSecret:d.config.clientSecret,
-        refreshToken:d.config.refreshToken, driveType:d.config.driveType ?? 'default',
-        // 老数据源没有 app 字段：填过 client_id 的按「自定义应用」回填。
+        refreshToken:d.config.refreshToken,
+        // 老配置里的 app 字段可能缺失：填过 client_id 的按「自定义应用」回填。
         app:d.config.app || (d.config.clientId ? CUSTOM_APP : undefined),
         webRefreshToken:d.config.webRefreshToken,
         apiBase:d.config.apiBase, cookie:d.config.cookie,
@@ -104,7 +106,7 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
         volumeEnabled:d.volumeEnabled, volumeText:sizeToInput(d.volumeSize),
         volumeStrategy:d.volumeStrategy, volumeNameFormat:d.volumeNameFormat, cacheEnabled:d.cacheEnabled });
     } else {
-      form.setFieldsValue({ type: 'localfs', encryptionEnabled: true, volumeEnabled: true, driveType: 'default',
+      form.setFieldsValue({ type: 'localfs', encryptionEnabled: true, volumeEnabled: true,
         volumeText: '300M', volumeStrategy: 'random', volumeNameFormat: '{s}_{i}.bin', cacheEnabled: true });
     }
   }, [open, editing, cloneFrom, form]);
@@ -262,8 +264,7 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
       <Form.Item name="bduss" label="BDUSS" rules={[{required:true,message:'请扫码登录获取，或手动粘贴'}]} extra={<Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>setQrOpen(true)}>扫码登录自动获取</Button>}><Input.Password placeholder="点击下方扫码登录自动获取，或手动粘贴 Cookie 中的 BDUSS"/></Form.Item>
       <Form.Item name="userAgent" label="下载 User-Agent" extra="留空使用默认值，仅影响下载数据流量的 UA 标识"><Input placeholder="netdisk;P2SP;2.2.61.31;android"/></Form.Item></>}
       {type==='aliyundrive'&&<><Form.Item name="root" label="网盘根目录" extra="留空即网盘根目录；建议单独用一个目录"><Input placeholder="/safedrive"/></Form.Item>
-      <Form.Item name="driveType" label="盘位" extra="资源库容量大且不占备份盘配额，备份盘对应手机备份目录"><Select options={[{label:'默认盘',value:'default'},{label:'资源库',value:'resource'},{label:'备份盘',value:'backup'}]}/></Form.Item>
-      <Form.Item name="webRefreshToken" label="官网令牌（推荐）" extra={<><Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>setAliWebQrOpen(true)}>扫码登录官网获取</Button><div><Typography.Text type="secondary">扫码登录后可免扫码换取下方开放平台 refresh_token，并解锁分享与转存（开放平台没有这两个接口）。可留空，仅用手动扫码授权。</Typography.Text></div></>}><Input.Password placeholder="扫码登录官网自动填入，可免扫码授权下方应用"/></Form.Item>
+      <Form.Item name="webRefreshToken" label="官网令牌（推荐）" extra={<><Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>setAliWebQrOpen(true)}>扫码登录官网获取</Button><div><Typography.Text type="secondary">扫码登录后可免扫码换取下方开放平台 refresh_token；分享与转存走官网 PDS 接口，必须配置官网令牌才可用。不需要分享/转存可留空。</Typography.Text></div></>}><Input.Password placeholder="扫码登录官网自动填入，可免扫码授权下方应用"/></Form.Item>
       <Form.Item name="app" label="第三方应用" extra={aliAppNote ?? '内置应用无需自建：扫码即用；填入已有 refresh_token 时会自动识别归属'}><Select options={aliAppOptions} placeholder="阿里云盘TV"/></Form.Item>
       {aliApp===CUSTOM_APP&&<><Form.Item name="clientId" label="client_id" rules={[{required:true}]} extra="阿里云盘开放平台自建应用的凭据；只在本机与阿里官方接口之间流转"><Input/></Form.Item>
       <Form.Item name="clientSecret" label="client_secret" rules={[{required:true}]}><Input.Password/></Form.Item></>}

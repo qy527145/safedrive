@@ -102,6 +102,30 @@ body > #root { min-height: 100vh; }
   color: var(--sd-text); border: 2px dashed var(--sd-accent); border-radius: 8px;
   background: rgba(10, 12, 18, .88); backdrop-filter: blur(6px); }
 .file-drop-overlay .anticon { color: var(--sd-accent); font-size: 42px; }
+/* 文件多、往下滚时把顶部操作条钉住，快捷操作始终可点（顶栏高 70px，钉在其下）。 */
+.browser-card .ant-card-head { position: sticky; top: 70px; z-index: 15;
+  background: rgba(20, 24, 35, .96) !important; backdrop-filter: blur(8px);
+  border-top-left-radius: 8px; border-top-right-radius: 8px; }
+@media (max-width: 720px) { .browser-card .ant-card-head { top: 68px; } }
+/* 阿里云盘盘位切换：胶囊式两态开关，选中态用主题渐变，与主按钮同语言。 */
+.drive-pill.ant-segmented { padding: 3px; border-radius: 999px; background: rgba(110,168,255,.08);
+  border: 1px solid var(--sd-border); }
+.drive-pill .ant-segmented-item { border-radius: 999px !important; color: var(--sd-muted);
+  transition: color .16s ease; }
+.drive-pill .ant-segmented-item:hover:not(.ant-segmented-item-selected) { color: var(--sd-text); }
+.drive-pill .ant-segmented-item-selected, .drive-pill .ant-segmented-thumb {
+  border-radius: 999px !important; background: linear-gradient(135deg, var(--sd-accent), var(--sd-accent-2)) !important; }
+.drive-pill .ant-segmented-item-selected .ant-segmented-item-label { color: #09101a; font-weight: 650; }
+.drive-pill .ant-segmented-item-label { padding: 0 12px; }
+/* 数据源列表顶部筛选条：搜索 + 类型过滤，右侧显示匹配计数。 */
+.ds-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 18px; }
+.ds-toolbar-search.ant-input-affix-wrapper { width: 260px; border-radius: 999px; padding-inline: 14px; }
+.ds-toolbar-search .ant-input-prefix { margin-right: 8px; color: var(--sd-muted); }
+.ds-toolbar-type { min-width: 132px; }
+.ds-toolbar-type .ant-select-selector { border-radius: 999px !important; padding-inline: 14px !important; }
+.ds-toolbar-count { margin-left: auto; color: var(--sd-muted); font-size: 12px;
+  font-variant-numeric: tabular-nums; }
+@media (max-width: 560px) { .ds-toolbar-search.ant-input-affix-wrapper { width: 100%; } .ds-toolbar-count { margin-left: 0; } }
 
 /* ---------- 文件预览：跟随暗色主题 ---------- */
 .text-preview { max-height: 65vh; overflow: auto; background: #10141e; border: 1px solid #262c3a;

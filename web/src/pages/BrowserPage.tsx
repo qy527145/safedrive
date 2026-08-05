@@ -177,6 +177,30 @@ export default function BrowserPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 阿里云盘盘位：老配置里的 default 语义等同备份盘，统一显示为备份盘。
+  const driveType: 'resource' | 'backup' =
+    ds?.config.driveType === 'backup' || ds?.config.driveType === 'default' ? 'backup' : 'resource';
+  const [switchingDrive, setSwitchingDrive] = useState(false);
+  const switchDrive = useCallback(
+    async (next: 'resource' | 'backup') => {
+      if (!dsId || next === driveType || switchingDrive) return;
+      setSwitchingDrive(true);
+      try {
+        await api.setDsDrive(dsId, next);
+        await sources.refresh();
+        // 切盘后同一路径指向另一个盘的目录，退回根目录重新列。
+        gotoPath('');
+        await refresh();
+        message.success(next === 'resource' ? '已切换到资源库' : '已切换到备份盘');
+      } catch (e) {
+        message.error(e instanceof Error ? e.message : String(e));
+      } finally {
+        setSwitchingDrive(false);
+      }
+    },
+    [dsId, driveType, switchingDrive, sources, gotoPath, refresh, message],
+  );
+
   useEffect(() => {
     void refresh();
   }, [refresh]);
@@ -816,6 +840,7 @@ export default function BrowserPage() {
         onChange={onPickerChange}
       />
       <Card
+      className="browser-card"
       title={
         <Space size={4}>
           <Button type="text" icon={<ArrowLeftOutlined />} onClick={() => navigate('/')} />
@@ -840,6 +865,19 @@ export default function BrowserPage() {
               })),
             ]}
           />
+          {ds?.type === 'aliyundrive' && (
+            <Segmented
+              className="drive-pill"
+              size="small"
+              value={driveType}
+              disabled={switchingDrive}
+              onChange={(v) => void switchDrive(v as 'resource' | 'backup')}
+              options={[
+                { value: 'resource', label: '资源库' },
+                { value: 'backup', label: '备份盘' },
+              ]}
+            />
+          )}
         </Space>
       }
       extra={
