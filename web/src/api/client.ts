@@ -353,7 +353,7 @@ export const api = {
   createShare: (ds: string, paths: string[], native = false, password = '') =>
     request<
       | { native: false; link: string }
-      | { native: true; url: string; password: string }
+      | { native: true; url: string; password: string; quick?: boolean }
     >(`/api/files/${ds}/share`, {
       method: 'POST',
       body: JSON.stringify({ paths, native, password }),

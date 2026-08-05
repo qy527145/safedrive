@@ -35,6 +35,10 @@ pub struct Entry {
 pub struct CloudShare {
     pub url: String,
     pub password: String,
+    /// 快传（阿里云盘备份盘专用）：没有提取码、通常有有效期，语义与普通分享不同，
+    /// 也无法被 `sd://` 标准分享封装/转存。路由层据此给用户不同的提示。
+    #[serde(default)]
+    pub quick: bool,
 }
 
 /// 云盘转存后的名称映射。`source_name` 是分享中的存储名，`name` 是目标目录

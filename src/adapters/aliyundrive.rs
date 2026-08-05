@@ -876,6 +876,44 @@ impl AliyunDriveFs {
         }
         Ok(())
     }
+
+    /// 用**开放平台**接口创建原生分享，返回规范短链。开放平台令牌是每个阿里云盘
+    /// 数据源都持有的主令牌，无需额外的官网令牌，因此优先走它；备份盘 / 应用无分享
+    /// 权限时会失败，再由 `share` 降级到官网接口乃至快传。
+    async fn open_create_share(
+        &self,
+        drive_id: &str,
+        file_ids: &[String],
+        password: &str,
+    ) -> ApiResult<String> {
+        let body = json!({
+            "driveId": drive_id,
+            "fileIdList": file_ids,
+            // 空 = 永久有效。
+            "expiration": "",
+            "sharePwd": password,
+        });
+        let value = self
+            .post("/adrive/v1.0/openFile/createShare", &body, "创建分享")
+            .await?;
+        // 用响应的 share_id 拼规范短链（响应自带的 share_url 可能是 stg 域名）；
+        // 缺 share_id 才退回响应里的 share_url。
+        if let Some(share_id) = value
+            .get("share_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            return Ok(aliyun_web::share_url(share_id));
+        }
+        value
+            .get("share_url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                ApiError::Upstream("阿里云盘开放平台创建分享响应缺少 share_id / share_url".into())
+            })
+    }
 }
 
 #[async_trait]
@@ -944,14 +982,13 @@ impl Storage for AliyunDriveFs {
         Ok(())
     }
 
-    /// 原生分享。开放平台没有分享接口，走官网（PDS）——因此必须配官网令牌。
+    /// 原生分享。优先走开放平台接口（人人都有的主令牌，无需官网令牌）；失败再
+    /// 降级到官网（PDS）普通分享，仍失败则退回快传（备份盘唯一可行的路）。
     async fn share(&self, paths: &[String], password: Option<&str>) -> ApiResult<CloudShare> {
         if paths.is_empty() {
             return Err(ApiError::BadRequest("请至少选择一个条目".into()));
         }
-        let web = self.web()?;
         let drive_id = self.drive_id().await?;
-        self.warn_account_mismatch(web).await;
         let mut file_ids = Vec::with_capacity(paths.len());
         for path in paths {
             file_ids.push(self.stat(path).await?.file_id);
@@ -960,10 +997,56 @@ impl Storage for AliyunDriveFs {
             Some(custom) => custom.to_owned(),
             None => aliyun_web::gen_share_password()?,
         };
-        let share_id = web.create_share(&drive_id, &file_ids, &password).await?;
+
+        // 1) 开放平台分享：不需要官网令牌，优先。
+        let open_err = match self
+            .open_create_share(&drive_id, &file_ids, &password)
+            .await
+        {
+            Ok(url) => {
+                return Ok(CloudShare {
+                    url,
+                    password,
+                    quick: false,
+                });
+            }
+            Err(open_err) => open_err,
+        };
+        tracing::info!("阿里云盘开放平台分享失败，改用官网接口: {open_err}");
+
+        // 2) 官网普通分享（需要官网令牌）。没配官网令牌就没有 2)/3) 可退。
+        let web = self.web().map_err(|_| {
+            ApiError::Upstream(format!(
+                "阿里云盘开放平台分享失败：{open_err}；未配置官网令牌，无法降级到官网分享 / 快传"
+            ))
+        })?;
+        self.warn_account_mismatch(web).await;
+        let web_err = match web.create_share(&drive_id, &file_ids, &password).await {
+            Ok(share_id) => {
+                return Ok(CloudShare {
+                    url: aliyun_web::share_url(&share_id),
+                    password,
+                    quick: false,
+                });
+            }
+            Err(web_err) => web_err,
+        };
+        tracing::info!("阿里云盘官网普通分享失败，改用快传: {web_err}");
+
+        // 3) 快传：备份盘文件会被普通分享拒（Forbidden），只有这一条路。
+        //    没有提取码、语义是临时链接。
+        let url = web
+            .create_quick_share(&drive_id, &file_ids)
+            .await
+            .map_err(|quick_err| {
+                ApiError::Upstream(format!(
+                    "阿里云盘分享失败：开放平台 [{open_err}]；官网普通分享 [{web_err}]；快传 [{quick_err}]"
+                ))
+            })?;
         Ok(CloudShare {
-            url: aliyun_web::share_url(&share_id),
-            password,
+            url,
+            password: String::new(),
+            quick: true,
         })
     }
 
@@ -975,7 +1058,14 @@ impl Storage for AliyunDriveFs {
         let drive_id = self.drive_id().await?;
         self.warn_account_mismatch(web).await;
         let dest_id = self.folder_id(dest, true).await?;
-        let share_token = web.share_token(&share_id, &share.password).await?;
+        // 快传（`/t/`）没有提取码，换 share_token 时密码留空；拿到 token 后读取内容、
+        // 转存与普通分享（`/s/`）同路。备份盘只能生成快传，转存也从这里进来。
+        let password = if share.quick || aliyun_web::is_quick_share_url(&share.url) {
+            ""
+        } else {
+            share.password.as_str()
+        };
+        let share_token = web.share_token(&share_id, password).await?;
         let items = web.share_root_items(&share_id, &share_token).await?;
         let imported = web
             .copy_from_share(&share_id, &share_token, &items, &drive_id, &dest_id)

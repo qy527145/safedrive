@@ -31,11 +31,15 @@ const AUTHORIZE_SID: &str = "m10qxi1syey6h";
 const AUTHORIZE_CLIENT_ID: &str = "25dzX3vbYqktVxyX";
 const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 /// 官网数据接口（api.aliyundrive.com）的写操作（分享/转存等）走风控，必须带一整套
-/// 反滥用请求头，否则边缘 WAF 直接回 `403 Forbidden`（纯文本，不带 JSON code）。
-/// 这个 App UA 与下面的 `X_CANARY` 成对出现，比桌面浏览器 UA 更不容易触发风控。
-const APP_UA: &str = "AliApp(AYSD/5.8.0) com.alicloud.databox/37029260 Channel/36176927979800@rimet_android_5.8.0 language/zh-CN /Android Mobile";
-/// 风控放行标记（提升频率上限，声明客户端渠道/版本）。
-const X_CANARY: &str = "client=Android,app=adrive,version=v5.8.0";
+/// 反滥用请求头，否则边缘 WAF 直接回 `403 Forbidden`。这个 UA 与下面的 `X_CANARY`
+/// 成对声明客户端身份，二者必须同源同版本。
+///
+/// 版本号是硬风控：旧版本会被回成 `403 {"code":"Forbidden","display_message":
+/// "请升级至最新版本使用此功能"}`（这是版本闸，早于设备会话校验）。这里对齐**官网
+/// web 端**当前在用的版本 —— web 客户端的分享接口是最稳的一条路。
+const APP_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
+/// 风控放行标记（声明客户端渠道/版本）；版本落后会被判「请升级至最新版本」。
+const X_CANARY: &str = "client=web,app=adrive,version=v6.8.12";
 /// aligo 项目公开的固定设备签名与 **公钥**（均为公开常量，非私钥）。官网写接口需要
 /// 一份「设备会话」：用这套已知可用的静态签名 + 公钥调一次 create_session 注册设备，
 /// 之后带上同一 device-id + 签名即可通过，省掉引入 secp256k1 现场签名的依赖。
@@ -75,17 +79,37 @@ pub fn share_url(share_id: &str) -> String {
     format!("https://www.alipan.com/s/{share_id}")
 }
 
+/// 快传短链。备份盘文件不能走普通分享（`/s/`），只能走快传（`/t/`）。
+pub fn quick_share_url(share_id: &str) -> String {
+    format!("https://www.alipan.com/t/{share_id}")
+}
+
 /// 从分享链接里取回 `share_id`。阿里的短链有 alipan.com / aliyundrive.com
-/// 两个域名，后面还常带 `?` 查询串。
+/// 两个域名，后面还常带 `?` 查询串。普通分享是 `/s/{id}`、快传是 `/t/{id}`，
+/// 两者的 `share_id` 都在同一位置，这里一并识别。
 pub fn share_id_from_url(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url.trim()).ok()?;
     let segments: Vec<&str> = parsed.path_segments()?.collect();
     segments
         .windows(2)
-        .find(|parts| parts[0] == "s")
+        .find(|parts| parts[0] == "s" || parts[0] == "t")
         .map(|parts| parts[1])
         .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()))
         .map(str::to_owned)
+}
+
+/// 判断分享链接是不是**快传**（`/t/{id}`）。快传没有提取码，语义与普通分享
+/// （`/s/`）不同：转存时 share_token 的密码留空，失败也不该向用户索要提取码。
+pub fn is_quick_share_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
+        return false;
+    };
+    let Some(segments) = parsed.path_segments().map(|segs| segs.collect::<Vec<_>>()) else {
+        return false;
+    };
+    segments
+        .windows(2)
+        .any(|parts| parts[0] == "t" && !parts[1].is_empty())
 }
 
 /// 生成 4 位分享密码。
@@ -224,11 +248,12 @@ impl WebClient {
     }
 
     /// 给官网写接口挂上一整套反滥用请求头。少任何一项都可能被边缘 WAF 拦成 403。
+    /// UA / canary / origin / referer 统一对齐官网 web 端身份。
     fn apply_write_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         request
             .header(USER_AGENT, APP_UA)
-            .header(REFERER, "https://www.aliyundrive.com/")
-            .header(ORIGIN, "https://www.aliyundrive.com")
+            .header(REFERER, "https://www.alipan.com/")
+            .header(ORIGIN, "https://www.alipan.com")
             .header(HeaderName::from_static("x-canary"), X_CANARY)
             .header(HeaderName::from_static("x-device-id"), self.device_id())
             .header(HeaderName::from_static("x-signature"), DEVICE_SIGNATURE)
@@ -358,6 +383,37 @@ impl WebClient {
             .filter(|id| !id.is_empty())
             .map(str::to_owned)
             .ok_or_else(|| ApiError::Upstream("阿里云盘创建分享响应缺少 share_id".into()))
+    }
+
+    /// 创建**快传**分享，返回快传短链。备份盘文件无法走普通分享（会被拒），
+    /// 只能快传：body 只带 `drive_file_list`，没有提取码，通常自带有效期。
+    pub async fn create_quick_share(
+        &self,
+        drive_id: &str,
+        file_ids: &[String],
+    ) -> ApiResult<String> {
+        let drive_file_list: Vec<Value> = file_ids
+            .iter()
+            .map(|file_id| json!({ "drive_id": drive_id, "file_id": file_id }))
+            .collect();
+        let body = json!({ "drive_file_list": drive_file_list });
+        let value = self
+            .post("/adrive/v1/share/create", &body, "创建快传", None)
+            .await?;
+        // 优先用响应自带的完整短链；缺了再用 share_id 拼快传短链。
+        if let Some(url) = value
+            .get("share_url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+        {
+            return Ok(url.to_owned());
+        }
+        value
+            .get("share_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(quick_share_url)
+            .ok_or_else(|| ApiError::Upstream("阿里云盘快传响应缺少 share_url / share_id".into()))
     }
 
     /// 用分享 ID + 密码换取一次性的 share_token。
@@ -854,6 +910,7 @@ mod tests {
                 .all(|byte| SHARE_PASSWORD_ALPHABET.contains(&byte))
         );
         assert_eq!(share_url("abc123"), "https://www.alipan.com/s/abc123");
+        assert_eq!(quick_share_url("abc123"), "https://www.alipan.com/t/abc123");
     }
 
     #[test]
@@ -872,8 +929,24 @@ mod tests {
         }
         assert!(share_id_from_url("https://www.alipan.com/").is_none());
         assert!(share_id_from_url("https://pan.baidu.com/s/1abc").is_some_and(|id| id == "1abc"));
+        // 快传短链 `/t/{id}` 的 share_id 同样能被识别
+        assert_eq!(
+            share_id_from_url("https://www.alipan.com/t/aB12cd34").as_deref(),
+            Some("aB12cd34")
+        );
         // 路径注入不能混进 share_id
         assert!(share_id_from_url("https://www.alipan.com/s/..%2Ffoo").is_none());
         assert!(share_id_from_url("not a url").is_none());
+    }
+
+    #[test]
+    fn distinguishes_quick_share_links() {
+        assert!(is_quick_share_url("https://www.alipan.com/t/aB12cd34"));
+        assert!(is_quick_share_url(
+            " https://www.aliyundrive.com/t/aB12cd34?x=1 "
+        ));
+        assert!(!is_quick_share_url("https://www.alipan.com/s/3XCkDNb1Cfa"));
+        assert!(!is_quick_share_url("https://www.alipan.com/"));
+        assert!(!is_quick_share_url("not a url"));
     }
 }

@@ -1944,6 +1944,7 @@ impl Storage for BaiduPanFs {
         Ok(CloudShare {
             url: url.to_owned(),
             password,
+            quick: false,
         })
     }
 
@@ -3168,6 +3169,7 @@ mod tests {
                 &CloudShare {
                     url: format!("{base}/s/1qym_MmGtZhFrTpKqf_H0oQ"),
                     password: "8888".into(),
+                    quick: false,
                 },
                 "asd",
             )

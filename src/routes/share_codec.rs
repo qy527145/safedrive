@@ -104,6 +104,13 @@ pub(super) fn native_password(url: &str) -> Option<String> {
         .filter(|pwd| !pwd.is_empty())
 }
 
+/// 是否为阿里云盘「快传」原生短链（`/t/{id}`）。快传没有提取码，导入失败时
+/// 不能再向用户索要提取码，语义上也不适合 `sd://` 封装。
+pub(super) fn is_quick_native(url: &str) -> bool {
+    native_source(url) == Some("aliyundrive")
+        && crate::adapters::aliyun_web::is_quick_share_url(url)
+}
+
 pub(super) fn encode(pack: &Pack) -> Result<String, &'static str> {
     let source = match pack.source_type.as_str() {
         "baidupan" => SOURCE_BAIDUPAN,
@@ -322,6 +329,11 @@ mod tests {
             native_source("https://pan.quark.cn/s/3a5f8b2c1d0e"),
             Some("quark")
         );
+        // 阿里云盘快传短链 `/t/{id}` 也应识别为 aliyundrive 源
+        assert_eq!(
+            native_source("https://www.alipan.com/t/aB12cd34"),
+            Some("aliyundrive")
+        );
         // 同域名但不是分享短链
         assert!(native_source("https://pan.baidu.com/disk/home").is_none());
         assert!(native_source("https://www.alipan.com/").is_none());
@@ -330,6 +342,19 @@ mod tests {
         assert!(native_source("sd://abcdef").is_none());
         // 域名后缀伪装不能蒙混（evil-baidu.com 不属于 baidu.com）
         assert!(native_source("https://evil-baidu.com/s/1abc").is_none());
+    }
+
+    /// 快传短链（`/t/`）判为快传；普通分享短链与非阿里链接判否。
+    #[test]
+    fn detects_quick_native_share() {
+        assert!(is_quick_native("https://www.alipan.com/t/aB12cd34"));
+        assert!(is_quick_native(
+            "https://www.aliyundrive.com/t/aB12cd34?x=1"
+        ));
+        assert!(!is_quick_native("https://www.alipan.com/s/3XCkDNb1Cfa"));
+        assert!(!is_quick_native("https://pan.baidu.com/s/1abc"));
+        assert!(!is_quick_native("https://pan.quark.cn/s/3a5f8b2c1d0e"));
+        assert!(!is_quick_native("https://example.com/t/aB12cd34"));
     }
 
     /// 链接内嵌的 `?pwd=` 提取码能被取出；没有或为空则判 None。

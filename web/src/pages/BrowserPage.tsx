@@ -513,15 +513,19 @@ export default function BrowserPage() {
 
   /** 展示分享结果：原生分享给出短链 + 提取码，标准分享给出 sd:// 链接。 */
   const showShareResult = (
-    result: { native: false; link: string } | { native: true; url: string; password: string },
+    result: { native: false; link: string } | { native: true; url: string; password: string; quick?: boolean },
     count: number,
   ) => {
     if (result.native) {
       modal.confirm({
-        title: `已创建官网分享（${count} 项）`,
+        title: result.quick ? `已创建快传（${count} 项）` : `已创建官网分享（${count} 项）`,
         icon: <LinkOutlined />,
         content: <Space direction="vertical" style={{ width: '100%' }}>
-          <Typography.Text type="secondary">云盘官网原生分享，接收方用官方 App / 网页即可打开，无需 SafeDrive。提取码已内嵌在链接里。</Typography.Text>
+          <Typography.Text type="secondary">
+            {result.quick
+              ? '阿里云盘备份盘文件无法普通分享，已改用「快传」：无提取码，接收方点开即可保存，链接通常有有效期。'
+              : '云盘官网原生分享，接收方用官方 App / 网页即可打开，无需 SafeDrive。提取码已内嵌在链接里。'}
+          </Typography.Text>
           <Input.TextArea readOnly value={result.url} autoSize={{ minRows: 2, maxRows: 4 }} onFocus={(e) => e.target.select()} />
           {result.password && (
             <Typography.Text type="secondary">
@@ -533,7 +537,7 @@ export default function BrowserPage() {
         cancelText: '关闭',
         onOk: async () => {
           await navigator.clipboard.writeText(result.url);
-          message.success('分享链接已复制');
+          message.success(result.quick ? '快传链接已复制' : '分享链接已复制');
         },
       });
       return;

@@ -142,9 +142,18 @@ async fn share_export(
             "native": true,
             "url": url,
             "password": cloud.password,
+            // 快传（阿里云盘备份盘）：没提取码、有有效期，前端据此换一套说明。
+            "quick": cloud.quick,
         })));
     }
 
+    // 快传链接（阿里云盘备份盘专用）没有可复用的分享 ID + 提取码流程，无法被
+    // sd:// 封装/转存 —— 明确引导用户改走原生分享，别抛出难懂的「无法提取 ID」。
+    if cloud.quick {
+        return Err(ApiError::BadRequest(
+            "该文件位于阿里云盘备份盘，只能生成「云盘官网原生分享」（快传），无法打包成 sd:// 标准分享；请改选原生分享".into(),
+        ));
+    }
     let share_id = codec::share_id(&datasource.ds_type, &cloud.url)
         .ok_or_else(|| ApiError::Upstream(format!("无法从分享短链提取分享 ID: {}", cloud.url)))?;
     let pack = codec::Pack {
@@ -207,8 +216,12 @@ async fn share_import(
         } else {
             dir.clone()
         };
+        // 快传（阿里云盘 `/t/`）没有提取码：不读 `?pwd=`、也不接受手填提取码。
+        let quick = codec::is_quick_native(link);
         // 提取码优先用用户手填的；留空则回退到链接里内嵌的 `?pwd=`。
-        let password = if body.password.trim().is_empty() {
+        let password = if quick {
+            String::new()
+        } else if body.password.trim().is_empty() {
             codec::native_password(link).unwrap_or_default()
         } else {
             body.password.trim().to_owned()
@@ -216,12 +229,14 @@ async fn share_import(
         let cloud = CloudShare {
             url: link.to_owned(),
             password: password.clone(),
+            quick,
         };
         // 没提供任何密码就转存失败 → 多半是需要提取码。不当作错误，让前端弹框
-        // 补填后重试（免密分享则此次已直接成功）。提供了密码仍失败才如实报错。
+        // 补填后重试（免密分享则此次已直接成功）。快传本就无提取码，别误导用户去
+        // 填提取码，直接如实报错；提供了密码仍失败也如实报错。
         let transferred = match storage.import_share(&cloud, &dest).await {
             Ok(transferred) => transferred,
-            Err(_) if password.is_empty() => {
+            Err(_) if password.is_empty() && !quick => {
                 return Ok(Json(json!({ "ok": false, "needPassword": true })));
             }
             Err(e) => return Err(e),
@@ -267,6 +282,7 @@ async fn share_import(
             ApiError::BadRequest(format!("{} 数据源不支持转存分享", pack.source_type))
         })?,
         password: pack.password.clone(),
+        quick: false,
     };
     let transferred = storage.import_share(&cloud, dest).await?;
 
