@@ -534,21 +534,21 @@ export default function BrowserPage() {
   const selectionAllForeign =
     selectedEntries.length > 0 && selectedEntries.every((e) => e.foreign);
   const selectionAnyForeign = selectedEntries.some((e) => e.foreign);
+  const selectionAnyManaged = selectedEntries.some((e) => !e.foreign);
+  const selectionCanNativeShare = canNativeShare && !selectionAnyManaged;
 
   /** 展示分享结果：原生分享给出短链 + 提取码，标准分享给出 sd:// 链接。 */
   const showShareResult = (
-    result: { native: false; link: string } | { native: true; url: string; password: string; quick?: boolean },
+    result: { native: false; link: string } | { native: true; url: string; password: string },
     count: number,
   ) => {
     if (result.native) {
       modal.confirm({
-        title: result.quick ? `已创建快传（${count} 项）` : `已创建官网分享（${count} 项）`,
+        title: `已创建官网分享（${count} 项）`,
         icon: <LinkOutlined />,
         content: <Space direction="vertical" style={{ width: '100%' }}>
           <Typography.Text type="secondary">
-            {result.quick
-              ? '阿里云盘备份盘文件无法普通分享，已改用「快传」：无提取码，接收方点开即可保存，链接通常有有效期。'
-              : '云盘官网原生分享，接收方用官方 App / 网页即可打开，无需 SafeDrive。提取码已内嵌在链接里。'}
+            云盘官网原生分享，接收方用官方 App / 网页即可打开，无需 SafeDrive。提取码已内嵌在链接里。
           </Typography.Text>
           <Input.TextArea readOnly value={result.url} autoSize={{ minRows: 2, maxRows: 4 }} onFocus={(e) => e.target.select()} />
           {result.password && (
@@ -561,7 +561,7 @@ export default function BrowserPage() {
         cancelText: '关闭',
         onOk: async () => {
           await navigator.clipboard.writeText(result.url);
-          message.success(result.quick ? '快传链接已复制' : '分享链接已复制');
+          message.success('分享链接已复制');
         },
       });
       return;
@@ -628,9 +628,9 @@ export default function BrowserPage() {
       message.warning('请先选择要分享的文件或文件夹');
       return;
     }
-    // 受管密文与外来明文不能混在一次分享（后端也会拒绝，这里先友好拦一下）。
-    if (selectionAnyForeign && !selectionAllForeign) {
-      message.warning('外来（明文）条目与受管加密条目不能一起分享，请分开选择');
+    // 混合选择统一生成标准分享；外来条目会保留字面名称，受管条目会重建信封。
+    if (selectionAnyForeign && selectionAnyManaged) {
+      void runCreateShare(false);
       return;
     }
     // 全外来：只能原生分享（sd:// 封装的是解密信息，对明文对象无意义）。
@@ -639,7 +639,7 @@ export default function BrowserPage() {
       return;
     }
     // 只有一种可选格式时不必打扰用户，直接生成标准分享。
-    if (!canNativeShare) {
+    if (!canNativeShare || !selectionCanNativeShare) {
       void runCreateShare(false);
       return;
     }

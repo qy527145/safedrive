@@ -25,7 +25,8 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::adapters::{RangeTransferMetrics, Storage};
-use crate::crypto::{ChunkPrp, content_cipher_params};
+use crate::crypto::content_cipher_params;
+use crate::disguise::Disguise;
 use crate::error::{ApiError, ApiResult};
 
 /// 开区间请求的首块小分片（加速播放器起播/seek 响应）。
@@ -56,34 +57,37 @@ pub struct FileLayout {
     pub total: u64,
 }
 
-/// 列出文件夹内的分卷并建立合并坐标系。
-/// 分卷名是文件密码派生的 PRP：把每个存储条目名 O(1) 反解回卷序号，
-/// 卷号必须恰好构成 0..n 无空洞 —— 缺卷/多卷都能精确报出，而不是
-/// 顺序扫描在断链处静默截断。
+/// 一个受管文件的叶子命名参数：信封里记下的明文名、该文件的密钥、数据源的
+/// 模版与伪装形态。布局探测靠它把存储端条目认回卷序。
+#[derive(Clone, Copy)]
+pub struct LeafNaming<'a> {
+    /// 数据源的叶子名模版（`{s}` / `{e}` / `{i}`，见 [`crate::naming`]）。
+    pub format: &'a str,
+    /// 信封里记下的明文文件名，供 `{s}` 展开。
+    pub source: &'a str,
+    /// 该文件的密钥，供 `{e}` 展开。
+    pub pw: &'a [u8],
+    pub disguise: Disguise,
+}
+
+/// 列出信封目录里属于本文件的叶子并建立合并坐标系。
+///
+/// 认卷的方式是**按模版生成候选名再查表**（[`crate::naming::resolve_leaves`]）：
+/// 手动塞进来的文件一概静默忽略，中间缺卷则在缺口处停下 —— 调用方拿信封里
+/// 记录的明文大小一比就知道少了东西。
+/// `disguise` 非 None 时每个存储对象前面都套了一层固定头部，合并坐标系记的是
+/// **去掉头部之后**的数据大小。
 pub async fn load_layout(
     storage: &dyn Storage,
     enc_folder: &str,
-    pw: &[u8],
+    naming: LeafNaming<'_>,
 ) -> ApiResult<FileLayout> {
     let entries = storage.list(enc_folder).await?;
-    let prp = ChunkPrp::new(pw);
-    let mut indexed: Vec<(usize, String, u64)> = entries
-        .into_iter()
-        .filter(|e| !e.is_dir)
-        .filter_map(|e| prp.index_of(&e.name).map(|i| (i, e.name, e.size)))
-        .collect();
-    indexed.sort_by_key(|(i, ..)| *i);
-    for (pos, (i, ..)) in indexed.iter().enumerate() {
-        if *i != pos {
-            return Err(ApiError::Upstream(format!(
-                "云端分卷不完整：缺第 {pos} 卷（共发现 {} 卷）",
-                indexed.len()
-            )));
-        }
-    }
-    let mut volumes = Vec::with_capacity(indexed.len());
+    let leaves = crate::naming::resolve_leaves(naming.format, naming.source, naming.pw, &entries);
+    let mut volumes = Vec::with_capacity(leaves.len());
     let mut offset = 0u64;
-    for (_, name, size) in indexed {
+    for (name, stored) in leaves {
+        let size = naming.disguise.data_len(stored);
         volumes.push(VolumeMeta { name, size, offset });
         offset += size;
     }
@@ -327,6 +331,9 @@ struct FetchContext {
     obj_path: String,
     pw: [u8; crate::crypto::SECRET_LEN],
     encrypted: bool,
+    /// 存储对象上的伪装头部：向上游发 Range 时要把它的长度加到卷内偏移上，
+    /// 数据区之外的字节永远不进解密与缓存。
+    disguise: Disguise,
     cache: Option<Arc<crate::cache::CacheEntry>>,
     cache_writeback: Option<CacheWriteback>,
     network_progress: Option<crate::adapters::ProgressFn>,
@@ -543,36 +550,19 @@ pub fn stream_range_cached(
     cache: Option<Arc<crate::cache::CacheEntry>>,
 ) -> mpsc::Receiver<io::Result<Bytes>> {
     stream_range_cached_mode(
-        storage, enc_folder, pw, true, layout, start, end, open_ended, params, cache, None,
+        storage,
+        enc_folder,
+        pw,
+        true,
+        Disguise::None,
+        layout,
+        start,
+        end,
+        open_ended,
+        params,
+        cache,
+        None,
     )
-}
-
-/// 未加密自定义卷名使用定宽 `{i}`，因此按文件名字典序即可恢复卷序。
-pub async fn load_layout_ordered(storage: &dyn Storage, folder: &str) -> ApiResult<FileLayout> {
-    let mut entries: Vec<_> = storage
-        .list(folder)
-        .await?
-        .into_iter()
-        .filter(|entry| !entry.is_dir)
-        .collect();
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut offset = 0u64;
-    let volumes = entries
-        .into_iter()
-        .map(|entry| {
-            let volume = VolumeMeta {
-                name: entry.name,
-                size: entry.size,
-                offset,
-            };
-            offset += entry.size;
-            volume
-        })
-        .collect();
-    Ok(FileLayout {
-        volumes,
-        total: offset,
-    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -581,6 +571,7 @@ pub fn stream_range_cached_mode(
     enc_folder: String,
     pw: [u8; crate::crypto::SECRET_LEN],
     encrypted: bool,
+    disguise: Disguise,
     layout: Arc<FileLayout>,
     start: u64,
     end: u64,
@@ -685,6 +676,7 @@ pub fn stream_range_cached_mode(
                 obj_path,
                 pw,
                 encrypted,
+                disguise,
                 cache: cache.clone(),
                 cache_writeback: cache_writeback.clone(),
                 network_progress: network_progress.clone(),
@@ -979,6 +971,7 @@ async fn fetch_chunk(
         obj_path,
         pw,
         encrypted,
+        disguise,
         cache,
         cache_writeback,
         network_progress,
@@ -1080,8 +1073,11 @@ async fn fetch_chunk(
             attempts += 1;
             let done = segment_len - remaining;
             let merged_position = network_start + done;
-            let range_start = c.vol_off + (merged_position - c.merged_start);
-            let range_end = c.vol_off + (segment.end - c.merged_start);
+            // 卷内偏移 → 存储对象偏移：伪装头部只在这里加回去，数据区之外的
+            // 字节永不进入解密、缓存与输出。
+            let header = disguise.header_len();
+            let range_start = header + c.vol_off + (merged_position - c.merged_start);
+            let range_end = header + c.vol_off + (segment.end - c.merged_start);
             let mut range_read = match tokio::time::timeout(
                 mode.first_byte_timeout(),
                 storage.get_range_tracked(
@@ -1438,18 +1434,30 @@ where
         })
         .collect::<Vec<_>>();
     upload_stream_planned(
-        storage, enc_folder, pw, true, total, &sizes, names, body, progress,
+        storage,
+        enc_folder,
+        pw,
+        true,
+        Disguise::None,
+        total,
+        &sizes,
+        names,
+        body,
+        progress,
     )
     .await
 }
 
 /// 按显式卷大小计划上传；`encrypted=false` 时原样写入，供未加密数据源使用。
+/// `volume_sizes` 是**数据区**大小（明文坐标）；`disguise` 非 None 时每个存储
+/// 对象都是「头部 + 数据区」，声明给上游的对象大小相应变大。
 #[allow(clippy::too_many_arguments)]
 pub async fn upload_stream_planned<S>(
     storage: Arc<dyn Storage>,
     enc_folder: &str,
     pw: &[u8],
     encrypted: bool,
+    disguise: Disguise,
     total: u64,
     volume_sizes: &[u64],
     names: &[String],
@@ -1469,8 +1477,15 @@ where
             } else {
                 format!("{enc_folder}/{name}")
             };
+            // 空文件也照样套头部：布局探测无条件按「对象大小 - 头部长度」算
+            // 数据大小，落地形态必须始终自洽。
+            let header = disguise.header(0);
             return storage
-                .put_sized(&path, 0, futures_util::stream::empty().boxed())
+                .put_sized(
+                    &path,
+                    header.len() as u64,
+                    futures_util::stream::iter((!header.is_empty()).then(|| Ok(header))).boxed(),
+                )
                 .await;
         }
         return Ok(());
@@ -1559,15 +1574,45 @@ where
                 let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(8);
                 let st = Arc::clone(&storage);
                 let uploaded = Arc::clone(&progress);
+                let header_len = disguise.header_len();
+                let header_reported = AtomicU64::new(0);
                 let on_upload: crate::adapters::ProgressFn = Arc::new(move |n| {
-                    uploaded.record_uploaded(n);
+                    // 伪装头部不是用户数据：先把每卷开头的这几十字节从进度里
+                    // 扣掉，否则「已上传」会超过声明的文件大小。
+                    let done = header_reported.load(Ordering::Relaxed);
+                    let skip = header_len.saturating_sub(done).min(n);
+                    if skip > 0 {
+                        header_reported.store(done + skip, Ordering::Relaxed);
+                    }
+                    if n > skip {
+                        uploaded.record_uploaded(n - skip);
+                    }
                 });
+                let stored = disguise.stored_len(cap);
                 let handle = tokio::spawn(async move {
-                    st.put_sized_tracked(&obj_path, cap, ReceiverStream::new(rx).boxed(), on_upload)
-                        .await
+                    st.put_sized_tracked(
+                        &obj_path,
+                        stored,
+                        ReceiverStream::new(rx).boxed(),
+                        on_upload,
+                    )
+                    .await
                 });
                 current = Some((tx, handle));
                 sent_in_vol = 0;
+                // 头部先落进通道：存储对象的形态恒为「头部 + 数据区」。
+                let header = disguise.header(cap);
+                if !header.is_empty() {
+                    let send_ok = {
+                        let (tx, _) = current.as_ref().expect("上面刚建立");
+                        tx.send(Ok(header)).await.is_ok()
+                    };
+                    if !send_ok {
+                        close_current(&mut current, &mut pending).await;
+                        wait_all(&mut pending).await?;
+                        return Err(ApiError::Upstream("分卷写入提前中断".into()));
+                    }
+                }
             }
             let cap = vol_cap(vol_idx);
             let take = (cap - sent_in_vol).min(b.len() as u64) as usize;
@@ -1614,7 +1659,7 @@ mod tests {
     use super::*;
     use crate::adapters::localfs::LocalFs;
     use crate::adapters::{ByteStream, Entry};
-    use crate::crypto::{chunk_count, gen_chunk_names, gen_secret};
+    use crate::crypto::{chunk_count, gen_secret};
     use futures_util::stream;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1688,6 +1733,20 @@ mod tests {
 
         async fn put(&self, _: &str, _: ByteStream) -> ApiResult<()> {
             unreachable!()
+        }
+    }
+
+    /// 引擎测试统一用 `{e}` 模版：叶子名即文件密钥派生的 PRP 名。
+    fn leaf_names(pw: &[u8], count: usize) -> Vec<String> {
+        crate::naming::leaf_names(crate::naming::ENVELOPE, "", pw, count)
+    }
+
+    fn naming<'a>(pw: &'a [u8], disguise: Disguise) -> LeafNaming<'a> {
+        LeafNaming {
+            format: crate::naming::ENVELOPE,
+            source: "",
+            pw,
+            disguise,
         }
     }
 
@@ -1836,6 +1895,7 @@ mod tests {
             String::new(),
             [0u8; crate::crypto::SECRET_LEN],
             false,
+            Disguise::None,
             Arc::new(layout(&[vol_size, vol_size])),
             seek,
             2 * vol_size - 1,
@@ -1892,6 +1952,7 @@ mod tests {
             String::new(),
             [0u8; crate::crypto::SECRET_LEN],
             false,
+            Disguise::None,
             Arc::new(layout(&[volume_size as u64; 4])),
             0,
             volume_size as u64 * 4 - 1,
@@ -2043,6 +2104,7 @@ mod tests {
             String::new(),
             pw,
             true,
+            Disguise::None,
             Arc::new(layout(&[total])),
             0,
             total - 1,
@@ -2085,6 +2147,7 @@ mod tests {
             String::new(),
             [0u8; crate::crypto::SECRET_LEN],
             false,
+            Disguise::None,
             Arc::new(layout(&[total])),
             0,
             total - 1,
@@ -2126,6 +2189,7 @@ mod tests {
                 obj_path: "volume".into(),
                 pw: [0u8; crate::crypto::SECRET_LEN],
                 encrypted: false,
+                disguise: Disguise::None,
                 cache: None,
                 cache_writeback: None,
                 network_progress: None,
@@ -2283,6 +2347,7 @@ mod tests {
                 "folder",
                 &[0; crate::crypto::SECRET_LEN],
                 false,
+                Disguise::None,
                 5,
                 &sizes,
                 &names,
@@ -2313,7 +2378,7 @@ mod tests {
         let plain: Vec<u8> = (0..700_000u32).map(|i| (i * 31 % 256) as u8).collect();
         let total = plain.len() as u64;
         let volume_size = 256 * 1024u64;
-        let names = gen_chunk_names(&pw, chunk_count(total, volume_size));
+        let names = leaf_names(&pw, chunk_count(total, volume_size));
 
         storage.mkdir("ENCFOLDER").await.unwrap();
         let body = stream::iter(
@@ -2357,7 +2422,7 @@ mod tests {
 
         // 布局
         let l = Arc::new(
-            load_layout(storage.as_ref(), "ENCFOLDER", &pw)
+            load_layout(storage.as_ref(), "ENCFOLDER", naming(&pw, Disguise::None))
                 .await
                 .unwrap(),
         );
@@ -2431,6 +2496,159 @@ mod tests {
         }
     }
 
+    /// 伪装 + 加密 + 分卷三者叠加的端到端闭环：每个存储对象都是「54 字节 BMP
+    /// 头 + 密文数据区」，合并坐标系仍是明文坐标，任意区间下载逐字节一致。
+    #[tokio::test]
+    async fn disguised_upload_then_range_stream_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::from(Box::new(
+            LocalFs::from_config(&serde_json::json!({"root": dir.path().to_str().unwrap()}))
+                .unwrap(),
+        ) as Box<dyn Storage>);
+        let disguise = Disguise::Bmp;
+        let header_len = disguise.header_len();
+
+        let pw = gen_secret();
+        let plain: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 256) as u8).collect();
+        let total = plain.len() as u64;
+        let volume_size = 128 * 1024u64;
+        let sizes = (0..total.div_ceil(volume_size))
+            .map(|idx| volume_size.min(total - idx * volume_size))
+            .collect::<Vec<_>>();
+        let names = leaf_names(&pw, sizes.len());
+
+        storage.mkdir("F").await.unwrap();
+        let progress = Arc::new(UploadProgress::new(total));
+        upload_stream_planned(
+            Arc::clone(&storage),
+            "F",
+            &pw,
+            true,
+            disguise,
+            total,
+            &sizes,
+            &names,
+            stream::iter(
+                plain
+                    .chunks(9_000)
+                    .map(|c| Ok(Bytes::copy_from_slice(c)))
+                    .collect::<Vec<_>>(),
+            ),
+            Arc::clone(&progress),
+        )
+        .await
+        .unwrap();
+        // 进度按明文口径统计：头部字节不计入。
+        assert_eq!(progress.encrypted.load(Ordering::Relaxed), total);
+        assert_eq!(progress.uploaded.load(Ordering::Relaxed), total);
+
+        // 落地形态：每个对象 = 头部 + 数据区，且开头就是 BMP 魔数。
+        let entries = storage.list("F").await.unwrap();
+        assert_eq!(entries.len(), sizes.len());
+        for (index, name) in names.iter().enumerate() {
+            let raw = std::fs::read(dir.path().join("F").join(name)).unwrap();
+            assert_eq!(raw.len() as u64, sizes[index] + header_len, "{name}");
+            assert_eq!(&raw[..2], b"BM", "{name}");
+            assert_eq!(
+                u32::from_le_bytes(raw[2..6].try_into().unwrap()) as u64,
+                header_len + sizes[index],
+                "bfSize 应声明整个对象大小"
+            );
+            assert_ne!(
+                &raw[header_len as usize..header_len as usize + 16],
+                &plain[..16],
+                "数据区必须是密文"
+            );
+        }
+
+        // 布局用的是**明文坐标**：总大小与逐卷大小都不含头部。
+        let layout = Arc::new(
+            load_layout(storage.as_ref(), "F", naming(&pw, disguise))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(layout.total, total);
+        assert_eq!(
+            layout.volumes.iter().map(|v| v.size).collect::<Vec<_>>(),
+            sizes
+        );
+
+        let params = StreamParams {
+            max_split: 40_000,
+            max_threads: 4,
+            max_per_volume: 2,
+            mode: StreamMode::BulkDownload,
+        };
+        for (start, end) in [
+            (0u64, total - 1),
+            (0, 0),
+            (131_071, 131_072),
+            (100_000, 250_000),
+            (total - 1, total - 1),
+        ] {
+            let mut rx = stream_range_cached_mode(
+                Arc::clone(&storage),
+                "F".into(),
+                pw,
+                true,
+                disguise,
+                Arc::clone(&layout),
+                start,
+                end,
+                false,
+                &params,
+                None,
+                None,
+            );
+            let mut out = Vec::new();
+            while let Some(item) = rx.recv().await {
+                out.extend_from_slice(&item.unwrap());
+            }
+            assert_eq!(
+                out,
+                &plain[start as usize..=end as usize],
+                "区间 [{start},{end}]"
+            );
+        }
+    }
+
+    /// 空文件同样套头部：布局无条件按「对象大小 - 头部长度」算数据大小，
+    /// 落地形态必须自洽（否则 0 字节对象会被算成负数/绕回）。
+    #[tokio::test]
+    async fn disguised_empty_file_still_carries_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::from(Box::new(
+            LocalFs::from_config(&serde_json::json!({"root": dir.path().to_str().unwrap()}))
+                .unwrap(),
+        ) as Box<dyn Storage>);
+        storage.mkdir("E").await.unwrap();
+        let pw = gen_secret();
+        let names = leaf_names(&pw, 1);
+        upload_stream_planned(
+            Arc::clone(&storage),
+            "E",
+            &pw,
+            true,
+            Disguise::Bmp,
+            0,
+            &[0],
+            &names,
+            stream::iter(Vec::<io::Result<Bytes>>::new()),
+            Arc::new(UploadProgress::new(0)),
+        )
+        .await
+        .unwrap();
+        let raw = std::fs::read(dir.path().join("E").join(&names[0])).unwrap();
+        assert_eq!(raw.len(), 54);
+        assert_eq!(&raw[..2], b"BM");
+        let layout = load_layout(storage.as_ref(), "E", naming(&pw, Disguise::Bmp))
+            .await
+            .unwrap();
+        assert_eq!(layout.total, 0);
+        assert_eq!(layout.volumes.len(), 1);
+        assert_eq!(layout.volumes[0].size, 0);
+    }
+
     #[tokio::test]
     async fn upload_size_mismatch_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -2442,7 +2660,7 @@ mod tests {
         let pw = gen_secret();
 
         // 少给
-        let names = gen_chunk_names(&pw, 1);
+        let names = leaf_names(&pw, 1);
         let body = stream::iter(vec![Ok(Bytes::from_static(b"short"))]);
         let progress = || Arc::new(UploadProgress::new(100));
         assert!(
@@ -2499,7 +2717,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let l = load_layout(storage.as_ref(), "E", &pw).await.unwrap();
+        let l = load_layout(storage.as_ref(), "E", naming(&pw, Disguise::None))
+            .await
+            .unwrap();
         assert_eq!(l.total, 0);
         assert!(l.volumes.is_empty());
     }
@@ -2522,6 +2742,7 @@ mod tests {
                 obj_path: "v".into(),
                 pw,
                 encrypted: true,
+                disguise: Disguise::None,
                 cache: None,
                 cache_writeback: None,
                 network_progress: None,

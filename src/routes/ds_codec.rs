@@ -1,12 +1,13 @@
 //! Compact, authenticated `sdds://` datasource-config share payloads.
 //!
-//! Wire format (protocol v1):
+//! Wire format:
 //! `base64url(AES-128-SIV(binary payload) || encrypted-pad:4 || version:4)`,
 //! mirroring the `sd://` file-share envelope in [`super::share_codec`]. The
 //! payload carries everything needed to recreate a datasource: connection
-//! config, root password, volume and cache settings. Credentials dominate the
-//! length, so strings whose bytes all fit the 64-symbol base64url alphabet
-//! (BDUSS, generated passwords, tokens) are packed at 6 bits per character.
+//! config, root password, volume, disguise and cache settings. Credentials
+//! dominate the length, so strings whose bytes all fit the 64-symbol base64url
+//! alphabet (BDUSS, generated passwords, tokens) are packed at 6 bits per
+//! character.
 //!
 //! The link is a bearer secret: anyone holding it gets the credentials and the
 //! root password. The protocol key only keeps generic clients from reading it.
@@ -22,17 +23,14 @@ use super::bits::{BitReader, BitWriter, DecodeError, MAX_STRING_BYTES, validate_
 pub(super) const SCHEME: &str = "sdds://";
 
 const VERSION: u8 = 1;
-/// v2 只在阿里云盘尾部多了「第三方应用 + 官网令牌」两段，其余布局与 v1 逐位
-/// 相同。没用到这两段的链接仍按 v1 签发，老版本客户端照旧能导入。
-const VERSION_ALIYUN_APP: u8 = 2;
 const SOURCE_LOCALFS: u8 = 1;
 const SOURCE_WEBDAV: u8 = 2;
 const SOURCE_BAIDUPAN: u8 = 3;
 const SOURCE_ALIYUNDRIVE: u8 = 4;
 const SOURCE_QUARK: u8 = 5;
+const DISGUISE_BMP: u64 = 1;
 const COMPACT_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-const DEFAULT_VOLUME_NAME_FORMAT: &str = "{s}_{i}.bin";
 
 // Protocol key for v1, deliberately protocol-wide: it obscures the payload
 // from generic clients, but ships in every compatible SafeDrive client and so
@@ -55,8 +53,30 @@ pub(super) struct DsPack {
     pub volume_enabled: bool,
     pub volume_size: u64,
     pub volume_strategy: String,
-    pub volume_name_format: String,
+    /// 存储端叶子对象的名字模版（仅受管数据源有意义，见 [`crate::naming`]）。
+    pub leaf_name_format: String,
+    pub disguise_enabled: bool,
+    pub disguise_algorithm: String,
     pub cache_enabled: bool,
+}
+
+impl DsPack {
+    fn disguise(&self) -> crate::disguise::Disguise {
+        if self.disguise_enabled {
+            crate::disguise::Disguise::from_algorithm(&self.disguise_algorithm).unwrap_or_default()
+        } else {
+            crate::disguise::Disguise::None
+        }
+    }
+
+    /// 三个开关能推出来的默认叶子名模版 —— 与它一致时不必进链接。
+    fn default_leaf_name_format(&self) -> String {
+        crate::naming::default_format(
+            self.encryption_enabled,
+            self.volume_enabled,
+            self.disguise(),
+        )
+    }
 }
 
 pub(super) fn encode(pack: &DsPack) -> Result<String, &'static str> {
@@ -71,14 +91,27 @@ pub(super) fn encode(pack: &DsPack) -> Result<String, &'static str> {
     if pack.name.trim().is_empty() {
         return Err("datasource name must not be empty");
     }
+    let field = |key: &str| pack.config.get(key).and_then(Value::as_str).unwrap_or("");
+    // 受管数据源（加密 / 分卷 / 伪装任一开启）都吃根密码、都有叶子名模版。
+    let managed = pack.encryption_enabled || pack.volume_enabled || pack.disguise_enabled;
 
     let mut bits = BitWriter::default();
     bits.write_bits(source as u64, 4);
     bits.write_bit(pack.encryption_enabled);
     bits.write_bit(pack.volume_enabled);
     bits.write_bit(pack.cache_enabled);
+    bits.write_bit(pack.disguise_enabled);
+    if pack.disguise_enabled {
+        bits.write_bits(
+            match pack.disguise_algorithm.as_str() {
+                "bmp" => DISGUISE_BMP,
+                _ => return Err("unsupported disguise algorithm"),
+            },
+            4,
+        );
+    }
     write_compact(&mut bits, &pack.name)?;
-    if pack.encryption_enabled {
+    if managed {
         write_compact(&mut bits, &pack.password)?;
     }
     if pack.volume_enabled {
@@ -88,28 +121,16 @@ pub(super) fn encode(pack: &DsPack) -> Result<String, &'static str> {
             "fixed" => true,
             _ => return Err("unsupported volume strategy"),
         });
-        if !pack.encryption_enabled {
-            // Encrypted datasources derive volume names from the file key, so
-            // the template is meaningless there and stays out of the link.
-            write_optional(
-                &mut bits,
-                (pack.volume_name_format != DEFAULT_VOLUME_NAME_FORMAT)
-                    .then_some(pack.volume_name_format.as_str()),
-            )?;
-        }
+    }
+    // 叶子名模版只对受管数据源有意义；与默认值一致时省掉（默认值可由三个开关重算）。
+    if managed {
+        let default_format = pack.default_leaf_name_format();
+        write_optional(
+            &mut bits,
+            (pack.leaf_name_format != default_format).then_some(pack.leaf_name_format.as_str()),
+        )?;
     }
 
-    let field = |key: &str| pack.config.get(key).and_then(Value::as_str).unwrap_or("");
-    // 阿里云盘选了内置应用、或配了官网令牌，才需要 v2 的尾部两段。
-    let version = if source == SOURCE_ALIYUNDRIVE
-        && ["app", "webRefreshToken"]
-            .iter()
-            .any(|key| !field(key).is_empty())
-    {
-        VERSION_ALIYUN_APP
-    } else {
-        VERSION
-    };
     match source {
         SOURCE_LOCALFS => write_compact(&mut bits, field("root"))?,
         SOURCE_WEBDAV => {
@@ -122,13 +143,8 @@ pub(super) fn encode(pack: &DsPack) -> Result<String, &'static str> {
             write_compact(&mut bits, field("clientId"))?;
             write_compact(&mut bits, field("clientSecret"))?;
             write_compact(&mut bits, field("refreshToken"))?;
-            for key in ["driveType", "apiBase"] {
+            for key in ["driveType", "apiBase", "app", "webRefreshToken"] {
                 write_optional(&mut bits, Some(field(key)).filter(|v| !v.is_empty()))?;
-            }
-            if version >= VERSION_ALIYUN_APP {
-                for key in ["app", "webRefreshToken"] {
-                    write_optional(&mut bits, Some(field(key)).filter(|v| !v.is_empty()))?;
-                }
             }
         }
         SOURCE_QUARK => {
@@ -147,7 +163,7 @@ pub(super) fn encode(pack: &DsPack) -> Result<String, &'static str> {
 
     let plain = bits.finish();
     let mut cipher = Aes128Siv::new_from_slice(&V1_KEY).map_err(|_| "invalid protocol key")?;
-    let version_bytes = [version];
+    let version_bytes = [VERSION];
     let mut wire = cipher
         .encrypt(
             [b"safedrive-ds".as_slice(), version_bytes.as_slice()],
@@ -155,7 +171,7 @@ pub(super) fn encode(pack: &DsPack) -> Result<String, &'static str> {
         )
         .map_err(|_| "datasource share encryption failed")?;
     let encrypted_pad = wire.first().ok_or("empty ciphertext")? & 0xf0;
-    wire.push(encrypted_pad | version);
+    wire.push(encrypted_pad | VERSION);
     Ok(format!("{SCHEME}{}", URL_SAFE_NO_PAD.encode(wire)))
 }
 
@@ -172,7 +188,7 @@ pub(super) fn decode(link: &str) -> Result<DsPack, DecodeError> {
     if wire.first().map(|byte| byte & 0xf0) != Some(trailer & 0xf0) {
         return Err(DecodeError::Invalid);
     }
-    if version != VERSION && version != VERSION_ALIYUN_APP {
+    if version != VERSION {
         return Err(DecodeError::UnsupportedVersion(version));
     }
     let mut cipher = Aes128Siv::new_from_slice(&V1_KEY).map_err(|_| DecodeError::Invalid)?;
@@ -183,10 +199,10 @@ pub(super) fn decode(link: &str) -> Result<DsPack, DecodeError> {
             &wire,
         )
         .map_err(|_| DecodeError::Invalid)?;
-    decode_plain(&plain, version)
+    decode_plain(&plain)
 }
 
-fn decode_plain(plain: &[u8], version: u8) -> Result<DsPack, DecodeError> {
+fn decode_plain(plain: &[u8]) -> Result<DsPack, DecodeError> {
     let mut bits = BitReader::new(plain);
     let source = bits.read_bits(4)? as u8;
     let ds_type = match source {
@@ -200,27 +216,36 @@ fn decode_plain(plain: &[u8], version: u8) -> Result<DsPack, DecodeError> {
     let encryption_enabled = bits.read_bit()?;
     let volume_enabled = bits.read_bit()?;
     let cache_enabled = bits.read_bit()?;
+    let disguise_enabled = bits.read_bit()?;
+    let mut disguise_algorithm = crate::disguise::DEFAULT_ALGORITHM.to_owned();
+    if disguise_enabled {
+        disguise_algorithm = match bits.read_bits(4)? {
+            DISGUISE_BMP => "bmp".to_owned(),
+            _ => return Err(DecodeError::Invalid),
+        };
+    }
     let name = read_compact(&mut bits)?;
     if name.trim().is_empty() {
         return Err(DecodeError::Invalid);
     }
-    let password = if encryption_enabled {
+    // 受管数据源（加密 / 分卷 / 伪装任一开启）都带根密码。
+    let managed = encryption_enabled || volume_enabled || disguise_enabled;
+    let password = if managed {
         read_compact(&mut bits)?
     } else {
         String::new()
     };
     let mut volume_size = crate::registry::DEFAULT_VOLUME_SIZE;
     let mut volume_strategy = "random";
-    let mut volume_name_format = DEFAULT_VOLUME_NAME_FORMAT.to_owned();
     if volume_enabled {
         volume_size = read_size(&mut bits)?;
         volume_strategy = if bits.read_bit()? { "fixed" } else { "random" };
-        if !encryption_enabled {
-            if let Some(format) = read_optional(&mut bits)? {
-                volume_name_format = format;
-            }
-        }
     }
+    let leaf_override = if managed {
+        read_optional(&mut bits)?
+    } else {
+        None
+    };
 
     let config = match source {
         SOURCE_LOCALFS => json!({ "root": read_compact(&mut bits)? }),
@@ -229,21 +254,16 @@ fn decode_plain(plain: &[u8], version: u8) -> Result<DsPack, DecodeError> {
             "username": read_optional(&mut bits)?.unwrap_or_default(),
             "password": read_optional(&mut bits)?.unwrap_or_default(),
         }),
-        SOURCE_ALIYUNDRIVE => {
-            let mut config = json!({
-                "root": read_compact(&mut bits)?,
-                "clientId": read_compact(&mut bits)?,
-                "clientSecret": read_compact(&mut bits)?,
-                "refreshToken": read_compact(&mut bits)?,
-                "driveType": read_optional(&mut bits)?.unwrap_or_else(|| "default".into()),
-                "apiBase": read_optional(&mut bits)?.unwrap_or_default(),
-            });
-            if version >= VERSION_ALIYUN_APP {
-                config["app"] = read_optional(&mut bits)?.unwrap_or_default().into();
-                config["webRefreshToken"] = read_optional(&mut bits)?.unwrap_or_default().into();
-            }
-            config
-        }
+        SOURCE_ALIYUNDRIVE => json!({
+            "root": read_compact(&mut bits)?,
+            "clientId": read_compact(&mut bits)?,
+            "clientSecret": read_compact(&mut bits)?,
+            "refreshToken": read_compact(&mut bits)?,
+            "driveType": read_optional(&mut bits)?.unwrap_or_else(|| "default".into()),
+            "apiBase": read_optional(&mut bits)?.unwrap_or_default(),
+            "app": read_optional(&mut bits)?.unwrap_or_default(),
+            "webRefreshToken": read_optional(&mut bits)?.unwrap_or_default(),
+        }),
         SOURCE_QUARK => json!({
             "root": read_compact(&mut bits)?,
             "cookie": read_compact(&mut bits)?,
@@ -258,6 +278,14 @@ fn decode_plain(plain: &[u8], version: u8) -> Result<DsPack, DecodeError> {
         }),
     };
     bits.finish()?;
+    let disguise = if disguise_enabled {
+        crate::disguise::Disguise::from_algorithm(&disguise_algorithm).unwrap_or_default()
+    } else {
+        crate::disguise::Disguise::None
+    };
+    let leaf_name_format = leaf_override.unwrap_or_else(|| {
+        crate::naming::default_format(encryption_enabled, volume_enabled, disguise)
+    });
     Ok(DsPack {
         ds_type: ds_type.to_owned(),
         name,
@@ -267,7 +295,9 @@ fn decode_plain(plain: &[u8], version: u8) -> Result<DsPack, DecodeError> {
         volume_enabled,
         volume_size,
         volume_strategy: volume_strategy.to_owned(),
-        volume_name_format,
+        leaf_name_format,
+        disguise_enabled,
+        disguise_algorithm,
         cache_enabled,
     })
 }
@@ -395,7 +425,9 @@ mod tests {
             volume_enabled: true,
             volume_size: 300 * 1024 * 1024,
             volume_strategy: "random".into(),
-            volume_name_format: DEFAULT_VOLUME_NAME_FORMAT.into(),
+            leaf_name_format: "{e}".into(),
+            disguise_enabled: false,
+            disguise_algorithm: crate::disguise::DEFAULT_ALGORITHM.into(),
             cache_enabled: true,
         }
     }
@@ -414,7 +446,9 @@ mod tests {
             volume_enabled: true,
             volume_size: 12_345_678,
             volume_strategy: "fixed".into(),
-            volume_name_format: "{s}.part{i}".into(),
+            leaf_name_format: "{s}.part{i}".into(),
+            disguise_enabled: false,
+            disguise_algorithm: crate::disguise::DEFAULT_ALGORITHM.into(),
             cache_enabled: false,
         }
     }
@@ -436,7 +470,9 @@ mod tests {
             volume_enabled: true,
             volume_size: 300 * 1024 * 1024,
             volume_strategy: "random".into(),
-            volume_name_format: DEFAULT_VOLUME_NAME_FORMAT.into(),
+            leaf_name_format: "{e}".into(),
+            disguise_enabled: false,
+            disguise_algorithm: crate::disguise::DEFAULT_ALGORITHM.into(),
             cache_enabled: true,
         }
     }
@@ -456,7 +492,9 @@ mod tests {
             volume_enabled: false,
             volume_size: crate::registry::DEFAULT_VOLUME_SIZE,
             volume_strategy: "random".into(),
-            volume_name_format: DEFAULT_VOLUME_NAME_FORMAT.into(),
+            leaf_name_format: "{e}".into(),
+            disguise_enabled: false,
+            disguise_algorithm: crate::disguise::DEFAULT_ALGORITHM.into(),
             cache_enabled: true,
         }
     }
@@ -471,19 +509,34 @@ mod tests {
             volume_enabled: false,
             volume_size: crate::registry::DEFAULT_VOLUME_SIZE,
             volume_strategy: "random".into(),
-            volume_name_format: DEFAULT_VOLUME_NAME_FORMAT.into(),
+            leaf_name_format: "{e}".into(),
+            disguise_enabled: false,
+            disguise_algorithm: crate::disguise::DEFAULT_ALGORITHM.into(),
             cache_enabled: true,
         }
     }
 
+    /// 与 decode 的输出对齐：链接里省掉的字段解出来是默认值。
     fn normalized(mut pack: DsPack) -> DsPack {
-        // 与 decode 的输出对齐：不分卷时回落默认，加密时无名称模板。
+        let managed = pack.encryption_enabled || pack.volume_enabled || pack.disguise_enabled;
         if !pack.volume_enabled {
             pack.volume_size = crate::registry::DEFAULT_VOLUME_SIZE;
             pack.volume_strategy = "random".into();
         }
-        if pack.encryption_enabled {
-            pack.volume_name_format = DEFAULT_VOLUME_NAME_FORMAT.into();
+        // 非受管数据源没有叶子可命名，模版不进链接。
+        if !managed {
+            pack.leaf_name_format = pack.default_leaf_name_format();
+        }
+        if !pack.disguise_enabled {
+            pack.disguise_algorithm = crate::disguise::DEFAULT_ALGORITHM.into();
+        }
+        // 阿里云盘尾部固定带「内置应用 + 官网令牌」两段，没配就是空串。
+        if pack.ds_type == "aliyundrive" {
+            for key in ["app", "webRefreshToken"] {
+                if pack.config.get(key).is_none() {
+                    pack.config[key] = "".into();
+                }
+            }
         }
         pack
     }
@@ -501,6 +554,33 @@ mod tests {
             assert!(link.starts_with(SCHEME), "{link}");
             assert_eq!(decode(&link), Ok(normalized(pack)));
         }
+    }
+
+    /// 伪装形态与叶子名模版原样往返。
+    #[test]
+    fn disguise_and_leaf_format_ride_along() {
+        let mut pack = baidu_pack();
+        pack.disguise_enabled = true;
+        pack.disguise_algorithm = "bmp".into();
+        pack.leaf_name_format = "{e}.bmp".into();
+        let decoded = decode(&encode(&pack).unwrap()).unwrap();
+        assert!(decoded.disguise_enabled);
+        assert_eq!(decoded.disguise_algorithm, "bmp");
+        assert_eq!(decoded.leaf_name_format, "{e}.bmp");
+
+        // 自定义模版（与默认值不同）同样原样带回
+        let mut custom = webdav_pack();
+        custom.leaf_name_format = "{s}-第{i}卷.dat".into();
+        assert_eq!(
+            decode(&encode(&custom).unwrap()).unwrap().leaf_name_format,
+            "{s}-第{i}卷.dat"
+        );
+
+        // 认不出的算法不签链接（服务端校验也拦，这里是最后一道）。
+        let mut bogus = baidu_pack();
+        bogus.disguise_enabled = true;
+        bogus.disguise_algorithm = "png".into();
+        assert!(encode(&bogus).is_err());
     }
 
     #[test]
@@ -557,24 +637,13 @@ mod tests {
         assert!(decoded.config.get("refreshToken").is_none());
     }
 
-    /// 内置应用键与官网令牌只在 v2 里传；没用到就仍签 v1（老客户端能导入）。
+    /// 内置应用键与官网令牌从 v2 起随链接走。
     #[test]
-    fn aliyun_app_and_web_token_ride_along_in_v2() {
-        let version_of = |link: &str| {
-            *URL_SAFE_NO_PAD
-                .decode(link.strip_prefix(SCHEME).unwrap())
-                .unwrap()
-                .last()
-                .unwrap()
-                & 0x0f
-        };
-        assert_eq!(version_of(&encode(&aliyun_pack()).unwrap()), VERSION);
-
+    fn aliyun_app_and_web_token_ride_along() {
         let mut pack = aliyun_pack();
         pack.config["app"] = "tv".into();
         pack.config["webRefreshToken"] = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ3LTEifQ.c2ln".into();
         let link = encode(&pack).unwrap();
-        assert_eq!(version_of(&link), VERSION_ALIYUN_APP);
         assert_eq!(decode(&link), Ok(normalized(pack)));
 
         // 运行期令牌不进链接（导入端用 refresh_token 自己换）。

@@ -8,8 +8,8 @@
 //!
 //! 两条硬约束：
 //!   1. 分卷切分跟随源。改了边界，卷内容就变了，摘要对不上，秒传必然落空。
-//!   2. 源与目标的「是否加密」必须一致才能走原样搬运；一边加密一边明文时
-//!      内容天然不同，只能降级为解密 → 重加密的完整传输。
+//!   2. 源与目标的「是否加密」「是否伪装」必须一致才能走原样搬运；任一不同
+//!      时落地字节天然不同，只能降级为解密 → 重新编码的完整传输。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,12 +25,12 @@ use serde_json::json;
 
 use crate::adapters::{ContentHashes, RapidSource, Storage, hash_stream, sanitize};
 use crate::crypto::names::{NameMeta, decode_name, encode_name};
+use crate::disguise::Disguise;
 use crate::engine;
 use crate::error::{ApiError, ApiResult};
 use crate::routes::files::{
-    Located, PLAIN_VOLUME_SUFFIX, ensure_dir, ensure_plain_dir, join_enc, list_dir, locate_any,
-    mkdir_path, parent_and_name, plain_locate, resolve, resolve_root, stat_path, upload_file,
-    volume_names,
+    Located, ensure_dir, ensure_plain_dir, join_enc, list_dir, locate_any, mkdir_path,
+    parent_and_name, plain_locate, resolve, resolve_root, stat_path, upload_file,
 };
 use crate::state::AppState;
 use crate::vault::CachedNode;
@@ -99,7 +99,7 @@ pub(crate) struct CopyReport {
     pub(crate) rapid_bytes: u64,
     /// 真实经过 SafeDrive 的字节数。
     pub(crate) transferred_bytes: u64,
-    /// 因为源/目标加密设置不同而必须解密重加密的文件数。
+    /// 因为源/目标的加密或伪装设置不同而必须整条链路重新编码的文件数。
     pub(crate) reencrypted_files: u64,
     /// 解不开信封、跳过没复制的外来条目。
     pub(crate) skipped: Vec<String>,
@@ -276,13 +276,13 @@ async fn copy_object(
 struct RawPlan {
     /// 分卷所在的存储端目录（未分卷的明文文件即其父目录）。
     container: String,
+    /// 各分卷的名字与**存储侧**字节数（含伪装头部）—— 原样搬运声明给目标的
+    /// 就是这个长度，摘要也是按整个对象算的。
     volumes: Vec<(String, u64)>,
-    /// 明文逻辑总大小。
+    /// 明文逻辑总大小（不含伪装头部）。
     total: u64,
-    /// 加密文件的文件密钥；明文数据源为 None。
+    /// 受管文件的文件密钥；非受管数据源为 None。
     secret: Option<[u8; crate::crypto::SECRET_LEN]>,
-    /// 明文数据源：源文件是否用分卷容器承载。
-    plain_split: bool,
 }
 
 async fn plan_source(
@@ -291,61 +291,54 @@ async fn plan_source(
     ds: &str,
     path: &str,
 ) -> ApiResult<RawPlan> {
-    if state.datasource(ds)?.encryption_enabled {
+    let datasource = state.datasource(ds)?;
+    let disguise = Disguise::of(&datasource);
+    // 布局是明文坐标，搬运要的是存储侧长度：这里统一把伪装头部加回去。
+    let stored = |volumes: Vec<engine::VolumeMeta>| {
+        volumes
+            .into_iter()
+            .map(|volume| (volume.name, disguise.stored_len(volume.size)))
+            .collect::<Vec<_>>()
+    };
+    if datasource.managed() {
         let node = resolve(state, storage, ds, path).await?;
         if node.dir {
             return Err(ApiError::BadRequest(format!("{path} 是目录")));
         }
         let meta = decode_name(&node.parent_key, &node.nc)
             .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("无法解码 {path} 的密文名")))?;
-        // load_layout 会校验分卷号无空洞 —— 缺卷时宁可报错也不要复制出半个文件。
-        let layout = engine::load_layout(storage, &node.enc_path, &node.secret).await?;
-        if layout.total != meta.size {
-            return Err(ApiError::Upstream(format!(
-                "云端分卷总大小 {} 与记录 {} 不符（数据可能被外部修改）",
-                layout.total, meta.size
-            )));
-        }
+        let layout = engine::load_layout(
+            storage,
+            &node.enc_path,
+            engine::LeafNaming {
+                format: &datasource.leaf_name_format,
+                source: &meta.name,
+                pw: &node.secret,
+                disguise,
+            },
+        )
+        .await?;
+        // 缺卷时宁可报错，也不要复制出半个文件。
+        crate::routes::files::check_layout_total(&layout, meta.size, disguise)?;
         return Ok(RawPlan {
             container: node.enc_path,
-            volumes: layout
-                .volumes
-                .into_iter()
-                .map(|volume| (volume.name, volume.size))
-                .collect(),
+            volumes: stored(layout.volumes),
             total: layout.total,
             secret: Some(node.secret),
-            plain_split: false,
         });
     }
 
-    let (entry, actual, split) = plain_locate(storage, path).await?;
-    if split {
-        let layout = engine::load_layout_ordered(storage, &actual).await?;
-        Ok(RawPlan {
-            container: actual,
-            volumes: layout
-                .volumes
-                .into_iter()
-                .map(|volume| (volume.name, volume.size))
-                .collect(),
-            total: layout.total,
-            secret: None,
-            plain_split: true,
-        })
-    } else {
-        if entry.is_dir {
-            return Err(ApiError::BadRequest(format!("{path} 是目录")));
-        }
-        let (parent, name) = parent_and_name(&actual);
-        Ok(RawPlan {
-            container: parent.to_owned(),
-            volumes: vec![(name.to_owned(), entry.size)],
-            total: entry.size,
-            secret: None,
-            plain_split: false,
-        })
+    let (entry, actual) = plain_locate(storage, path).await?;
+    if entry.is_dir {
+        return Err(ApiError::BadRequest(format!("{path} 是目录")));
     }
+    let (parent, name) = parent_and_name(&actual);
+    Ok(RawPlan {
+        container: parent.to_owned(),
+        volumes: vec![(name.to_owned(), entry.size)],
+        total: entry.size,
+        secret: None,
+    })
 }
 
 /// 目标侧准备好容器与卷名，返回 (容器路径, 卷名, 失败时要清理的路径, 落缓存的回调)。
@@ -368,10 +361,10 @@ async fn plan_dest(
     let datasource = state.datasource(ds)?;
     let (parent, name) = parent_and_name(path);
 
-    if datasource.encryption_enabled {
+    if datasource.managed() {
         let secret = plan
             .secret
-            .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("加密目标缺少文件密钥")))?;
+            .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("受管目标缺少文件密钥")))?;
         let parent_node = if parent.is_empty() {
             resolve_root(state, ds)?
         } else {
@@ -390,9 +383,16 @@ async fn plan_dest(
         .ok_or_else(|| ApiError::BadRequest(format!("文件名过长: {name}")))?;
         let container = join_enc(&parent_node.enc_path, &nc);
         storage.mkdir(&container).await?;
+        // 切分跟随源，但叶子名按**目标**数据源的模版重排：`{e}` 由同一个文件
+        // 密钥派生所以与源同名（秒传前提不变），`{s}` 则跟随目标的新文件名。
         return Ok(DestPlan {
             container: container.clone(),
-            names: plan.volumes.iter().map(|(name, _)| name.clone()).collect(),
+            names: crate::naming::leaf_names(
+                &datasource.leaf_name_format,
+                name,
+                &secret,
+                plan.volumes.len(),
+            ),
             cleanup: Some(container),
             cache: Some(CachedNode {
                 secret,
@@ -402,25 +402,14 @@ async fn plan_dest(
         });
     }
 
+    // 非受管目标：一个文件一个明文名对象，不可能分卷（分卷即受管）。
     ensure_plain_dir(storage, parent).await?;
-    if plan.plain_split {
-        // 切分跟随源，但卷名按目标数据源的模板重排（明文卷名不参与内容）。
-        let container = join_enc(parent, &format!("{name}{PLAIN_VOLUME_SUFFIX}"));
-        storage.mkdir(&container).await?;
-        Ok(DestPlan {
-            container: container.clone(),
-            names: volume_names(&datasource.volume_name_format, name, plan.volumes.len()),
-            cleanup: Some(container),
-            cache: None,
-        })
-    } else {
-        Ok(DestPlan {
-            container: parent.to_owned(),
-            names: vec![name.to_owned()],
-            cleanup: Some(path.to_owned()),
-            cache: None,
-        })
-    }
+    Ok(DestPlan {
+        container: parent.to_owned(),
+        names: vec![name.to_owned()],
+        cleanup: Some(path.to_owned()),
+        cache: None,
+    })
 }
 
 /// 复制一个文件。加密设置一致时走原样搬运（可秒传），否则解密重加密。
@@ -435,11 +424,14 @@ async fn copy_file(
     hashes: &mut HashCache,
     progress: &Arc<engine::UploadProgress>,
 ) -> ApiResult<CopyReport> {
-    let src_encrypted = state.datasource(src_ds)?.encryption_enabled;
-    let dst_encrypted = state.datasource(dst_ds)?.encryption_enabled;
+    let src_cfg = state.datasource(src_ds)?;
+    let dst_cfg = state.datasource(dst_ds)?;
 
-    // 加密设置不一致：内容本身就不同，只能整条链路解密再重加密。
-    if src_encrypted != dst_encrypted {
+    // 加密或伪装设置不一致：落地字节本身就不同，只能整条链路解开再重新编码
+    //（解密 / 剥伪装 → 重加密 / 重套伪装）。
+    if src_cfg.encryption_enabled != dst_cfg.encryption_enabled
+        || Disguise::of(&src_cfg) != Disguise::of(&dst_cfg)
+    {
         let response = crate::routes::files::stream_file(
             state,
             src_ds,
@@ -559,7 +551,7 @@ async fn remove_existing(
     path: &str,
     overwrite: bool,
 ) -> ApiResult<()> {
-    if state.datasource(ds)?.encryption_enabled {
+    if state.datasource(ds)?.managed() {
         match resolve(state, storage, ds, path).await {
             Ok(node) => {
                 if !overwrite {
@@ -580,11 +572,11 @@ async fn remove_existing(
         return Ok(());
     }
     match plain_locate(storage, path).await {
-        Ok((entry, actual, split)) => {
+        Ok((entry, actual)) => {
             if !overwrite {
                 return Err(ApiError::BadRequest(format!("已存在同名条目: {path}")));
             }
-            if entry.is_dir && !split {
+            if entry.is_dir {
                 return Err(ApiError::BadRequest(format!("已存在同名目录: {path}")));
             }
             storage.delete(&actual).await?;
@@ -761,7 +753,7 @@ fn copy_node<'a>(
     })
 }
 
-/// 目标父目录的字面存储路径：受管数据源建/取加密目录返回其 enc_path，明文
+/// 目标父目录的字面存储路径：受管数据源建/取加密目录返回其 enc_path，非受管
 /// 数据源建普通目录返回明文路径本身（根为空串）。外来对象按字面名落进这里。
 async fn ensure_dest_parent_enc(
     state: &AppState,
@@ -772,7 +764,7 @@ async fn ensure_dest_parent_enc(
     if path.is_empty() {
         return Ok(String::new());
     }
-    if state.datasource(ds)?.encryption_enabled {
+    if state.datasource(ds)?.managed() {
         Ok(ensure_dir(state, storage, ds, path).await?.enc_path)
     } else {
         ensure_plain_dir(storage, path).await?;
@@ -780,9 +772,9 @@ async fn ensure_dest_parent_enc(
     }
 }
 
-/// 复制外来（明文）对象：源与目标都用**字面存储路径**，逐字节直传（能秒传
-/// 就秒传），落地仍是明文——在加密目标数据源里即「外来条目」。全程不碰任何
-/// 加解密，也不写信封缓存。
+/// 复制外来对象：源与目标都用**字面存储路径**，逐字节直传（能秒传就秒传），
+/// 落地仍是原样字节 —— 在受管目标数据源里即「外来条目」（解不开信封，读取
+/// 时既不解密也不脱伪装）。全程不碰加解密与伪装，也不写信封缓存。
 #[allow(clippy::too_many_arguments)]
 fn copy_foreign_node<'a>(
     state: &'a AppState,
@@ -879,7 +871,13 @@ mod tests {
     use crate::registry::DataSource;
     use crate::state::AppState;
 
-    fn datasource(id: &str, root: &str, encrypted: bool, split: bool) -> DataSource {
+    fn datasource(
+        id: &str,
+        root: &str,
+        encrypted: bool,
+        split: bool,
+        disguised: bool,
+    ) -> DataSource {
         DataSource {
             id: id.into(),
             name: id.into(),
@@ -888,7 +886,8 @@ mod tests {
             encryption_enabled: encrypted,
             // 两个数据源用**不同**根密码：目标信封必须用目标自己的 FK 重编，
             // 而卷内容仍然逐字节相同 —— 这正是保密钥复制要证明的事。
-            password: if encrypted {
+            // 受管（加密 / 分卷 / 伪装任一）都靠根密码派生信封密钥链。
+            password: if encrypted || split || disguised {
                 format!("pw-{id}")
             } else {
                 String::new()
@@ -897,7 +896,17 @@ mod tests {
             volume_enabled: split,
             volume_size: 64 * 1024,
             volume_strategy: "fixed".into(),
-            volume_name_format: "{s}_{i}.bin".into(),
+            leaf_name_format: crate::naming::default_format(
+                encrypted,
+                split,
+                if disguised {
+                    crate::disguise::Disguise::Bmp
+                } else {
+                    crate::disguise::Disguise::None
+                },
+            ),
+            disguise_enabled: disguised,
+            disguise_algorithm: "bmp".into(),
             cache_enabled: false,
             created_at: 1,
         }
@@ -905,14 +914,29 @@ mod tests {
 
     /// 两个 localfs 数据源 + 一个 AppState。
     fn setup(specs: &[(&str, bool, bool)]) -> (AppState, tempfile::TempDir) {
+        setup_disguised(
+            &specs
+                .iter()
+                .map(|(id, e, s)| (*id, *e, *s, false))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn setup_disguised(specs: &[(&str, bool, bool, bool)]) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new(dir.path().join("data"), None).unwrap();
-        for (id, encrypted, split) in specs {
+        for (id, encrypted, split, disguised) in specs {
             let root = dir.path().join(id);
             std::fs::create_dir_all(&root).unwrap();
             state
                 .registry
-                .create(datasource(id, root.to_str().unwrap(), *encrypted, *split))
+                .create(datasource(
+                    id,
+                    root.to_str().unwrap(),
+                    *encrypted,
+                    *split,
+                    *disguised,
+                ))
                 .unwrap();
         }
         (state, dir)
@@ -1047,7 +1071,8 @@ mod tests {
         out
     }
 
-    /// 明文 → 明文：分卷切分跟随源，卷名按目标模板重排。
+    /// 未加密分卷 → 未加密分卷：切分跟随源，叶子名按**目标**数据源的模版重排
+    /// （`{s}` 跟着目标的新文件名走）。分卷即受管，所以两边都是信封目录。
     #[tokio::test]
     async fn plain_split_copy_follows_source_layout() {
         let (state, dir) = setup(&[("src", false, true), ("dst", false, true)]);
@@ -1059,16 +1084,297 @@ mod tests {
             .unwrap();
         assert_eq!(report.transferred_volumes, 3);
         assert_eq!(read_back(&state, "dst", "sub/b.bin").await, data);
+        // 目标侧：sub/ 下一个信封目录，里面三个按目标模版命名的叶子。
+        let leaves = volume_files(&dir.path().join("dst"));
         assert_eq!(
-            tree(&dir.path().join("dst")),
-            vec![
-                "sub/".to_string(),
-                format!("sub/b.bin{PLAIN_VOLUME_SUFFIX}/"),
-                format!("sub/b.bin{PLAIN_VOLUME_SUFFIX}/b.bin_01.bin"),
-                format!("sub/b.bin{PLAIN_VOLUME_SUFFIX}/b.bin_02.bin"),
-                format!("sub/b.bin{PLAIN_VOLUME_SUFFIX}/b.bin_03.bin"),
-            ]
+            leaves
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b.bin.01", "b.bin.02", "b.bin.03"],
+            "叶子名用的是目标的新文件名"
         );
+    }
+
+    /// 明文 + 伪装 + 分卷：落地的每个卷都是「54 字节 BMP 头 + 数据」，但列目录
+    /// 报的是明文大小、流式下载逐字节一致。
+    #[tokio::test]
+    async fn plain_disguised_roundtrip_reports_logical_size() {
+        let (state, dir) = setup_disguised(&[("src", false, true, true)]);
+        let data = payload(150 * 1024);
+        put(&state, "src", "a.bin", &data).await;
+
+        let volumes = volume_files(&dir.path().join("src"));
+        assert_eq!(volumes.len(), 3);
+        let mut stored = 0usize;
+        for (name, bytes) in &volumes {
+            assert_eq!(&bytes[..2], b"BM", "{name} 应带 BMP 伪装头部");
+            stored += bytes.len();
+        }
+        assert_eq!(stored, data.len() + 3 * 54);
+
+        let storage = state.adapter("src").unwrap();
+        let entries = list_dir(&state, storage.as_ref(), "src", "").await.unwrap();
+        let entry = entries.iter().find(|e| e.name == "a.bin").unwrap();
+        assert_eq!(entry.size, data.len() as u64, "列目录报明文大小");
+        assert_eq!(read_back(&state, "src", "a.bin").await, data);
+    }
+
+    /// 加密 + 伪装且两端设置一致：仍是逐字节相同的原样搬运（秒传前提不变）。
+    #[tokio::test]
+    async fn disguised_copy_stays_verbatim_when_both_sides_match() {
+        let (state, dir) = setup_disguised(&[("src", true, true, true), ("dst", true, true, true)]);
+        let data = payload(150 * 1024);
+        put(&state, "src", "a.mkv", &data).await;
+
+        let report = copy_path(&state, "src", "a.mkv", "dst", "b.mkv", false, None)
+            .await
+            .unwrap();
+        assert_eq!(report.reencrypted_files, 0, "设置一致不该降级");
+        assert_eq!(report.transferred_volumes, 3);
+        assert_eq!(read_back(&state, "dst", "b.mkv").await, data);
+        assert_eq!(
+            volume_files(&dir.path().join("src")),
+            volume_files(&dir.path().join("dst")),
+            "卷名与卷内容（含伪装头部）必须逐字节相同"
+        );
+    }
+
+    /// 伪装设置不一致：落地字节天然不同，只能整条链路重新编码，两边各自自洽。
+    #[tokio::test]
+    async fn disguise_mismatch_falls_back_to_reencode() {
+        let (state, dir) =
+            setup_disguised(&[("src", true, true, true), ("dst", true, true, false)]);
+        let data = payload(80 * 1024);
+        put(&state, "src", "a.bin", &data).await;
+
+        let report = copy_path(&state, "src", "a.bin", "dst", "a.bin", false, None)
+            .await
+            .unwrap();
+        assert_eq!(report.reencrypted_files, 1);
+        assert_eq!(read_back(&state, "dst", "a.bin").await, data);
+        let src_stored: usize = volume_files(&dir.path().join("src"))
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .sum();
+        let dst_stored: usize = volume_files(&dir.path().join("dst"))
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .sum();
+        assert_eq!(src_stored, data.len() + 2 * 54, "源每卷带头部");
+        assert_eq!(dst_stored, data.len(), "目标没开伪装，落地不带头部");
+    }
+
+    /// 伪装数据源里的**外来对象**一个字节都不能动 —— 这是「用信封识别受管
+    /// 对象」的全部意义：外部上传的普通文件、甚至一张真的 BMP，都解不开信封，
+    /// 于是原样列出、原样读回，不会被误当成伪装对象砍掉头部。
+    #[tokio::test]
+    async fn foreign_objects_in_a_disguised_datasource_are_never_stripped() {
+        // 不加密、只伪装：即便如此也走受管信封（名字由根密码派生的链解开）。
+        let (state, dir) =
+            setup_disguised(&[("dis", false, true, true), ("plain", false, false, false)]);
+        let storage = state.adapter("dis").unwrap();
+
+        // 受管文件：正常往返。
+        let mine = payload(150 * 1024);
+        put(&state, "dis", "我的.bin", &mine).await;
+        assert_eq!(read_back(&state, "dis", "我的.bin").await, mine);
+
+        // 外部直接塞进存储根：一个普通文件 + 一张「真 BMP」（开头就是 BM）。
+        let bare = payload(3000);
+        let mut real_bmp = crate::disguise::Disguise::Bmp.header(600).to_vec();
+        real_bmp.extend_from_slice(&payload(600));
+        std::fs::write(dir.path().join("dis").join("外来.bin"), &bare).unwrap();
+        std::fs::write(dir.path().join("dis").join("图.bmp"), &real_bmp).unwrap();
+
+        let entries = list_dir(&state, storage.as_ref(), "dis", "").await.unwrap();
+        for (name, size) in [("外来.bin", bare.len()), ("图.bmp", real_bmp.len())] {
+            let entry = entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} 应被列出"));
+            assert!(entry.foreign, "{name} 解不开信封 → 外来条目");
+            assert_eq!(entry.size, size as u64, "{name} 报的是真实大小，不减头部");
+        }
+        // 受管文件仍以明文名与明文大小呈现。
+        let managed = entries.iter().find(|e| e.name == "我的.bin").unwrap();
+        assert!(!managed.foreign);
+        assert_eq!(managed.size, mine.len() as u64);
+
+        // 下载：外来对象逐字节原样，真 BMP 不会被砍掉 54 字节变成废文件。
+        assert_eq!(read_back(&state, "dis", "外来.bin").await, bare);
+        assert_eq!(read_back(&state, "dis", "图.bmp").await, real_bmp.clone());
+
+        // 复制到别的数据源：外来身份不变，字节不变。
+        copy_path(&state, "dis", "图.bmp", "plain", "图.bmp", false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("plain").join("图.bmp")).unwrap(),
+            real_bmp
+        );
+    }
+
+    /// 只伪装不加密：存储端是「信封目录 + 若干 BMP 头分卷」，内容是明文（没过
+    /// ChaCha20），明文视角的名字与大小都正常。
+    ///
+    /// 注意这个组合下**叶子名会带上原始文件名**（未加密的默认模版是
+    /// `{s}_{i}.bin`）—— 信封目录名藏住了它，但叶子没有。要连叶子也不泄露就得
+    /// 开加密（模版强制用 `{e}`），或自己写一个不含 `{s}` 的模版。
+    #[tokio::test]
+    async fn disguise_without_encryption_keeps_content_plain_inside_the_envelope() {
+        let (state, dir) = setup_disguised(&[("dis", false, true, true)]);
+        let data = payload(150 * 1024);
+        put(&state, "dis", "片子.mkv", &data).await;
+
+        // 信封目录名不含明文名；叶子名按默认模版带上明文名与等宽序号。
+        let items = tree(&dir.path().join("dis"));
+        let containers: Vec<&String> = items.iter().filter(|rel| rel.ends_with('/')).collect();
+        assert_eq!(containers.len(), 1, "{items:?}");
+        assert!(
+            !containers[0].contains("片子.mkv"),
+            "信封名不该暴露明文名: {}",
+            containers[0]
+        );
+        let volumes = volume_files(&dir.path().join("dis"));
+        assert_eq!(
+            volumes.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["片子.mkv.01.bmp", "片子.mkv.02.bmp", "片子.mkv.03.bmp"]
+        );
+        // 固定分卷 + 伪装：数据区上限是 64 KiB − 54（「最大分卷大小」约束的是
+        // 落地对象），所以切点在 65482 处。
+        let data_max = 64 * 1024 - 54;
+        let expected: Vec<&[u8]> = vec![
+            &data[..data_max],
+            &data[data_max..2 * data_max],
+            &data[2 * data_max..],
+        ];
+        let mut matched = vec![false; expected.len()];
+        for (name, bytes) in &volumes {
+            assert_eq!(&bytes[..2], b"BM", "{name}");
+            assert!(bytes.len() <= 64 * 1024, "{name}: 落地对象不得超过 64 KiB");
+            let region = &bytes[54..];
+            let index = expected
+                .iter()
+                .position(|slice| *slice == region)
+                .unwrap_or_else(|| {
+                    panic!("{name} 的数据区不是明文的任何一卷 —— 未加密时头部之后就该是明文")
+                });
+            assert!(!matched[index], "同一卷出现两次: {name}");
+            matched[index] = true;
+        }
+        assert!(matched.iter().all(|hit| *hit), "三卷都要对上");
+        assert_eq!(read_back(&state, "dis", "片子.mkv").await, data);
+    }
+
+    /// 三个开关的全部 8 种组合，各自在存储侧长什么样。这是落地格式的规格说明
+    /// （README「存储形态一览」那张表由它兜底），改动任何一条都会在这里立刻
+    /// 炸出来。
+    #[tokio::test]
+    async fn storage_shape_matrix_covers_every_switch_combination() {
+        const VOLUME: u64 = 64 * 1024;
+        let data = payload(150 * 1024); // 固定 64 KiB 分卷 → 恰好 3 卷
+        let head = &data[..16];
+
+        for enc in [false, true] {
+            for split in [false, true] {
+                for dis in [false, true] {
+                    let label = format!("加密={enc} 分卷={split} 伪装={dis}");
+                    let (state, dir) = setup_disguised(&[("ds", enc, split, dis)]);
+                    put(&state, "ds", "a.mkv", &data).await;
+                    let root = dir.path().join("ds");
+                    let items = tree(&root);
+                    let managed = enc || split || dis;
+                    let header = u64::from(dis) * 54;
+
+                    if !managed {
+                        // 三个开关全关是唯一的「裸文件」形态：存储端就是原文件。
+                        assert_eq!(items, vec!["a.mkv".to_string()], "{label}");
+                        assert_eq!(std::fs::read(root.join("a.mkv")).unwrap(), data, "{label}");
+                        assert_eq!(read_back(&state, "ds", "a.mkv").await, data, "{label}");
+                        continue;
+                    }
+
+                    // 其余七种都是「一个信封目录 + 若干叶子」。
+                    let dirs: Vec<&String> = items.iter().filter(|r| r.ends_with('/')).collect();
+                    assert_eq!(dirs.len(), 1, "{label}: 只应有一个信封目录 {items:?}");
+                    let container = dirs[0].trim_end_matches('/');
+                    assert!(
+                        !container.contains("a.mkv"),
+                        "{label}: 信封名不该暴露明文名（{container}）"
+                    );
+
+                    let leaves = volume_files(&root);
+                    // 「最大分卷大小」约束落地对象，所以伪装时数据区上限是
+                    // VOLUME-54，切出来的卷数与每卷大小都跟着变。
+                    let data_max = VOLUME - header;
+                    let expected: Vec<u64> = if split {
+                        let count = (data.len() as u64).div_ceil(data_max);
+                        (0..count)
+                            .map(|i| data_max.min(data.len() as u64 - i * data_max))
+                            .collect()
+                    } else {
+                        vec![data.len() as u64]
+                    };
+                    let mut sizes: Vec<u64> = leaves.iter().map(|(_, b)| b.len() as u64).collect();
+                    sizes.sort_unstable();
+                    let mut want: Vec<u64> = expected.iter().map(|size| size + header).collect();
+                    want.sort_unstable();
+                    assert_eq!(sizes, want, "{label}: 每卷 = 数据 + 伪装头部");
+                    if split {
+                        assert!(
+                            sizes.iter().all(|stored| *stored <= VOLUME),
+                            "{label}: 落地对象不得超过最大分卷大小 {VOLUME}"
+                        );
+                    }
+
+                    // 叶子名符合该组合的默认模版：加密用 {e}（十六进制），否则
+                    // 用明文名（分卷再带等宽序号）；伪装再加 .bmp 后缀。
+                    for (name, bytes) in &leaves {
+                        let stem = match name.strip_suffix(".bmp") {
+                            Some(stem) => {
+                                assert!(dis, "{label}: 没开伪装不该有 .bmp 后缀（{name}）");
+                                stem
+                            }
+                            None => {
+                                assert!(!dis, "{label}: 开了伪装该有 .bmp 后缀（{name}）");
+                                name.as_str()
+                            }
+                        };
+                        if enc {
+                            assert!(
+                                stem.len().is_multiple_of(2)
+                                    && stem.bytes().all(|b| b.is_ascii_hexdigit()),
+                                "{label}: 加密叶子名应是 {{e}} 展开的十六进制（{name}）"
+                            );
+                        } else if split {
+                            assert!(
+                                stem.starts_with("a.mkv.")
+                                    && stem[6..].bytes().all(|b| b.is_ascii_digit()),
+                                "{label}: 未加密分卷叶子名应是 {{s}}.{{i}}（{name}）"
+                            );
+                        } else {
+                            assert_eq!(stem, "a.mkv", "{label}: 未加密未分卷叶子名即 {{s}}");
+                        }
+                        if dis {
+                            assert_eq!(&bytes[..2], b"BM", "{label}: {name} 应带 BMP 头部");
+                        }
+                    }
+
+                    // 内容是否过 ChaCha20，只由「是否加密」决定。
+                    let plain_leaf = leaves
+                        .iter()
+                        .map(|(_, bytes)| &bytes[header as usize..])
+                        .any(|region| region.starts_with(head));
+                    assert_eq!(
+                        plain_leaf, !enc,
+                        "{label}: 未加密时头部之后就是明文，加密时不该出现明文"
+                    );
+
+                    assert_eq!(read_back(&state, "ds", "a.mkv").await, data, "{label}");
+                }
+            }
+        }
     }
 
     /// 加密 ↔ 明文：内容本身不同，只能解密重加密，报告里如实标注。

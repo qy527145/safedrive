@@ -174,6 +174,11 @@ impl ChunkPrp {
 
     /// 名字 → 卷序号。非法形状 / 反解出的序号不属于该宽度域 → None
     /// （外来文件或其他宽度域的名字）。
+    ///
+    /// 读路径不用它（叶子名靠 [`crate::naming`] 按模版生成候选再查表），它的
+    /// 意义是**证明 `name_of` 是双射** —— 由 `chunk_names_are_a_permutation`
+    /// 逐个反解验证，两个卷号绝不会撞到同一个名字。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn index_of(&self, name: &str) -> Option<usize> {
         let n = name.len();
         if n == 0 || !n.is_multiple_of(2) || n > 16 {
@@ -200,12 +205,6 @@ pub fn chunk_count(size: u64, volume_size: u64) -> usize {
     } else {
         size.div_ceil(volume_size) as usize
     }
-}
-
-/// 前 count 个分卷名（索引 i 即第 i 卷）。
-pub fn gen_chunk_names(pw: &[u8], count: usize) -> Vec<String> {
-    let prp = ChunkPrp::new(pw);
-    (0..count).map(|i| prp.name_of(i)).collect()
 }
 
 #[cfg(test)]
@@ -316,12 +315,12 @@ mod tests {
         let _ = prp.index_of(&format!("{short_idx}{short_idx}")); // 不 panic 即可
 
         // 不同密码 → 不同置换
-        assert_ne!(gen_chunk_names(&gen_secret(), 10), gen_chunk_names(&pw, 10));
-        // gen_chunk_names 与逐个 name_of 一致
-        assert_eq!(
-            gen_chunk_names(&pw, 5),
-            (0..5).map(|i| prp.name_of(i)).collect::<Vec<_>>()
-        );
+        let names = |pw: &[u8]| {
+            (0..10)
+                .map(|i| ChunkPrp::new(pw).name_of(i))
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(names(&gen_secret()), names(&pw));
     }
 
     #[test]

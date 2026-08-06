@@ -38,8 +38,12 @@ struct DsBody {
     volume_size: Option<u64>,
     #[serde(default)]
     volume_strategy: Option<String>,
+    #[serde(default, alias = "volumeNameFormat")]
+    leaf_name_format: Option<String>,
     #[serde(default)]
-    volume_name_format: Option<String>,
+    disguise_enabled: Option<bool>,
+    #[serde(default)]
+    disguise_algorithm: Option<String>,
     #[serde(default)]
     cache_enabled: Option<bool>,
 }
@@ -77,16 +81,7 @@ fn validate(body: &DsBody) -> ApiResult<()> {
                 .get("bduss")
                 .and_then(|value| value.as_str())
                 .is_some_and(|value| !value.trim().is_empty());
-            let legacy_cookie_has_bduss = body
-                .config
-                .get("cookie")
-                .and_then(|value| value.as_str())
-                .is_some_and(|cookie| {
-                    cookie
-                        .split(';')
-                        .any(|part| part.trim().starts_with("BDUSS="))
-                });
-            if !has_bduss && !legacy_cookie_has_bduss {
+            if !has_bduss {
                 return Err(ApiError::BadRequest("百度网盘需要 BDUSS".into()));
             }
             let text = config_text(body);
@@ -176,10 +171,21 @@ fn check_api_base(base: &str, what: &str) -> ApiResult<()> {
     Ok(())
 }
 
-fn mapping_config(
-    body: &DsBody,
-    old: Option<&DataSource>,
-) -> ApiResult<(bool, String, bool, u64, String, String, bool)> {
+/// 数据源里与连接无关的那部分配置（加密 / 分卷 / 伪装 / 缓存）。
+/// 字段名与 `DataSource` 一致，便于直接展开。
+struct Options {
+    encryption_enabled: bool,
+    password: String,
+    volume_enabled: bool,
+    volume_size: u64,
+    volume_strategy: String,
+    leaf_name_format: String,
+    disguise_enabled: bool,
+    disguise_algorithm: String,
+    cache_enabled: bool,
+}
+
+fn mapping_config(body: &DsBody, old: Option<&DataSource>) -> ApiResult<Options> {
     let encrypted = body
         .encryption_enabled
         .or_else(|| old.map(|d| d.encryption_enabled))
@@ -205,17 +211,42 @@ fn mapping_config(
         .clone()
         .or_else(|| old.map(|d| d.volume_strategy.clone()))
         .unwrap_or_else(|| "random".into());
-    let format = body
-        .volume_name_format
-        .clone()
-        .or_else(|| old.map(|d| d.volume_name_format.clone()))
-        .unwrap_or_else(|| "{s}_{i}.bin".into());
+    let disguise_enabled = body
+        .disguise_enabled
+        .or_else(|| old.map(|d| d.disguise_enabled))
+        .unwrap_or(false);
+    let disguise_algorithm = body
+        .disguise_algorithm
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .or_else(|| old.map(|d| d.disguise_algorithm.clone()))
+        .unwrap_or_else(|| crate::disguise::DEFAULT_ALGORITHM.into());
     let cache = body
         .cache_enabled
         .or_else(|| old.map(|d| d.cache_enabled))
         .unwrap_or(true);
-    if encrypted && password.is_empty() {
-        return Err(ApiError::BadRequest("启用加密时密码不能为空".into()));
+    if disguise_enabled && crate::disguise::Disguise::from_algorithm(&disguise_algorithm).is_none()
+    {
+        return Err(ApiError::BadRequest(format!(
+            "不支持的伪装算法: {disguise_algorithm}（目前支持 {}）",
+            crate::disguise::ALGORITHMS.join(" / ")
+        )));
+    }
+    let disguise = if disguise_enabled {
+        crate::disguise::Disguise::from_algorithm(&disguise_algorithm).unwrap_or_default()
+    } else {
+        crate::disguise::Disguise::None
+    };
+
+    // 加密 / 分卷 / 伪装任一开启即「受管」：文件落进一个信封目录，目录名由根
+    // 密码派生的密钥链加密 —— 所以三者都吃根密码。
+    let managed = encrypted || volume_enabled || disguise_enabled;
+    if managed && password.is_empty() {
+        return Err(ApiError::BadRequest(
+            "启用加密、分卷或伪装时根密码不能为空".into(),
+        ));
     }
     if volume_enabled {
         if volume_size < crate::registry::MIN_VOLUME_SIZE {
@@ -226,25 +257,48 @@ fn mapping_config(
                 "分卷策略只能是 fixed 或 random".into(),
             ));
         }
-        if !encrypted {
-            if !format.contains("{i}") {
-                return Err(ApiError::BadRequest("分卷名称格式必须包含 {i}".into()));
-            }
-            let sample = format.replace("{s}", "sample").replace("{i}", "0001");
-            if sample.contains('/') || sample.contains('\\') || sample == "." || sample == ".." {
-                return Err(ApiError::BadRequest("分卷名称格式包含非法路径字符".into()));
-            }
-        }
     }
-    Ok((
-        encrypted,
-        if encrypted { password } else { String::new() },
+
+    // 叶子名模版：只有受管数据源有叶子可命名，非受管的归一到默认值。
+    let default_format = crate::naming::default_format(encrypted, volume_enabled, disguise);
+    let leaf_name_format = if managed {
+        let format = body
+            .leaf_name_format
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| old.map(|d| d.leaf_name_format.clone()))
+            .unwrap_or(default_format);
+        crate::naming::validate_format(&format, encrypted, volume_enabled)
+            .map_err(ApiError::BadRequest)?;
+        format
+    } else {
+        // 非受管数据源没有信封、也没有叶子可命名。显式塞了模版说明调用方
+        // 搞错了对象，明说比悄悄丢掉好（前端在这种组合下不会显示该输入）。
+        if body
+            .leaf_name_format
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(ApiError::BadRequest(
+                "未启用加密、分卷或伪装时没有叶子对象可命名，不能设置叶子文件名模版".into(),
+            ));
+        }
+        default_format
+    };
+
+    Ok(Options {
+        encryption_enabled: encrypted,
+        password: if managed { password } else { String::new() },
         volume_enabled,
         volume_size,
-        strategy,
-        format,
-        cache,
-    ))
+        volume_strategy: strategy,
+        leaf_name_format,
+        disguise_enabled,
+        disguise_algorithm,
+        cache_enabled: cache,
+    })
 }
 
 async fn list(State(state): State<AppState>) -> Json<Vec<DataSource>> {
@@ -256,15 +310,17 @@ async fn create(
     Json(body): Json<DsBody>,
 ) -> ApiResult<Json<DataSource>> {
     validate(&body)?;
-    let (
+    let Options {
         encryption_enabled,
         password,
         volume_enabled,
         volume_size,
         volume_strategy,
-        volume_name_format,
+        leaf_name_format,
+        disguise_enabled,
+        disguise_algorithm,
         cache_enabled,
-    ) = mapping_config(&body, None)?;
+    } = mapping_config(&body, None)?;
     let ds = DataSource {
         id: uuid::Uuid::new_v4().to_string(),
         name: body.name,
@@ -276,7 +332,9 @@ async fn create(
         volume_enabled,
         volume_size,
         volume_strategy,
-        volume_name_format,
+        leaf_name_format,
+        disguise_enabled,
+        disguise_algorithm,
         cache_enabled,
         created_at: now_ms(),
     };
@@ -293,15 +351,17 @@ async fn update(
         .registry
         .get(&id)
         .ok_or_else(|| ApiError::NotFound(format!("数据源不存在: {id}")))?;
-    let (
+    let Options {
         encryption_enabled,
         password,
         volume_enabled,
         volume_size,
         volume_strategy,
-        volume_name_format,
+        leaf_name_format,
+        disguise_enabled,
+        disguise_algorithm,
         cache_enabled,
-    ) = mapping_config(&body, Some(&old))?;
+    } = mapping_config(&body, Some(&old))?;
     if encryption_enabled != old.encryption_enabled {
         return Err(ApiError::BadRequest(
             "加密模式在数据源创建后不可更改；请新建数据源进行迁移".into(),
@@ -312,10 +372,28 @@ async fn update(
             "分卷模式在数据源创建后不可更改；可调整最大分卷大小和分卷策略".into(),
         ));
     }
+    // 伪装改变落地字节（头部长度、头部内容都跟着算法走），翻转或换算法都会
+    // 让已经写下去的对象读不回来。
+    if disguise_enabled != old.disguise_enabled {
+        return Err(ApiError::BadRequest(
+            "伪装模式在数据源创建后不可更改；请新建数据源进行迁移".into(),
+        ));
+    }
+    if disguise_enabled && disguise_algorithm != old.disguise_algorithm {
+        return Err(ApiError::BadRequest(
+            "伪装算法在数据源创建后不可更改；请新建数据源进行迁移".into(),
+        ));
+    }
+    // 读取靠按模版生成候选名再查表，改了模版已经写下去的叶子就再也认不出来。
+    if leaf_name_format != old.leaf_name_format {
+        return Err(ApiError::BadRequest(
+            "叶子文件名模版在数据源创建后不可更改；请新建数据源进行迁移".into(),
+        ));
+    }
     if body.ds_type != old.ds_type {
         return Err(ApiError::BadRequest("数据源类型创建后不可更改".into()));
     }
-    if old.encryption_enabled && (password != old.password || old.prev_password.is_some()) {
+    if old.managed() && (password != old.password || old.prev_password.is_some()) {
         // 先持久化过渡密码，迁移中断时读路径仍可用旧密码。
         let previous = if password == old.password {
             old.prev_password.clone().expect("已检查存在过渡密码")
@@ -354,7 +432,9 @@ async fn update(
         volume_enabled,
         volume_size,
         volume_strategy,
-        volume_name_format,
+        leaf_name_format,
+        disguise_enabled,
+        disguise_algorithm,
         cache_enabled,
         created_at: old.created_at,
     };
@@ -466,7 +546,9 @@ async fn share(
         volume_enabled: ds.volume_enabled,
         volume_size: ds.volume_size,
         volume_strategy: ds.volume_strategy,
-        volume_name_format: ds.volume_name_format,
+        leaf_name_format: ds.leaf_name_format,
+        disguise_enabled: ds.disguise_enabled,
+        disguise_algorithm: ds.disguise_algorithm,
         cache_enabled: ds.cache_enabled,
     };
     let link =
@@ -499,11 +581,13 @@ async fn import(
         ds_type: pack.ds_type,
         config: pack.config,
         encryption_enabled: Some(pack.encryption_enabled),
-        password: pack.encryption_enabled.then_some(pack.password),
+        password: (pack.encryption_enabled || pack.disguise_enabled).then_some(pack.password),
         volume_enabled: Some(pack.volume_enabled),
         volume_size: Some(pack.volume_size),
         volume_strategy: Some(pack.volume_strategy),
-        volume_name_format: Some(pack.volume_name_format),
+        leaf_name_format: Some(pack.leaf_name_format),
+        disguise_enabled: Some(pack.disguise_enabled),
+        disguise_algorithm: Some(pack.disguise_algorithm),
         cache_enabled: Some(pack.cache_enabled),
     };
     create(State(state), Json(body)).await
@@ -708,6 +792,188 @@ mod tests {
             assert_eq!(status, 200, "{ds_type} {created}");
             assert_eq!(created["type"], ds_type);
         }
+    }
+
+    /// 伪装也吃根密码：信封名由它派生，没有它就无从判断一个存储对象到底是不是
+    /// SafeDrive 写的。未提供时服务端自动生成一个，并如实回给管理端。
+    #[tokio::test]
+    async fn disguise_gets_a_root_password_even_without_encryption() {
+        let (_state, app, dir) = setup();
+        let root = dir.path().join("cloud");
+        let (status, created) = send(
+            &app,
+            "POST",
+            "/api/ds",
+            Some(serde_json::json!({
+                "name": "只伪装", "type": "localfs",
+                "config": { "root": root.to_str().unwrap() },
+                "encryptionEnabled": false, "volumeEnabled": false, "cacheEnabled": false,
+                "disguiseEnabled": true,
+            })),
+        )
+        .await;
+        assert_eq!(status, 200, "{created}");
+        assert_eq!(created["encryptionEnabled"], false);
+        assert_eq!(created["disguiseEnabled"], true);
+        assert_eq!(created["disguiseAlgorithm"], "bmp");
+        assert!(
+            !created["password"].as_str().unwrap_or_default().is_empty(),
+            "受管数据源必须有根密码: {created}"
+        );
+
+        // 既不加密也不伪装 → 不需要根密码，保持空串。
+        let plain = dir.path().join("plain");
+        let (status, created) = send(
+            &app,
+            "POST",
+            "/api/ds",
+            Some(serde_json::json!({
+                "name": "纯明文", "type": "localfs",
+                "config": { "root": plain.to_str().unwrap() },
+                "encryptionEnabled": false, "volumeEnabled": false, "cacheEnabled": false,
+                "disguiseEnabled": false,
+            })),
+        )
+        .await;
+        assert_eq!(status, 200, "{created}");
+        assert_eq!(created["password"], "");
+    }
+
+    /// 统一命名策略的六条规则，逐条钉在接口层。
+    #[tokio::test]
+    async fn leaf_name_template_rules_are_enforced() {
+        let (_state, app, dir) = setup();
+        let create = |name: &str, enc: bool, vol: bool, dis: bool, format: Option<&str>| {
+            let root = dir.path().join(name);
+            let mut body = serde_json::json!({
+                "name": name, "type": "localfs",
+                "config": { "root": root.to_str().unwrap() },
+                "encryptionEnabled": enc, "volumeEnabled": vol, "disguiseEnabled": dis,
+                "cacheEnabled": false,
+            });
+            if let Some(format) = format {
+                body["leafNameFormat"] = format.into();
+            }
+            body
+        };
+
+        // 规则 1 + 3 + 5：受管数据源自动拿到根密码，模版按开关取默认值，
+        // 开了 BMP 伪装则在默认模版尾部加 .bmp。
+        for (label, enc, vol, dis, want) in [
+            ("加密", true, false, false, "{e}"),
+            ("加密分卷", true, true, false, "{e}"),
+            ("分卷", false, true, false, "{s}.{i}"),
+            ("伪装", false, false, true, "{s}.bmp"),
+            ("分卷伪装", false, true, true, "{s}.{i}.bmp"),
+            ("加密分卷伪装", true, true, true, "{e}.bmp"),
+        ] {
+            let (status, created) = send(
+                &app,
+                "POST",
+                "/api/ds",
+                Some(create(label, enc, vol, dis, None)),
+            )
+            .await;
+            assert_eq!(status, 200, "{label}: {created}");
+            assert_eq!(created["leafNameFormat"], want, "{label} 的默认模版");
+            assert!(
+                !created["password"].as_str().unwrap_or_default().is_empty(),
+                "{label}: 受管数据源必须有根密码"
+            );
+        }
+
+        // 三个开关全关 → 非受管：没有信封、没有叶子、不需要根密码。
+        let (status, created) = send(
+            &app,
+            "POST",
+            "/api/ds",
+            Some(create("裸文件", false, false, false, None)),
+        )
+        .await;
+        assert_eq!(status, 200, "{created}");
+        assert_eq!(created["password"], "");
+
+        // 规则 2 + 3 + 4：占位符的可用性与必填性。
+        for (label, enc, vol, format, expect) in [
+            ("加密缺 {e}", true, true, "{s}_{i}.bin", "必须包含 {e}"),
+            ("未加密用 {e}", false, true, "{e}_{i}", "只在启用加密时可用"),
+            ("未加密分卷缺 {i}", false, true, "{s}.bin", "必须包含 {i}"),
+            (
+                "加密未分卷用 {i}",
+                true,
+                false,
+                "{e}_{i}",
+                "只在启用分卷时可用",
+            ),
+            ("未知占位符", true, true, "{q}{e}", "无法识别"),
+            ("越界路径", true, true, "../{e}", "非法路径"),
+        ] {
+            let (status, resp) = send(
+                &app,
+                "POST",
+                "/api/ds",
+                Some(create(label, enc, vol, false, Some(format))),
+            )
+            .await;
+            assert_eq!(status, 400, "{label} 应被拒绝: {resp}");
+            let message = resp["error"].as_str().unwrap_or_default();
+            assert!(message.contains(expect), "{label} → {message}");
+        }
+
+        // 非受管数据源没有叶子可命名：显式给模版直接报错，而不是悄悄丢掉。
+        let (status, resp) = send(
+            &app,
+            "POST",
+            "/api/ds",
+            Some(create("裸文件带模版", false, false, false, Some("{s}.dat"))),
+        )
+        .await;
+        assert_eq!(status, 400, "{resp}");
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("没有叶子对象可命名"),
+            "{resp}"
+        );
+
+        // {s} 任何时候都可用；加密时 {i} 可省也可带。
+        for (label, enc, vol, format) in [
+            ("加密带 {s}", true, true, "{s}-{e}"),
+            ("加密带 {i}", true, true, "{e}_{i}.dat"),
+            ("未加密分卷", false, true, "{s}-第{i}卷.dat"),
+        ] {
+            let (status, created) = send(
+                &app,
+                "POST",
+                "/api/ds",
+                Some(create(label, enc, vol, false, Some(format))),
+            )
+            .await;
+            assert_eq!(status, 200, "{label}: {created}");
+            assert_eq!(created["leafNameFormat"], format);
+        }
+
+        // 模版创建后不可更改（读取靠按模版生成候选名再查表）。
+        let (_, created) = send(
+            &app,
+            "POST",
+            "/api/ds",
+            Some(create("锁定", true, true, false, Some("{e}"))),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap();
+        let mut update = create("锁定", true, true, false, Some("{e}_{i}"));
+        update["password"] = created["password"].clone();
+        let (status, resp) = send(&app, "PUT", &format!("/api/ds/{id}"), Some(update)).await;
+        assert_eq!(status, 400, "{resp}");
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("模版在数据源创建后不可更改"),
+            "{resp}"
+        );
     }
 
     #[tokio::test]

@@ -1022,11 +1022,7 @@ impl Storage for QuarkFs {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map_or(passcode, str::to_owned);
-        Ok(CloudShare {
-            url,
-            password,
-            quick: false,
-        })
+        Ok(CloudShare { url, password })
     }
 
     async fn import_share(&self, share: &CloudShare, dest: &str) -> ApiResult<Vec<ImportedEntry>> {
@@ -1398,7 +1394,6 @@ mod tests {
                 &CloudShare {
                     url: "https://pan.quark.cn/s/PWDID".into(),
                     password: "ab12".into(),
-                    quick: false,
                 },
                 "",
             )

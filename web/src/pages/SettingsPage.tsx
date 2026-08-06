@@ -1,4 +1,4 @@
-import { App, Button, Card, Checkbox, Form, Input, InputNumber, Space, Statistic, Switch, Typography } from 'antd';
+import { App, Button, Card, Form, Input, InputNumber, Space, Statistic, Switch, Typography } from 'antd';
 import { useEffect, useState } from 'react';
 import { api, type CacheStats, type TransferSettings } from '../api/client';
 import { formatBytes, parseSize, sizeToInput } from '../utils/format';
@@ -121,8 +121,13 @@ export default function SettingsPage() {
           >
             <InputNumber min={1} max={64} style={{ width: '100%' }} />
           </Form.Item>
-          <Form.Item name="cacheEnabled" valuePropName="checked">
-            <Checkbox>启用全局持久密文块缓存</Checkbox>
+          <Form.Item
+            name="cacheEnabled"
+            label="全局持久密文块缓存"
+            valuePropName="checked"
+            tooltip="总开关：关闭后所有数据源都不再写本地缓存（各数据源自己的缓存开关只在它开启时生效）。缓存的是云端密文，按 1 MiB 完整块落盘。"
+          >
+            <Switch />
           </Form.Item>
           <Button type="primary" loading={saving} onClick={() => void saveSettings()}>
             保存

@@ -539,7 +539,9 @@ mod tests {
             volume_enabled: encrypted,
             volume_size: 64 * 1024,
             volume_strategy: "fixed".into(),
-            volume_name_format: "{s}_{i}.bin".into(),
+            leaf_name_format: "{e}".into(),
+            disguise_enabled: false,
+            disguise_algorithm: "bmp".into(),
             cache_enabled: false,
             created_at: 1,
         }

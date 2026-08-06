@@ -21,7 +21,7 @@ export function describeCopy(report: CopyReport): string {
   if (report.rapidVolumes) parts.push(`秒传 ${report.rapidVolumes} 卷 ${formatBytes(report.rapidBytes)}`);
   if (report.transferredVolumes)
     parts.push(`实传 ${report.transferredVolumes} 卷 ${formatBytes(report.transferredBytes)}`);
-  if (report.reencryptedFiles) parts.push(`重加密 ${report.reencryptedFiles} 个文件`);
+  if (report.reencryptedFiles) parts.push(`重新编码 ${report.reencryptedFiles} 个文件`);
   if (report.skipped.length) parts.push(`跳过 ${report.skipped.length} 项`);
   return parts.join(' · ');
 }

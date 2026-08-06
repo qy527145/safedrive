@@ -416,13 +416,6 @@ impl BaiduPanFs {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
-            .or_else(|| {
-                config
-                    .get("cookie")
-                    .and_then(Value::as_str)
-                    .and_then(|cookie| cookie_value(cookie, "BDUSS"))
-                    .map(str::to_owned)
-            })
             .ok_or_else(|| ApiError::BadRequest("百度网盘配置缺少 BDUSS".into()))?;
         let download_cookie = HeaderValue::from_str(&format!("BDUSS={bduss}"))
             .map_err(|_| ApiError::BadRequest("百度网盘 BDUSS 含非法字符".into()))?;
@@ -435,12 +428,7 @@ impl BaiduPanFs {
                 .unwrap_or(DEFAULT_DOWNLOAD_UA),
         )
         .map_err(|_| ApiError::BadRequest("百度网盘下载 User-Agent 含非法字符".into()))?;
-        let root = normalize_root(
-            config
-                .get("root")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-        )?;
+        let root = normalize_root(config.get("root").and_then(Value::as_str).unwrap_or(""))?;
         let parse_url = |field: &str, default: &str| -> ApiResult<Url> {
             let url = Url::parse(config.get(field).and_then(Value::as_str).unwrap_or(default))
                 .map_err(|e| ApiError::BadRequest(format!("百度网盘 {field} 无效: {e}")))?;
@@ -1936,7 +1924,6 @@ impl Storage for BaiduPanFs {
         Ok(CloudShare {
             url: url.to_owned(),
             password,
-            quick: false,
         })
     }
 
@@ -2180,13 +2167,6 @@ impl Storage for BaiduPanFs {
     ) -> ApiResult<()> {
         self.upload_sized(path, size, body, progress).await
     }
-}
-
-fn cookie_value<'a>(cookies: &'a str, name: &str) -> Option<&'a str> {
-    cookies.split(';').find_map(|part| {
-        let (key, value) = part.trim().split_once('=')?;
-        (key == name && !value.is_empty()).then_some(value)
-    })
 }
 
 // ---------------- 排查日志辅助 ----------------
@@ -3161,7 +3141,6 @@ mod tests {
                 &CloudShare {
                     url: format!("{base}/s/1qym_MmGtZhFrTpKqf_H0oQ"),
                     password: "8888".into(),
-                    quick: false,
                 },
                 "asd",
             )

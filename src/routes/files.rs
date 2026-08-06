@@ -4,6 +4,10 @@
 //! 用父目录 FK 派生的密钥加密。路径解析 = 从数据源根钥逐层 list + 解名
 //! 下钻；服务端用纯内存缓存加速（云端为准，miss 按需重建）。
 //! 云端数据 + 根钥 = 完整可恢复，没有「先记密码本再传字节」的顺序问题。
+//!
+//! 走不走信封由 `DataSource::managed()` 决定 —— 加密和伪装都要。信封同时
+//! 是「这个存储对象是不是 SafeDrive 写的」的判据：解得开就按受管条目处理
+//! （该解密解密、该脱伪装脱伪装），解不开就是外来对象，一个字节都不动。
 
 use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
@@ -21,25 +25,30 @@ use std::sync::Arc;
 
 use crate::adapters::sanitize;
 use crate::crypto::names::{NameMeta, decode_name, encode_name};
-use crate::crypto::{SECRET_LEN, gen_chunk_names, gen_secret};
+use crate::crypto::{SECRET_LEN, gen_secret};
+use crate::disguise::Disguise;
 use crate::engine::{self, RangeSpec, StreamMode, StreamParams};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::vault::CachedNode;
 
-pub(crate) const PLAIN_VOLUME_SUFFIX: &str = ".__safedrive_volumes__";
-
 pub(crate) fn parent_and_name(path: &str) -> (&str, &str) {
     path.rsplit_once('/').unwrap_or(("", path))
 }
 
-fn volume_plan(total: u64, enabled: bool, max: u64, strategy: &str) -> Vec<u64> {
+/// 把 `total` 字节明文切成若干卷，每卷**落地之后**都不超过 `max`。
+///
+/// `max` 是用户配置的「最大分卷大小」，它约束的是**实际存储对象**：伪装会给
+/// 每个对象额外套一层 `header` 字节的头部，所以数据区的上限是 `max - header`。
+fn volume_plan(total: u64, enabled: bool, max: u64, header: u64, strategy: &str) -> Vec<u64> {
     if total == 0 {
         return Vec::new();
     }
     if !enabled {
         return vec![total];
     }
+    // 头部也算在「最大分卷大小」里 —— 那是对落地对象的硬限制。
+    let max = max.saturating_sub(header).max(1);
     let count = total.div_ceil(max) as usize;
     if strategy != "random" || count <= 1 {
         return (0..count)
@@ -64,34 +73,19 @@ fn volume_plan(total: u64, enabled: bool, max: u64, strategy: &str) -> Vec<u64> 
     (0..count).map(|i| max - (cuts[i + 1] - cuts[i])).collect()
 }
 
-pub(crate) fn volume_names(format: &str, source: &str, count: usize) -> Vec<String> {
-    let width = count.max(1).to_string().len().max(2);
-    (0..count)
-        .map(|i| {
-            format
-                .replace("{s}", source)
-                .replace("{i}", &format!("{:0width$}", i + 1, width = width))
-        })
-        .collect()
-}
-
+/// 非受管数据源里定位一个字面对象：存储端就是明文原样，一个文件就是一个对象。
 pub(crate) async fn plain_locate(
     storage: &dyn crate::adapters::Storage,
     path: &str,
-) -> ApiResult<(crate::adapters::Entry, String, bool)> {
+) -> ApiResult<(crate::adapters::Entry, String)> {
     let (parent, name) = parent_and_name(path);
-    let entries = storage.list(parent).await?;
-    if let Some(e) = entries.iter().find(|e| e.name == name) {
-        return Ok((e.clone(), path.to_string(), false));
-    }
-    let container = format!("{name}{PLAIN_VOLUME_SUFFIX}");
-    if let Some(e) = entries
+    storage
+        .list(parent)
+        .await?
         .into_iter()
-        .find(|e| e.is_dir && e.name == container)
-    {
-        return Ok((e, join_enc(parent, &container), true));
-    }
-    Err(ApiError::NotFound(format!("路径不存在: {path}")))
+        .find(|e| e.name == name)
+        .map(|e| (e, path.to_string()))
+        .ok_or_else(|| ApiError::NotFound(format!("路径不存在: {path}")))
 }
 
 pub(crate) async fn ensure_plain_dir(
@@ -105,7 +99,7 @@ pub(crate) async fn ensure_plain_dir(
     for seg in path.split('/') {
         let next = join_enc(&current, seg);
         match plain_locate(storage, &next).await {
-            Ok((e, _, false)) if e.is_dir => {}
+            Ok((e, _)) if e.is_dir => {}
             Ok(_) => return Err(ApiError::BadRequest(format!("{next} 已存在且不是目录"))),
             Err(ApiError::NotFound(_)) => storage.mkdir(&next).await?,
             Err(e) => return Err(e),
@@ -504,41 +498,22 @@ pub(crate) async fn list_dir(
     ds: &str,
     path: &str,
 ) -> ApiResult<Vec<ListedEntry>> {
-    let mut entries = if !state.datasource(ds)?.encryption_enabled {
-        let raw = storage.list(path).await?;
-        let mut out = Vec::with_capacity(raw.len());
-        for e in raw {
-            if e.is_dir && e.name.ends_with(PLAIN_VOLUME_SUFFIX) {
-                let name = e.name.trim_end_matches(PLAIN_VOLUME_SUFFIX).to_string();
-                let folder = join_enc(path, &e.name);
-                let size = storage
-                    .list(&folder)
-                    .await?
-                    .into_iter()
-                    .filter(|v| !v.is_dir)
-                    .map(|v| v.size)
-                    .sum::<u64>();
-                out.push(ListedEntry {
-                    name,
-                    is_dir: false,
-                    size,
-                    mtime: e.mtime,
-                    foreign: false,
-                    identity: Some(folder),
-                });
-            } else {
-                let identity = (!e.is_dir).then(|| join_enc(path, &e.name));
-                out.push(ListedEntry {
-                    name: e.name,
-                    is_dir: e.is_dir,
-                    size: e.size,
-                    mtime: e.mtime,
-                    foreign: false,
-                    identity,
-                });
-            }
-        }
-        out
+    let mut entries = if !state.datasource(ds)?.managed() {
+        // 非受管数据源（加密 / 分卷 / 伪装全关）：存储端就是明文原样，一个
+        // 文件一个对象，名字与大小直接取用。
+        storage
+            .list(path)
+            .await?
+            .into_iter()
+            .map(|e| ListedEntry {
+                identity: (!e.is_dir).then(|| join_enc(path, &e.name)),
+                name: e.name,
+                is_dir: e.is_dir,
+                size: e.size,
+                mtime: e.mtime,
+                foreign: false,
+            })
+            .collect()
     } else {
         let node = match locate_any(state, storage, ds, path).await? {
             Located::Managed(node) => {
@@ -756,7 +731,7 @@ pub(crate) async fn mkdir_path(
     ds: &str,
     path: &str,
 ) -> ApiResult<()> {
-    if !state.datasource(ds)?.encryption_enabled {
+    if !state.datasource(ds)?.managed() {
         ensure_plain_dir(storage, path).await
     } else {
         ensure_dir(state, storage, ds, path).await.map(|_| ())
@@ -872,42 +847,18 @@ pub(crate) async fn rename_path(
     if to == from || to.starts_with(&format!("{from}/")) {
         return Err(ApiError::BadRequest("不能移动到自身或其子目录".into()));
     }
-    if !state.datasource(ds)?.encryption_enabled {
-        let (_, actual_from, split) = plain_locate(storage, from).await?;
-        let (to_parent, to_name) = parent_and_name(to);
+    if !state.datasource(ds)?.managed() {
+        let (_, actual_from) = plain_locate(storage, from).await?;
+        let (to_parent, _) = parent_and_name(to);
         ensure_plain_dir(storage, to_parent).await?;
         if plain_locate(storage, to).await.is_ok() {
             return Err(ApiError::BadRequest("目标名称已存在".into()));
         }
-        let actual_to = if split {
-            join_enc(to_parent, &format!("{to_name}{PLAIN_VOLUME_SUFFIX}"))
-        } else {
-            to.to_string()
-        };
-        storage.rename(&actual_from, &actual_to).await?;
-        if split {
-            let old_name = parent_and_name(from).1;
-            for volume in storage
-                .list(&actual_to)
-                .await?
-                .into_iter()
-                .filter(|entry| !entry.is_dir)
-            {
-                let renamed = volume.name.replace(old_name, to_name);
-                if renamed != volume.name {
-                    storage
-                        .rename(
-                            &join_enc(&actual_to, &volume.name),
-                            &join_enc(&actual_to, &renamed),
-                        )
-                        .await?;
-                }
-            }
-        }
+        storage.rename(&actual_from, to).await?;
         return Ok(());
     }
-    // 加密数据源：外来（明文）对象只按字面存储名整体搬运，仍保持明文外来身份；
-    // 只有受管条目才走「换父钥重编码信封」的零重加密 rename。
+    // 受管数据源：外来对象只按字面存储名整体搬运，仍保持外来身份；只有受管
+    // 条目才走「换父钥重编码信封」的零重加密 rename。
     let node = match locate_any(state, storage, ds, from).await? {
         Located::Managed(node) => node,
         Located::Foreign { enc_path, .. } => {
@@ -1008,12 +959,12 @@ pub(crate) async fn delete_path(
     if path.is_empty() {
         return Err(ApiError::BadRequest("不允许删除根目录".into()));
     }
-    if !state.datasource(ds)?.encryption_enabled {
-        let (_, actual, _) = plain_locate(storage, path).await?;
+    if !state.datasource(ds)?.managed() {
+        let (_, actual) = plain_locate(storage, path).await?;
         storage.delete(&actual).await?;
         return Ok(());
     }
-    // 受管条目走信封解析后按 enc_path 删；外来（明文）对象按字面存储名删。
+    // 受管条目走信封解析后按 enc_path 删；外来对象按字面存储名删。
     match locate_any(state, storage, ds, path).await? {
         Located::Managed(node) => {
             match storage.delete(&node.enc_path).await {
@@ -1194,7 +1145,7 @@ async fn cache_identity(
     path: &str,
 ) -> ApiResult<(String, u64)> {
     let cfg = state.datasource(ds)?;
-    if cfg.encryption_enabled {
+    if cfg.managed() {
         let node = resolve(state, storage, ds, path).await?;
         if node.dir {
             return Err(ApiError::BadRequest("目录没有文件缓存".into()));
@@ -1203,22 +1154,11 @@ async fn cache_identity(
             .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("无法读取文件元数据")))?;
         Ok((node.enc_path, meta.size))
     } else {
-        let (entry, actual, split) = plain_locate(storage, path).await?;
-        if entry.is_dir && !split {
+        let (entry, actual) = plain_locate(storage, path).await?;
+        if entry.is_dir {
             return Err(ApiError::BadRequest("目录没有文件缓存".into()));
         }
-        let size = if split {
-            storage
-                .list(&actual)
-                .await?
-                .into_iter()
-                .filter(|e| !e.is_dir)
-                .map(|e| e.size)
-                .sum()
-        } else {
-            entry.size
-        };
-        Ok((actual, size))
+        Ok((actual, entry.size))
     }
 }
 
@@ -1263,7 +1203,8 @@ async fn file_cache_warm(
         return Err(ApiError::BadRequest("该数据源或全局缓存当前已关闭".into()));
     }
     let storage = state.adapter_arc(&ds)?;
-    let (folder, secret, encrypted, layout, identity) = if cfg.encryption_enabled {
+    let disguise = Disguise::of(&cfg);
+    let (folder, secret, encrypted, layout, identity) = if cfg.managed() {
         let node = resolve(&state, storage.as_ref(), &ds, &path).await?;
         if node.dir {
             return Err(ApiError::BadRequest("目录不能加入文件缓存".into()));
@@ -1277,37 +1218,40 @@ async fn file_cache_warm(
             &layout_key,
             storage.as_ref(),
             &node.enc_path,
-            &node.secret,
+            engine::LeafNaming {
+                format: &cfg.leaf_name_format,
+                source: &meta.name,
+                pw: &node.secret,
+                disguise,
+            },
             meta.size,
         )
         .await?;
-        (node.enc_path.clone(), node.secret, true, layout, identity)
+        // 预热会把拉到的密文写进持久缓存，错位的数据一旦落盘就会长期生效 ——
+        // 这里必须和 stream_file 用同一把尺子。
+        check_layout_total(&layout, meta.size, disguise)?;
+        (
+            node.enc_path.clone(),
+            node.secret,
+            cfg.encryption_enabled,
+            layout,
+            identity,
+        )
     } else {
-        let (entry, actual, split) = plain_locate(storage.as_ref(), &path).await?;
-        if entry.is_dir && !split {
+        let (entry, actual) = plain_locate(storage.as_ref(), &path).await?;
+        if entry.is_dir {
             return Err(ApiError::BadRequest("目录不能加入文件缓存".into()));
         }
-        let (folder, layout) = if split {
-            let layout_key = crate::cache::CacheStore::key(&ds, &actual);
-            (
-                actual.clone(),
-                load_ordered_stream_layout(&state, &layout_key, storage.as_ref(), &actual).await?,
-            )
-        } else {
-            let (parent, name) = parent_and_name(&actual);
-            (
-                parent.to_string(),
-                Arc::new(engine::FileLayout {
-                    total: entry.size,
-                    volumes: vec![engine::VolumeMeta {
-                        name: name.into(),
-                        size: entry.size,
-                        offset: 0,
-                    }],
-                }),
-            )
-        };
-        (folder, [0u8; SECRET_LEN], false, layout, actual)
+        let (parent, name) = parent_and_name(&actual);
+        let layout = Arc::new(engine::FileLayout {
+            total: entry.size,
+            volumes: vec![engine::VolumeMeta {
+                name: name.into(),
+                size: entry.size,
+                offset: 0,
+            }],
+        });
+        (parent.to_string(), [0u8; SECRET_LEN], false, layout, actual)
     };
     let total = layout.total;
     let key = crate::cache::CacheStore::key(&ds, &identity);
@@ -1329,6 +1273,7 @@ async fn file_cache_warm(
         folder,
         secret,
         encrypted,
+        disguise,
         layout,
         0,
         total - 1,
@@ -1499,14 +1444,15 @@ where
     }
     let _uploading_guard = UploadingGuard(state, upload_key);
 
-    if !datasource.encryption_enabled {
+    if !datasource.managed() {
+        // 非受管：一个文件就是一个明文名对象，没有容器也没有分卷。
         ensure_plain_dir(storage.as_ref(), &parent).await?;
         match plain_locate(storage.as_ref(), path).await {
-            Ok((entry, actual, split)) => {
+            Ok((entry, actual)) => {
                 if !overwrite {
                     return Err(ApiError::BadRequest(format!("已存在同名条目: {path}")));
                 }
-                if entry.is_dir && !split {
+                if entry.is_dir {
                     return Err(ApiError::BadRequest(format!("已存在同名目录: {path}")));
                 }
                 storage.delete(&actual).await?;
@@ -1514,42 +1460,24 @@ where
             Err(ApiError::NotFound(_)) => {}
             Err(e) => return Err(e),
         }
-        let sizes = if size == 0 && !datasource.volume_enabled {
-            vec![0]
-        } else {
-            volume_plan(
-                size,
-                datasource.volume_enabled,
-                datasource.volume_size,
-                &datasource.volume_strategy,
-            )
-        };
-        let (folder, names, cleanup) = if datasource.volume_enabled {
-            let folder_name = format!("{file_name}{PLAIN_VOLUME_SUFFIX}");
-            let folder = join_enc(&parent, &folder_name);
-            storage.mkdir(&folder).await?;
-            let names = volume_names(&datasource.volume_name_format, &file_name, sizes.len());
-            (folder.clone(), names, folder)
-        } else {
-            (parent.clone(), vec![file_name.clone()], path.to_string())
-        };
         let result = engine::upload_stream_planned(
             Arc::clone(&storage),
-            &folder,
+            &parent,
             &[0u8; SECRET_LEN],
             false,
+            Disguise::None,
             size,
-            &sizes,
-            &names,
+            &[size],
+            std::slice::from_ref(&file_name),
             body,
             Arc::clone(&progress),
         )
         .await;
         if let Err(e) = result {
-            let _ = storage.delete(&cleanup).await;
+            let _ = storage.delete(path).await;
             return Err(e);
         }
-        return Ok(names.len());
+        return Ok(1);
     }
 
     // 文件夹上传：自动创建缺失的中间目录
@@ -1592,14 +1520,18 @@ where
     .ok_or_else(|| ApiError::BadRequest(format!("文件名过长: {file_name}")))?;
     let enc_folder = join_enc(&parent_node.enc_path, &nc);
 
+    let disguise = Disguise::of(&datasource);
     let sizes = volume_plan(
         size,
         datasource.volume_enabled,
         datasource.volume_size,
+        disguise.header_len(),
         &datasource.volume_strategy,
     );
-    // 加密场景沿用当前密钥派生的随机卷名；自定义模板只用于未加密数据源。
-    let names = gen_chunk_names(&pw, sizes.len());
+    // 叶子名由数据源模版决定：`{s}` 明文名、`{e}` 文件密钥派生的索引凭据、
+    // `{i}` 等宽序号（见 crate::naming）。
+    let names =
+        crate::naming::leaf_names(&datasource.leaf_name_format, &file_name, &pw, sizes.len());
 
     let result: ApiResult<()> = async {
         storage.mkdir(&enc_folder).await?;
@@ -1607,7 +1539,8 @@ where
             Arc::clone(&storage),
             &enc_folder,
             &pw,
-            true,
+            datasource.encryption_enabled,
+            disguise,
             size,
             &sizes,
             &names,
@@ -1700,7 +1633,7 @@ pub(crate) async fn stream_file(
 ) -> ApiResult<Response> {
     let storage = state.adapter_arc(ds)?;
     let datasource = state.datasource(ds)?;
-    if !datasource.encryption_enabled {
+    if !datasource.managed() {
         return stream_plain(state, storage, ds, path, download, method, headers).await;
     }
     let node = match resolve(state, storage.as_ref(), ds, path).await {
@@ -1717,6 +1650,7 @@ pub(crate) async fn stream_file(
     let meta = decode_name(&node.parent_key, &node.nc)
         .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("无法解码 {path} 的密文名")))?;
     let transfer = state.settings.get();
+    let disguise = Disguise::of(&datasource);
     let enc_folder = node.enc_path.clone();
 
     // PotPlayer 起播和 seek 会连续建立 Range 连接。布局探测需要一次云端
@@ -1727,16 +1661,16 @@ pub(crate) async fn stream_file(
         &layout_key,
         storage.as_ref(),
         &enc_folder,
-        &node.secret,
+        engine::LeafNaming {
+            format: &datasource.leaf_name_format,
+            source: &meta.name,
+            pw: &node.secret,
+            disguise,
+        },
         meta.size,
     )
     .await?;
-    if layout.total != meta.size {
-        return Err(ApiError::Upstream(format!(
-            "云端分卷总大小 {} 与记录 {} 不符（数据可能被外部修改）",
-            layout.total, meta.size,
-        )));
-    }
+    check_layout_total(&layout, meta.size, disguise)?;
     let total = layout.total;
 
     let file_name = meta.name;
@@ -1805,7 +1739,8 @@ pub(crate) async fn stream_file(
         storage,
         enc_folder,
         node.secret,
-        true,
+        datasource.encryption_enabled,
+        disguise,
         layout,
         start,
         end,
@@ -1829,12 +1764,39 @@ pub(crate) async fn stream_file(
         .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))
 }
 
+#[allow(clippy::too_many_arguments)]
+/// 校验云端分卷总大小与信封里记录的明文大小一致。
+///
+/// 差值恰好是「卷数 × 伪装头部长度」时，说明这些卷根本没有本数据源的伪装
+/// 头部（多半是外部直接写入、或从没开伪装的地方搬来的）—— 指名道姓报出来，
+/// 别让用户拿着「数据可能被外部修改」去猜。
+pub(crate) fn check_layout_total(
+    layout: &engine::FileLayout,
+    expected: u64,
+    disguise: Disguise,
+) -> ApiResult<()> {
+    if layout.total == expected {
+        return Ok(());
+    }
+    let missing = disguise.header_len() * layout.volumes.len() as u64;
+    if missing > 0 && layout.total + missing == expected {
+        return Err(ApiError::Upstream(format!(
+            "该文件的 {} 个分卷没有本数据源的伪装头部（少了 {missing} 字节），无法按伪装解析；它多半来自未启用伪装的数据源，或被外部工具直接写入",
+            layout.volumes.len(),
+        )));
+    }
+    Err(ApiError::Upstream(format!(
+        "云端分卷总大小 {} 与记录 {expected} 不符（数据可能被外部修改）",
+        layout.total,
+    )))
+}
+
 async fn load_stream_layout(
     state: &AppState,
     key: &str,
     storage: &dyn crate::adapters::Storage,
     enc_folder: &str,
-    secret: &[u8],
+    naming: engine::LeafNaming<'_>,
     expected_total: u64,
 ) -> ApiResult<Arc<engine::FileLayout>> {
     if let Some(layout) = state.cached_layout(key)
@@ -1855,33 +1817,13 @@ async fn load_stream_layout(
         return Ok(layout);
     }
 
-    let layout = Arc::new(engine::load_layout(storage, enc_folder, secret).await?);
+    let layout = Arc::new(engine::load_layout(storage, enc_folder, naming).await?);
     state.put_cached_layout(key.to_string(), Arc::clone(&layout));
     tracing::debug!(
         "stream layout cache MISS key={key} total={} volumes={}",
         layout.total,
         layout.volumes.len()
     );
-    Ok(layout)
-}
-
-async fn load_ordered_stream_layout(
-    state: &AppState,
-    key: &str,
-    storage: &dyn crate::adapters::Storage,
-    folder: &str,
-) -> ApiResult<Arc<engine::FileLayout>> {
-    if let Some(layout) = state.cached_layout(key) {
-        tracing::debug!("ordered stream layout cache HIT key={key}");
-        return Ok(layout);
-    }
-    let probe_lock = state.layout_probe_lock(key);
-    let _guard = probe_lock.lock().await;
-    if let Some(layout) = state.cached_layout(key) {
-        return Ok(layout);
-    }
-    let layout = Arc::new(engine::load_layout_ordered(storage, folder).await?);
-    state.put_cached_layout(key.to_string(), Arc::clone(&layout));
     Ok(layout)
 }
 
@@ -1894,29 +1836,22 @@ async fn stream_plain(
     method: Method,
     headers: &HeaderMap,
 ) -> ApiResult<Response> {
-    let (entry, actual, split) = plain_locate(storage.as_ref(), path).await?;
-    if entry.is_dir && !split {
+    let (entry, actual) = plain_locate(storage.as_ref(), path).await?;
+    if entry.is_dir {
         return Err(ApiError::BadRequest("不能下载目录".into()));
     }
-    let (enc_folder, layout) = if split {
-        let layout_key = crate::cache::CacheStore::key(ds, &actual);
-        let layout =
-            load_ordered_stream_layout(state, &layout_key, storage.as_ref(), &actual).await?;
-        (actual.clone(), layout)
-    } else {
-        let (parent, name) = parent_and_name(&actual);
-        (
-            parent.to_string(),
-            Arc::new(engine::FileLayout {
-                volumes: vec![engine::VolumeMeta {
-                    name: name.to_string(),
-                    size: entry.size,
-                    offset: 0,
-                }],
-                total: entry.size,
-            }),
-        )
-    };
+    // 走到这里的数据源必然非受管（`stream_file` 已按 managed 分流）：存储端就是
+    // 明文原样的单个对象，没有容器、没有分卷、也没有伪装头部可剥。
+    let (parent, name) = parent_and_name(&actual);
+    let enc_folder = parent.to_string();
+    let layout = Arc::new(engine::FileLayout {
+        volumes: vec![engine::VolumeMeta {
+            name: name.to_string(),
+            size: entry.size,
+            offset: 0,
+        }],
+        total: entry.size,
+    });
     serve_object(
         state,
         storage,
@@ -1927,6 +1862,7 @@ async fn stream_plain(
             layout,
             secret: [0u8; SECRET_LEN],
             encrypted: false,
+            disguise: Disguise::None,
             display_name: parent_and_name(path).1,
             transfer_key: format!("{ds}:{path}"),
             download,
@@ -1937,9 +1873,9 @@ async fn stream_plain(
     .await
 }
 
-/// 加密数据源里解不开信封的**明文外来文件**（例如转存进来的他人明文分享，
-/// 可能还嵌在外来目录里）：定位存储端原始对象后按字节直传 —— 不做解密，
-/// 照常支持 Range / 预览 / 下载。
+/// 受管数据源里解不开信封的**外来文件**（例如转存进来的他人明文分享，可能
+/// 还嵌在外来目录里）：定位存储端原始对象后按字节直传 —— 不解密、也不脱
+/// 伪装（它不是 SafeDrive 写的），照常支持 Range / 预览 / 下载。
 async fn stream_foreign_plain(
     state: &AppState,
     storage: Arc<dyn crate::adapters::Storage>,
@@ -1982,6 +1918,8 @@ async fn stream_foreign_plain(
             layout,
             secret: [0u8; SECRET_LEN],
             encrypted: false,
+            // 外来对象不是 SafeDrive 写的，没有伪装头部可剥。
+            disguise: Disguise::None,
             display_name: parent_and_name(path).1,
             transfer_key: format!("{ds}:{path}"),
             download,
@@ -2002,6 +1940,8 @@ struct ServeObject<'a> {
     /// 解密密钥；明文 / 外来对象传全零并配 `encrypted=false`。
     secret: [u8; SECRET_LEN],
     encrypted: bool,
+    /// 存储对象上的伪装头部；外来对象传 `Disguise::None`。
+    disguise: Disguise,
     /// 展示名（决定 MIME 与下载文件名）。
     display_name: &'a str,
     /// 下行进度上报键。
@@ -2083,6 +2023,7 @@ async fn serve_object(
         serve.enc_folder,
         serve.secret,
         serve.encrypted,
+        serve.disguise,
         serve.layout,
         start,
         end,
@@ -2116,11 +2057,37 @@ mod config_tests {
         let total = 10 * 1024 * 1024 + 7;
         let max = 3 * 1024 * 1024;
         for _ in 0..32 {
-            let plan = volume_plan(total, true, max, "random");
+            let plan = volume_plan(total, true, max, 0, "random");
             assert_eq!(plan.len(), total.div_ceil(max) as usize);
             assert_eq!(plan.iter().sum::<u64>(), total);
             assert!(plan.iter().all(|size| *size > 0 && *size <= max));
         }
+    }
+
+    /// 「最大分卷大小」是对**实际存储对象**的硬限制：开了伪装时，数据区上限
+    /// 相应缩到 `max - 54`，落地对象才恰好不超过用户配置的值。
+    #[test]
+    fn disguise_header_counts_against_the_volume_limit() {
+        const HEADER: u64 = 54;
+        let max = 100 * 1024 * 1024;
+        let total = 250 * 1024 * 1024 + 12_345;
+        for strategy in ["fixed", "random"] {
+            let plan = volume_plan(total, true, max, HEADER, strategy);
+            assert_eq!(plan.iter().sum::<u64>(), total, "{strategy}");
+            assert!(
+                plan.iter().all(|data| data + HEADER <= max),
+                "{strategy}: 落地对象必须不超过 {max}: {plan:?}"
+            );
+            // 数据区上限缩小 54 字节 → 卷数按 max-54 算
+            assert_eq!(
+                plan.len(),
+                total.div_ceil(max - HEADER) as usize,
+                "{strategy}"
+            );
+        }
+        // 不伪装时行为不变：数据区可以顶到 max
+        let plan = volume_plan(total, true, max, 0, "fixed");
+        assert_eq!(plan[0], max);
     }
 
     #[test]
@@ -2131,7 +2098,7 @@ mod config_tests {
         let total = 2900 * mb;
         let max = 300 * mb;
         for _ in 0..32 {
-            let plan = volume_plan(total, true, max, "random");
+            let plan = volume_plan(total, true, max, 0, "random");
             assert_eq!(plan.len(), 10);
             assert_eq!(plan.iter().sum::<u64>(), total);
             assert!(plan.iter().all(|size| *size > 0 && *size <= max));
@@ -2139,12 +2106,173 @@ mod config_tests {
             assert!(pinned < plan.len() / 2, "顶格分卷过多: {plan:?}");
         }
     }
+}
 
+#[cfg(test)]
+mod disguise_tests {
+    use super::*;
+    use http_body_util::BodyExt;
+    use tower::util::ServiceExt;
+
+    /// 加密 + 分卷 + 伪装三开的数据源 + 已挂好的路由。
+    fn setup() -> (axum::Router, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cloud = dir.path().join("cloud");
+        std::fs::create_dir_all(&cloud).unwrap();
+        let state = AppState::new(dir.path().join("data"), None).unwrap();
+        state
+            .registry
+            .create(crate::registry::DataSource {
+                id: "ds1".into(),
+                name: "cloud".into(),
+                ds_type: "localfs".into(),
+                config: serde_json::json!({ "root": cloud.to_str().unwrap() }),
+                encryption_enabled: true,
+                password: "pw".into(),
+                prev_password: None,
+                volume_enabled: true,
+                volume_size: 64 * 1024,
+                volume_strategy: "fixed".into(),
+                leaf_name_format: "{e}.bmp".into(),
+                disguise_enabled: true,
+                disguise_algorithm: "bmp".into(),
+                cache_enabled: false,
+                created_at: 1,
+            })
+            .unwrap();
+        (crate::routes::router(state), dir)
+    }
+
+    async fn send(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        range: Option<&str>,
+        body: Vec<u8>,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(range) = range {
+            builder = builder.header(header::RANGE, range);
+        }
+        let resp = app
+            .clone()
+            .oneshot(builder.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let (parts, body) = resp.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes().to_vec();
+        (parts.status, parts.headers, bytes)
+    }
+
+    /// 代理 Range 下载必须修正分片：客户端的区间是明文坐标，响应头报的是
+    /// 明文大小，伪装头部既不出现在响应体里、也不参与区间计算。
+    #[tokio::test]
+    async fn range_download_skips_the_disguise_header() {
+        let (app, dir) = setup();
+        // 跨 3 个 64 KiB 分卷，边界落在 65536 / 131072。
+        let data: Vec<u8> = (0..150_000u32).map(|i| (i * 13 % 251) as u8).collect();
+        let (status, _, _) = send(
+            &app,
+            "PUT",
+            &format!("/api/files/ds1/upload?path=a.bin&size={}", data.len()),
+            None,
+            data.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // 存储侧：每个分卷都是「54 字节 BMP 头 + 密文」。
+        let mut stored = 0u64;
+        let mut volumes = 0;
+        for entry in walkdir(&dir.path().join("cloud")) {
+            let raw = std::fs::read(&entry).unwrap();
+            assert_eq!(&raw[..2], b"BM", "{}", entry.display());
+            stored += raw.len() as u64;
+            volumes += 1;
+        }
+        assert_eq!(volumes, 3);
+        assert_eq!(stored, data.len() as u64 + 3 * 54);
+
+        // HEAD：报明文大小。
+        let (status, headers, _) = send(&app, "HEAD", "/stream/ds1/a.bin", None, Vec::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers[header::CONTENT_LENGTH],
+            data.len().to_string().as_str()
+        );
+
+        // 全量与各种区间（含跨卷、卷边界、末字节、开区间）都逐字节一致。
+        let (status, _, body) = send(&app, "GET", "/stream/ds1/a.bin", None, Vec::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, data);
+
+        for (range, start, end) in [
+            ("bytes=0-0", 0usize, 0usize),
+            ("bytes=65535-65536", 65_535, 65_536),
+            ("bytes=131071-131072", 131_071, 131_072),
+            ("bytes=100-99999", 100, 99_999),
+            ("bytes=149999-", 149_999, 149_999),
+            ("bytes=-10", 149_990, 149_999),
+        ] {
+            let (status, headers, body) =
+                send(&app, "GET", "/stream/ds1/a.bin", Some(range), Vec::new()).await;
+            assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{range}");
+            assert_eq!(
+                headers[header::CONTENT_RANGE],
+                format!("bytes {start}-{end}/{}", data.len()).as_str(),
+                "{range}"
+            );
+            assert_eq!(body, data[start..=end], "{range}");
+        }
+    }
+
+    /// 受管文件的分卷没有伪装头部（外部写入 / 从没开伪装的地方搬来）时，
+    /// 必须指名道姓报出来，而不是让用户拿着「数据可能被外部修改」去猜。
     #[test]
-    fn formatted_names_have_aligned_one_based_indexes() {
-        let names = volume_names("{s}_{i}.bin", "movie.mkv", 12);
-        assert_eq!(names[0], "movie.mkv_01.bin");
-        assert_eq!(names[11], "movie.mkv_12.bin");
+    fn missing_disguise_header_is_named_in_the_error() {
+        let layout = engine::FileLayout {
+            volumes: vec![
+                engine::VolumeMeta {
+                    name: "a".into(),
+                    size: 1_000,
+                    offset: 0,
+                },
+                engine::VolumeMeta {
+                    name: "b".into(),
+                    size: 946,
+                    offset: 1_000,
+                },
+            ],
+            total: 1_946,
+        };
+        // 少的正好是 2 × 54：这些卷根本没有伪装头部。
+        let error = check_layout_total(&layout, 2_054, Disguise::Bmp).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("没有本数据源的伪装头部"), "{message}");
+        assert!(message.contains("108"), "{message}");
+        // 差值对不上头部长度 → 仍按「可能被外部修改」报。
+        let error = check_layout_total(&layout, 3_000, Disguise::Bmp).unwrap_err();
+        assert!(error.to_string().contains("外部修改"), "{error}");
+        // 对得上就放行。
+        assert!(check_layout_total(&layout, 1_946, Disguise::Bmp).is_ok());
+    }
+
+    /// 递归收集数据源根下所有普通文件。
+    fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out.sort();
+        out
     }
 }
 
@@ -2173,7 +2301,9 @@ mod adopt_foreign_tests {
                 volume_enabled: true,
                 volume_size: 64 * 1024,
                 volume_strategy: "fixed".into(),
-                volume_name_format: "{s}_{i}.bin".into(),
+                leaf_name_format: "{e}".into(),
+                disguise_enabled: false,
+                disguise_algorithm: "bmp".into(),
                 cache_enabled: false,
                 created_at: 1,
             })
@@ -2199,7 +2329,8 @@ mod adopt_foreign_tests {
         std::fs::create_dir_all(&folder).unwrap();
         let mut ct = content.to_vec();
         apply_content_keystream(&pw, 0, &mut ct);
-        std::fs::write(folder.join(&gen_chunk_names(&pw, 1)[0]), ct).unwrap();
+        let leaf = crate::naming::leaf_names(crate::naming::ENVELOPE, name, &pw, 1)[0].clone();
+        std::fs::write(folder.join(&leaf), ct).unwrap();
         nc
     }
 

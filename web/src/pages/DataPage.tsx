@@ -1,12 +1,12 @@
 import {
-  ApiOutlined, AppstoreOutlined, BarsOutlined, CopyOutlined, DatabaseOutlined, DeleteOutlined,
-  ImportOutlined, LinkOutlined, MoreOutlined, PlusOutlined, SearchOutlined,
+  ApiOutlined, AppstoreOutlined, BarsOutlined, ClearOutlined, CopyOutlined, DatabaseOutlined,
+  DeleteOutlined, ImportOutlined, LinkOutlined, MoreOutlined, PlusOutlined, SearchOutlined,
 } from '@ant-design/icons';
 import {
   App, Button, Card, Checkbox, Col, Dropdown, Empty, Input, Row, Segmented, Select, Skeleton, Space,
   Table, Tag, Typography, type MenuProps,
 } from 'antd';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, type DsRecord, type DsType } from '../api/client';
 import SourceModal from '../components/SourceModal';
@@ -21,6 +21,23 @@ const DS_TYPE_META: Record<DsType, { label: string; color: string }> = {
   aliyundrive: { label: '阿里云盘', color: 'orange' },
   quark: { label: '夸克网盘', color: 'purple' },
 };
+
+/** 顶栏高度（app.css 里 .app-header 固定 70px），粘性工具条与表头都吸在它下面。 */
+const HEADER_HEIGHT = 70;
+
+/** 开关型筛选的三态：不限 / 已开启 / 未开启。 */
+type Toggle = 'all' | 'on' | 'off';
+type SortKey = 'default' | 'created-desc' | 'created-asc' | 'name-asc' | 'name-desc';
+
+/** 三态筛选的下拉项：值自带维度名，收起时也看得出筛的是哪一项。 */
+const toggleOptions = (label: string) => [
+  { value: 'all' as const, label: `${label}：全部` },
+  { value: 'on' as const, label: `${label}：开` },
+  { value: 'off' as const, label: `${label}：关` },
+];
+
+const matchToggle = (filter: Toggle, enabled: boolean) =>
+  filter === 'all' || (filter === 'on') === enabled;
 
 /** 数据管理首页：数据源入口（卡片/列表两种呈现）+ 添加/编辑/克隆/分享/批量管理。 */
 export default function DataPage() {
@@ -40,17 +57,53 @@ export default function DataPage() {
     setView(v);
     localStorage.setItem('sd.view.sources', v);
   };
-  // 顶部筛选：按名称搜索 + 按类型过滤（数据源多了便于快速定位）
+  // 顶部筛选：名称/类型关键字 + 类型 + 四个配置维度 + 排序（数据源多了便于快速定位）
   const [query, setQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState<DsType | 'all'>('all');
+  const [encFilter, setEncFilter] = useState<Toggle>('all');
+  const [volFilter, setVolFilter] = useState<Toggle>('all');
+  const [disFilter, setDisFilter] = useState<Toggle>('all');
+  const [cacheFilter, setCacheFilter] = useState<Toggle>('all');
+  const [sortKey, setSortKey] = useState<SortKey>('default');
+
+  const activeFilters =
+    (query.trim() ? 1 : 0) +
+    (typeFilter === 'all' ? 0 : 1) +
+    [encFilter, volFilter, disFilter, cacheFilter].filter((f) => f !== 'all').length;
+  const resetFilters = () => {
+    setQuery('');
+    setTypeFilter('all');
+    setEncFilter('all');
+    setVolFilter('all');
+    setDisFilter('all');
+    setCacheFilter('all');
+  };
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return sources.list.filter(
+    const hit = sources.list.filter(
       (d) =>
         (typeFilter === 'all' || d.type === typeFilter) &&
-        (!q || d.name.toLowerCase().includes(q)),
+        matchToggle(encFilter, d.encryptionEnabled) &&
+        matchToggle(volFilter, d.volumeEnabled) &&
+        matchToggle(disFilter, d.disguiseEnabled) &&
+        matchToggle(cacheFilter, d.cacheEnabled) &&
+        // 关键字同时匹配名称与类型名，输入「百度」也能筛出来
+        (!q ||
+          d.name.toLowerCase().includes(q) ||
+          DS_TYPE_META[d.type].label.toLowerCase().includes(q)),
     );
-  }, [sources.list, query, typeFilter]);
+    if (sortKey === 'default') return hit;
+    return [...hit].sort((a, b) => {
+      switch (sortKey) {
+        case 'created-asc': return a.createdAt - b.createdAt;
+        case 'created-desc': return b.createdAt - a.createdAt;
+        case 'name-desc': return b.name.localeCompare(a.name, 'zh-Hans-CN');
+        default: return a.name.localeCompare(b.name, 'zh-Hans-CN');
+      }
+    });
+  }, [sources.list, query, typeFilter, encFilter, volFilter, disFilter, cacheFilter, sortKey]);
+
 
   useEffect(() => {
     void sources.refresh().catch((e: unknown) => message.error(String(e)));
@@ -226,8 +279,8 @@ export default function DataPage() {
     <PageHeading onAdd={openCreate} onImport={importAction} view={view} onViewChange={changeView} />
   );
   const batchBar = selectedIds.length > 0 && (
-    <Space style={{ marginBottom: 12 }} wrap>
-      <Typography.Text type="secondary">已选 {selectedIds.length} 项</Typography.Text>
+    <div className="ds-batchbar">
+      <Typography.Text className="ds-batchbar-count">已选 {selectedIds.length} 项</Typography.Text>
       <Button size="small" icon={<ApiOutlined />} loading={batchTesting} onClick={() => void batchTestAction()}>
         测试
       </Button>
@@ -237,20 +290,22 @@ export default function DataPage() {
       <Button size="small" type="text" onClick={() => setSelectedIds([])}>
         取消选择
       </Button>
-    </Space>
+    </div>
   );
+  /** 值不是「全部」时给个高亮描边，一眼看出哪几个维度正在生效。 */
+  const filterClass = (active: boolean) => `ds-filter${active ? ' is-active' : ''}`;
   const filterBar = (
     <div className="ds-toolbar">
       <Input
         className="ds-toolbar-search"
         prefix={<SearchOutlined />}
         allowClear
-        placeholder="搜索数据源名称"
+        placeholder="搜索名称或类型"
         value={query}
         onChange={(e) => setQuery(e.target.value)}
       />
       <Select<DsType | 'all'>
-        className="ds-toolbar-type"
+        className={filterClass(typeFilter !== 'all')}
         value={typeFilter}
         onChange={setTypeFilter}
         popupMatchSelectWidth={false}
@@ -262,14 +317,83 @@ export default function DataPage() {
           })),
         ]}
       />
-      {(query.trim() || typeFilter !== 'all') && (
+      <Select<Toggle>
+        className={filterClass(encFilter !== 'all')}
+        value={encFilter}
+        onChange={setEncFilter}
+        popupMatchSelectWidth={false}
+        options={toggleOptions('加密')}
+      />
+      <Select<Toggle>
+        className={filterClass(volFilter !== 'all')}
+        value={volFilter}
+        onChange={setVolFilter}
+        popupMatchSelectWidth={false}
+        options={toggleOptions('分卷')}
+      />
+      <Select<Toggle>
+        className={filterClass(disFilter !== 'all')}
+        value={disFilter}
+        onChange={setDisFilter}
+        popupMatchSelectWidth={false}
+        options={toggleOptions('伪装')}
+      />
+      <Select<Toggle>
+        className={filterClass(cacheFilter !== 'all')}
+        value={cacheFilter}
+        onChange={setCacheFilter}
+        popupMatchSelectWidth={false}
+        options={toggleOptions('缓存')}
+      />
+      <Select<SortKey>
+        className={filterClass(sortKey !== 'default')}
+        value={sortKey}
+        onChange={setSortKey}
+        popupMatchSelectWidth={false}
+        options={[
+          { value: 'default', label: '默认顺序' },
+          { value: 'created-desc', label: '最新创建' },
+          { value: 'created-asc', label: '最早创建' },
+          { value: 'name-asc', label: '名称 A→Z' },
+          { value: 'name-desc', label: '名称 Z→A' },
+        ]}
+      />
+      <div className="ds-toolbar-tail">
         <span className="ds-toolbar-count">
-          匹配 {filtered.length} / {sources.list.length}
+          {activeFilters > 0 ? `匹配 ${filtered.length} / ${sources.list.length}` : `共 ${sources.list.length} 个数据源`}
         </span>
-      )}
+        {activeFilters > 0 && (
+          <Button size="small" type="text" icon={<ClearOutlined />} onClick={resetFilters}>
+            清除筛选
+          </Button>
+        )}
+      </div>
     </div>
   );
-  const noMatch = <Empty description="没有匹配的数据源" />;
+  // 工具条吸在顶栏下方；表头再吸在工具条下方，所以要实时量出它的高度
+  //（批量操作条出现/收起、窄屏换行都会改变它）。
+  const stickyRef = useRef<HTMLDivElement>(null);
+  const [stickyHeight, setStickyHeight] = useState(0);
+  useLayoutEffect(() => {
+    const node = stickyRef.current;
+    if (!node) return;
+    const measure = () => setStickyHeight(node.offsetHeight);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [view, sources.loaded, sources.list.length]);
+  const stickyBar = (
+    <div className="ds-sticky" ref={stickyRef} style={{ top: HEADER_HEIGHT }}>
+      {filterBar}
+      {batchBar}
+    </div>
+  );
+  const noMatch = (
+    <Empty description="没有匹配的数据源">
+      <Button icon={<ClearOutlined />} onClick={resetFilters}>清除筛选</Button>
+    </Empty>
+  );
 
   if (!sources.loaded) return <>{heading}{modalNode}<Row gutter={[16,16]}>{[0,1,2].map((key) => <Col key={key} xs={24} sm={12} lg={8}><Card><Skeleton active avatar paragraph={{rows:2}} /></Card></Col>)}</Row></>;
   if (sources.list.length === 0) {
@@ -294,14 +418,14 @@ export default function DataPage() {
 
   if (view === 'list') {
     return (
-      <>{heading}{modalNode}<Card styles={{ body: { paddingTop: 16 } }}>
-        {filterBar}
-        {batchBar}
+      <>{heading}{modalNode}{stickyBar}<Card styles={{ body: { paddingTop: 16 } }}>
         <Table<DsRecord>
           rowKey="id"
           dataSource={filtered}
           pagination={false}
           size="middle"
+          sticky={{ offsetHeader: HEADER_HEIGHT + stickyHeight }}
+          locale={{ emptyText: noMatch }}
           rowSelection={{
             selectedRowKeys: selectedIds,
             onChange: (keys) => setSelectedIds(keys.map(String)),
@@ -327,6 +451,7 @@ export default function DataPage() {
                     {d.encryptionEnabled ? '已加密' : '未加密'}
                   </Tag>
                   <Tag>{d.volumeEnabled ? `${d.volumeStrategy === 'random' ? '随机' : '固定'}分卷` : '不分卷'}</Tag>
+                  {d.disguiseEnabled && <Tag color="purple">{d.disguiseAlgorithm.toUpperCase()} 伪装</Tag>}
                   <Tag color={d.cacheEnabled ? 'blue' : 'default'}>缓存{d.cacheEnabled ? '开' : '关'}</Tag>
                 </>
               ),
@@ -358,7 +483,7 @@ export default function DataPage() {
   }
 
   return (
-    <>{heading}{modalNode}{filterBar}{batchBar}
+    <>{heading}{modalNode}{stickyBar}
     {filtered.length === 0 ? noMatch : (
     <Row gutter={[18, 18]}>
       {filtered.map((d) => {
@@ -392,6 +517,7 @@ export default function DataPage() {
                         {d.encryptionEnabled ? '已加密' : '未加密'}
                       </Tag>
                       <Tag>{d.volumeEnabled ? `${d.volumeStrategy === 'random' ? '随机' : '固定'}分卷` : '不分卷'}</Tag>
+                      {d.disguiseEnabled && <Tag color="purple">{d.disguiseAlgorithm.toUpperCase()} 伪装</Tag>}
                       <Tag color={d.cacheEnabled ? 'blue' : 'default'}>缓存{d.cacheEnabled ? '开' : '关'}</Tag>
                     </div>
                     <Typography.Text type="secondary" style={{ fontSize: 12 }}>

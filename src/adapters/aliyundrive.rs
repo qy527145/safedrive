@@ -962,8 +962,8 @@ impl Storage for AliyunDriveFs {
     }
 
     /// 原生分享：走官网 PDS 上游接口（官网令牌 + 文件所在区域网关）。分享必须
-    /// 配置官网令牌 —— 开放平台没有分享接口。备份盘文件普通分享会被拒，自动降级
-    /// 到快传（没有提取码、语义是临时链接，备份盘唯一可行的路）。
+    /// 配置官网令牌 —— 开放平台没有分享接口。备份盘等不支持普通分享的文件会直接
+    /// 返回上游错误。
     async fn share(&self, paths: &[String], password: Option<&str>) -> ApiResult<CloudShare> {
         if paths.is_empty() {
             return Err(ApiError::BadRequest("请至少选择一个条目".into()));
@@ -986,37 +986,12 @@ impl Storage for AliyunDriveFs {
             None => aliyun_web::gen_share_password()?,
         };
         self.warn_account_mismatch(web).await;
-
-        // 1) PDS 普通分享（官网令牌 + 文件所在区域网关）。
-        let share_err = match web
+        let share_id = web
             .create_share(&domain_id, &drive_id, &file_ids, &password)
-            .await
-        {
-            Ok(share_id) => {
-                return Ok(CloudShare {
-                    url: aliyun_web::share_url(&share_id),
-                    password,
-                    quick: false,
-                });
-            }
-            Err(share_err) => share_err,
-        };
-        tracing::info!("阿里云盘普通分享失败，改用快传: {share_err}");
-
-        // 2) 快传：备份盘文件会被普通分享拒（Forbidden），只有这一条路。
-        //    没有提取码、语义是临时链接。
-        let url = web
-            .create_quick_share(&drive_id, &file_ids)
-            .await
-            .map_err(|quick_err| {
-                ApiError::Upstream(format!(
-                    "阿里云盘分享失败：普通分享 [{share_err}]；快传 [{quick_err}]"
-                ))
-            })?;
+            .await?;
         Ok(CloudShare {
-            url,
-            password: String::new(),
-            quick: true,
+            url: aliyun_web::share_url(&share_id),
+            password,
         })
     }
 
@@ -1028,14 +1003,7 @@ impl Storage for AliyunDriveFs {
         let drive_id = self.drive_id().await?;
         self.warn_account_mismatch(web).await;
         let dest_id = self.folder_id(dest, true).await?;
-        // 快传（`/t/`）没有提取码，换 share_token 时密码留空；拿到 token 后读取内容、
-        // 转存与普通分享（`/s/`）同路。备份盘只能生成快传，转存也从这里进来。
-        let password = if share.quick || aliyun_web::is_quick_share_url(&share.url) {
-            ""
-        } else {
-            share.password.as_str()
-        };
-        let share_token = web.share_token(&share_id, password).await?;
+        let share_token = web.share_token(&share_id, &share.password).await?;
         let items = web.share_root_items(&share_id, &share_token).await?;
         let imported = web
             .copy_from_share(&share_id, &share_token, &items, &drive_id, &dest_id)

@@ -226,8 +226,8 @@ impl AppState {
     /// 数据源的信封链根密钥。
     pub fn root_key_of(&self, ds_id: &str) -> ApiResult<[u8; crate::crypto::SECRET_LEN]> {
         let ds = self.datasource(ds_id)?;
-        if !ds.encryption_enabled {
-            return Err(ApiError::BadRequest("该数据源未启用加密".into()));
+        if !ds.managed() {
+            return Err(ApiError::BadRequest("该数据源未启用加密或伪装".into()));
         }
         Ok(crate::crypto::derive_root_key(ds.password.as_bytes()))
     }
@@ -238,8 +238,8 @@ impl AppState {
         ds_id: &str,
     ) -> ApiResult<Vec<[u8; crate::crypto::SECRET_LEN]>> {
         let ds = self.datasource(ds_id)?;
-        if !ds.encryption_enabled {
-            return Err(ApiError::BadRequest("该数据源未启用加密".into()));
+        if !ds.managed() {
+            return Err(ApiError::BadRequest("该数据源未启用加密或伪装".into()));
         }
         let mut keys = vec![crate::crypto::derive_root_key(ds.password.as_bytes())];
         if let Some(prev) = ds.prev_password {

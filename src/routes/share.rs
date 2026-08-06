@@ -8,6 +8,7 @@ use serde_json::json;
 
 use crate::adapters::{CloudShare, sanitize};
 use crate::crypto::names::{decode_name, encode_name};
+use crate::disguise::Disguise;
 use crate::error::{ApiError, ApiResult};
 use crate::routes::files::Located;
 use crate::state::AppState;
@@ -80,6 +81,7 @@ async fn share_export(
     let storage = state.adapter(&ds)?;
     let mut storage_paths = Vec::with_capacity(body.paths.len());
     let item_count = body.paths.len();
+    let mut managed_count = 0;
     let mut parent_keys = Vec::new();
     let mut any_managed = false;
     let mut any_foreign = false;
@@ -88,12 +90,13 @@ async fn share_export(
         if path.is_empty() {
             return Err(ApiError::BadRequest("不能分享数据源根目录".into()));
         }
-        if datasource.encryption_enabled {
-            // 受管条目走信封（只能 sd://）；外来（明文）条目按字面存储路径原样
-            // 分享（只能原生）—— 二者语义与落地格式都不同。
+        if datasource.managed() {
+            // 受管条目走信封（只能 sd://）；外来条目按字面存储路径原样分享
+            //（只能原生）—— 二者语义与落地格式都不同。
             match super::files::locate_any(&state, storage.as_ref(), &ds, &path).await? {
                 Located::Managed(node) => {
                     any_managed = true;
+                    managed_count += 1;
                     if !parent_keys.contains(&node.parent_key) {
                         parent_keys.push(node.parent_key);
                     }
@@ -105,25 +108,26 @@ async fn share_export(
                 }
             }
         } else {
-            let (_, actual, _) = super::files::plain_locate(storage.as_ref(), &path).await?;
+            let (_, actual) = super::files::plain_locate(storage.as_ref(), &path).await?;
             storage_paths.push(actual);
         }
     }
-    // 受管密文与外来明文不能混在一次分享里：一个只能 sd://、一个只能原生。
-    if any_managed && any_foreign {
-        return Err(ApiError::BadRequest(
-            "不能把受管加密条目与外来明文条目放在同一次分享，请分开分享".into(),
-        ));
-    }
-    // 全外来（明文）→ 强制原生：sd:// 封装的是解密信息，对明文对象无意义。
+    // 混合选择统一走 sd://：包中同时保留受管目录密钥与外来对象的字面存储名。
+    // 只有全外来选择才强制官网原生分享；sd:// 对纯外来对象没有解密信息可携带。
     let native = body.native || (any_foreign && !any_managed);
-    // 原生分享的是云端「原样对象」：受管加密条目在云端是乱码密文，官网分享对
-    // 接收方毫无意义 —— 只有明文（未加密数据源，或加密数据源里的外来条目）可原生。
+    let disguise = Disguise::of(&datasource);
+    // 原生分享的是云端「原样对象」：受管条目在云端是密文、或前面套了一层伪装
+    // 头部，接收方拿到的都不是原文件 —— 只有既没加密也没伪装的对象可原生
+    //（非受管数据源，或受管数据源里的外来条目）。
     if native && any_managed {
-        return Err(ApiError::BadRequest(
-            "加密数据源的受管条目在云端是密文，官网原生分享对接收方没有意义；请改用 sd:// 标准分享"
-                .into(),
-        ));
+        let reason = if datasource.encryption_enabled {
+            "是乱码密文"
+        } else {
+            "带有伪装头部"
+        };
+        return Err(ApiError::BadRequest(format!(
+            "该数据源的受管条目在云端{reason}，官网原生分享给出的不是原文件；请改用 sd:// 标准分享"
+        )));
     }
     // 自定义提取码只在原生分享时有意义（sd:// 密码受协议字母表约束，由服务端生成）。
     let custom_password = if native && !body.password.trim().is_empty() {
@@ -142,26 +146,19 @@ async fn share_export(
             "native": true,
             "url": url,
             "password": cloud.password,
-            // 快传（阿里云盘备份盘）：没提取码、有有效期，前端据此换一套说明。
-            "quick": cloud.quick,
         })));
     }
 
-    // 快传链接（阿里云盘备份盘专用）没有可复用的分享 ID + 提取码流程，无法被
-    // sd:// 封装/转存 —— 明确引导用户改走原生分享，别抛出难懂的「无法提取 ID」。
-    if cloud.quick {
-        return Err(ApiError::BadRequest(
-            "该文件位于阿里云盘备份盘，只能生成「云盘官网原生分享」（快传），无法打包成 sd:// 标准分享；请改选原生分享".into(),
-        ));
-    }
     let share_id = codec::share_id(&datasource.ds_type, &cloud.url)
         .ok_or_else(|| ApiError::Upstream(format!("无法从分享短链提取分享 ID: {}", cloud.url)))?;
     let pack = codec::Pack {
+        encrypted: datasource.encryption_enabled,
         source_type: datasource.ds_type,
         share_id,
         password: cloud.password,
-        encrypted: datasource.encryption_enabled,
+        disguise,
         item_count,
+        managed_count,
         parent_keys,
     };
     let link =
@@ -209,19 +206,17 @@ async fn share_import(
                 datasource.ds_type
             )));
         }
-        let dest = if datasource.encryption_enabled {
+        // 转存进来的是别人的裸对象：受管数据源解不开它们的名字，会按「外来
+        // 条目」原样读取（既不解密也不脱伪装），所以不需要任何额外把关。
+        let dest = if datasource.managed() {
             super::files::resolve(&state, storage.as_ref(), &ds, &dir)
                 .await?
                 .enc_path
         } else {
             dir.clone()
         };
-        // 快传（阿里云盘 `/t/`）没有提取码：不读 `?pwd=`、也不接受手填提取码。
-        let quick = codec::is_quick_native(link);
         // 提取码优先用用户手填的；留空则回退到链接里内嵌的 `?pwd=`。
-        let password = if quick {
-            String::new()
-        } else if body.password.trim().is_empty() {
+        let password = if body.password.trim().is_empty() {
             codec::native_password(link).unwrap_or_default()
         } else {
             body.password.trim().to_owned()
@@ -229,26 +224,24 @@ async fn share_import(
         let cloud = CloudShare {
             url: link.to_owned(),
             password: password.clone(),
-            quick,
         };
         // 没提供任何密码就转存失败 → 多半是需要提取码。不当作错误，让前端弹框
-        // 补填后重试（免密分享则此次已直接成功）。快传本就无提取码，别误导用户去
-        // 填提取码，直接如实报错；提供了密码仍失败也如实报错。
+        // 补填后重试（免密分享则此次已直接成功）；提供了密码仍失败则如实报错。
         let transferred = match storage.import_share(&cloud, &dest).await {
             Ok(transferred) => transferred,
-            Err(_) if password.is_empty() && !quick => {
+            Err(_) if password.is_empty() => {
                 return Ok(Json(json!({ "ok": false, "needPassword": true })));
             }
             Err(e) => return Err(e),
         };
-        if datasource.encryption_enabled {
+        if datasource.managed() {
             state.cache.evict_subtree(&ds, &dir);
         }
         return Ok(Json(json!({
             "ok": true,
             "imported": transferred.len(),
-            // 明文内容进了加密数据源 → 以外来条目呈现（前端据此提示）。
-            "foreign": datasource.encryption_enabled,
+            // 外来内容进了受管数据源 → 以外来条目呈现（前端据此提示）。
+            "foreign": datasource.managed(),
         })));
     }
 
@@ -269,7 +262,14 @@ async fn share_import(
             "加密模式不兼容：分享与当前数据源一个加密、一个未加密；确认强制导入后内容将按外来条目显示".into(),
         ));
     }
-    let parent = if datasource.encryption_enabled {
+    // 伪装不兼容没有「按外来条目显示」这样的优雅退路：转存的是云端原样分卷，
+    // 头部多一层或少一层都会让受管内容静默读成乱码，所以不给 force 放行。
+    if Disguise::of(&datasource) != pack.disguise {
+        return Err(ApiError::BadRequest(
+            "伪装设置不兼容：分享方与当前数据源的存储侧伪装不一致，转存后内容无法正确读取；请用伪装设置相同的数据源导入".into(),
+        ));
+    }
+    let parent = if datasource.managed() {
         Some(super::files::resolve(&state, storage.as_ref(), &ds, &dir).await?)
     } else {
         None
@@ -282,14 +282,13 @@ async fn share_import(
             ApiError::BadRequest(format!("{} 数据源不支持转存分享", pack.source_type))
         })?,
         password: pack.password.clone(),
-        quick: false,
     };
     let transferred = storage.import_share(&cloud, dest).await?;
 
-    // 两端均加密：内容无需重加密，只把每个根信封改用当前目录密钥封装；
-    // 这正是一次存储端 rename，节点 secret 与整棵子树密码链保持不变。
-    if pack.encrypted && datasource.encryption_enabled {
-        let parent = parent.expect("加密数据源必有目标父节点");
+    // 受管条目需要按当前目录密钥重编信封；外来条目没有可解密的信封，
+    // 保留转存后的字面名称。混合分享因此可以在一次云端转存中同时还原两类条目。
+    if pack.managed() && datasource.managed() {
+        let parent = parent.expect("受管数据源必有目标父节点");
         if transferred.len() != pack.item_count {
             return Err(ApiError::Upstream(format!(
                 "转存返回 {} 个条目，分享包包含 {} 个，无法安全重建加密文件名",
@@ -297,23 +296,23 @@ async fn share_import(
                 pack.item_count
             )));
         }
+        let mut managed_seen = 0;
         for entry in &transferred {
             let mut matches = pack
                 .parent_keys
                 .iter()
                 .filter_map(|key| decode_name(key, &entry.source_name));
-            let meta = matches.next().ok_or_else(|| {
-                ApiError::BadRequest(format!(
-                    "分享包无法解密转存条目 {} 的名称",
-                    entry.source_name
-                ))
-            })?;
+            let Some(meta) = matches.next() else {
+                // 外来条目在分享前就是字面存储名，不参与信封重编。
+                continue;
+            };
             if matches.next().is_some() {
                 return Err(ApiError::BadRequest(format!(
                     "转存条目 {} 匹配了多个目录密钥",
                     entry.source_name
                 )));
             }
+            managed_seen += 1;
             let new_name = encode_name(&parent.secret, &meta)
                 .ok_or_else(|| ApiError::BadRequest(format!("名称过长: {}", meta.name)))?;
             storage
@@ -322,6 +321,12 @@ async fn share_import(
                     &super::files::join_enc(&parent.enc_path, &new_name),
                 )
                 .await?;
+        }
+        if managed_seen != pack.managed_count {
+            return Err(ApiError::Upstream(format!(
+                "转存识别出 {} 个受管条目，分享包声明 {} 个",
+                managed_seen, pack.managed_count
+            )));
         }
         state.cache.evict_subtree(&ds, &dir);
     }

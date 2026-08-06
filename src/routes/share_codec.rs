@@ -1,6 +1,6 @@
 //! Compact, authenticated `sd://` share payloads.
 //!
-//! Wire format (protocol v1):
+//! Wire format:
 //! `base64url(AES-128-SIV(binary payload) || encrypted-pad:4 || version:4)`.
 //! The clear version nibble is authenticated as AES-SIV associated data. The
 //! binary payload starts with the 4-bit datasource type; all payload bits are
@@ -13,10 +13,12 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use super::bits::{BitReader, BitWriter, MAX_STRING_BYTES, validate_string};
+use crate::disguise::Disguise;
 
 pub(super) use super::bits::DecodeError;
 
 const VERSION: u8 = 1;
+const DISGUISE_BMP: u64 = 1;
 const SOURCE_BAIDUPAN: u8 = 1;
 const SOURCE_ALIYUNDRIVE: u8 = 2;
 const SOURCE_QUARK: u8 = 3;
@@ -36,11 +38,25 @@ pub(super) struct Pack {
     pub source_type: String,
     pub share_id: String,
     pub password: String,
+    /// 分享方的**内容**是否加密。受管但不加密 = 只伪装。
     pub encrypted: bool,
+    /// 分享方存储侧的伪装形态。转存的是云端原样对象，两端伪装必须一致，
+    /// 否则落地的分卷前面多/少一层头部，内容读不回来。
+    pub disguise: Disguise,
     pub item_count: usize,
+    /// 分享中走受管信封的根条目数量，其余是按字面存储名分享的外来条目。
+    /// 0 = 纯外来分享，等于 `item_count` = 纯受管分享，之间 = 混合分享。
+    pub managed_count: usize,
     /// Keys which decrypt the shared roots' storage names. Multiple selected
     /// roots from the same parent share one key.
     pub parent_keys: Vec<[u8; 16]>,
+}
+
+impl Pack {
+    /// 是否带受管条目（等价于「带上了 `parent_keys`」）。转存后重编信封需要它。
+    pub(super) fn managed(&self) -> bool {
+        self.managed_count != 0
+    }
 }
 
 /// 从云盘原生分享短链里取出要打包进 `sd://` 的分享 ID。
@@ -104,13 +120,6 @@ pub(super) fn native_password(url: &str) -> Option<String> {
         .filter(|pwd| !pwd.is_empty())
 }
 
-/// 是否为阿里云盘「快传」原生短链（`/t/{id}`）。快传没有提取码，导入失败时
-/// 不能再向用户索要提取码，语义上也不适合 `sd://` 封装。
-pub(super) fn is_quick_native(url: &str) -> bool {
-    native_source(url) == Some("aliyundrive")
-        && crate::adapters::aliyun_web::is_quick_share_url(url)
-}
-
 pub(super) fn encode(pack: &Pack) -> Result<String, &'static str> {
     let source = match pack.source_type.as_str() {
         "baidupan" => SOURCE_BAIDUPAN,
@@ -118,20 +127,30 @@ pub(super) fn encode(pack: &Pack) -> Result<String, &'static str> {
         "quark" => SOURCE_QUARK,
         _ => return Err("unsupported datasource type"),
     };
-    if pack.item_count == 0 || pack.item_count > MAX_ITEMS {
+    if pack.item_count == 0 || pack.item_count > MAX_ITEMS || pack.managed_count > pack.item_count {
         return Err("invalid item count");
     }
-    if pack.parent_keys.len() > pack.item_count || pack.encrypted != !pack.parent_keys.is_empty() {
-        return Err("parent keys do not match encryption flag");
+    if pack.managed() == pack.parent_keys.is_empty() || pack.parent_keys.len() > pack.managed_count
+    {
+        return Err("parent keys do not match managed entries");
+    }
+    if pack.encrypted && !pack.managed() {
+        return Err("encrypted content requires managed envelopes");
     }
     validate_string(&pack.share_id)?;
 
     let mut bits = BitWriter::default();
     bits.write_bits(source as u64, 4);
     bits.write_bit(pack.encrypted);
+    bits.write_bit(pack.disguise != Disguise::None);
+    match pack.disguise {
+        Disguise::None => {}
+        Disguise::Bmp => bits.write_bits(DISGUISE_BMP, 4),
+    }
     bits.write_string(&pack.share_id)?;
     write_password(&mut bits, &pack.password)?;
     bits.write_varint(pack.item_count as u64);
+    bits.write_varint(pack.managed_count as u64);
     bits.write_varint(pack.parent_keys.len() as u64);
     for key in &pack.parent_keys {
         bits.write_bytes(key);
@@ -139,9 +158,12 @@ pub(super) fn encode(pack: &Pack) -> Result<String, &'static str> {
 
     let plain = bits.finish();
     let mut cipher = Aes128Siv::new_from_slice(&V1_KEY).map_err(|_| "invalid protocol key")?;
-    let version = [VERSION];
+    let version_bytes = [VERSION];
     let ciphertext = cipher
-        .encrypt([b"safedrive-share".as_slice(), version.as_slice()], &plain)
+        .encrypt(
+            [b"safedrive-share".as_slice(), version_bytes.as_slice()],
+            &plain,
+        )
         .map_err(|_| "share encryption failed")?;
 
     let mut wire = ciphertext;
@@ -187,6 +209,13 @@ fn decode_plain(plain: &[u8]) -> Result<Pack, DecodeError> {
         _ => return Err(DecodeError::Invalid),
     };
     let encrypted = bits.read_bit()?;
+    let mut disguise = Disguise::None;
+    if bits.read_bit()? {
+        disguise = match bits.read_bits(4)? {
+            DISGUISE_BMP => Disguise::Bmp,
+            _ => return Err(DecodeError::Invalid),
+        };
+    }
     let share_id = bits.read_string()?;
     if share_id.is_empty() {
         return Err(DecodeError::Invalid);
@@ -196,8 +225,13 @@ fn decode_plain(plain: &[u8]) -> Result<Pack, DecodeError> {
     if item_count == 0 || item_count > MAX_ITEMS {
         return Err(DecodeError::Invalid);
     }
+    let managed_count = usize::try_from(bits.read_varint()?).map_err(|_| DecodeError::Invalid)?;
+    // 加密内容必然走受管信封，否则接收方拿不到任何可解密的东西。
+    if managed_count > item_count || (encrypted && managed_count == 0) {
+        return Err(DecodeError::Invalid);
+    }
     let key_count = usize::try_from(bits.read_varint()?).map_err(|_| DecodeError::Invalid)?;
-    if key_count > item_count || encrypted != (key_count != 0) {
+    if key_count > managed_count || (managed_count != 0) != (key_count != 0) {
         return Err(DecodeError::Invalid);
     }
     let mut parent_keys = Vec::with_capacity(key_count);
@@ -215,7 +249,9 @@ fn decode_plain(plain: &[u8]) -> Result<Pack, DecodeError> {
         share_id,
         password,
         encrypted,
+        disguise,
         item_count,
+        managed_count,
         parent_keys,
     })
 }
@@ -255,9 +291,60 @@ mod tests {
             share_id: "qym_MmGtZhFrTpKqf_H0oQ".into(),
             password: "a2k9".into(),
             encrypted,
+            disguise: Disguise::None,
             item_count: 8,
+            managed_count: if encrypted { 8 } else { 0 },
             parent_keys: encrypted.then_some([0x5a; 16]).into_iter().collect(),
         }
+    }
+
+    /// 伪装形态、「受管但不加密」、混合分享的受管条目数都原样往返。
+    #[test]
+    fn managed_shape_survives_the_roundtrip() {
+        // 加密 + 伪装
+        let mut both = sample(true);
+        both.disguise = Disguise::Bmp;
+        assert_eq!(decode(&encode(&both).unwrap()), Ok(both));
+
+        // 只伪装不加密：受管（带目录密钥）但内容是明文
+        let mut disguise_only = sample(true);
+        disguise_only.encrypted = false;
+        disguise_only.disguise = Disguise::Bmp;
+        assert_eq!(
+            decode(&encode(&disguise_only).unwrap()),
+            Ok(disguise_only.clone())
+        );
+        assert!(disguise_only.managed());
+
+        // 混合分享：8 项里 3 项受管、5 项外来
+        let mut mixed = sample(true);
+        mixed.managed_count = 3;
+        let decoded = decode(&encode(&mixed).unwrap()).unwrap();
+        assert_eq!(decoded, mixed);
+        assert_eq!((decoded.item_count, decoded.managed_count), (8, 3));
+        assert!(decoded.managed());
+
+        // 纯外来分享没有受管条目，也不带目录密钥
+        let foreign = sample(false);
+        assert_eq!(foreign.managed_count, 0);
+        assert!(!foreign.managed());
+        assert_eq!(decode(&encode(&foreign).unwrap()), Ok(foreign));
+
+        // 加密必然受管：不带目录密钥的「加密」包非法
+        let mut bogus = sample(false);
+        bogus.encrypted = true;
+        assert!(encode(&bogus).is_err());
+
+        // 受管条目数不能超过总条目数
+        let mut too_many = sample(true);
+        too_many.managed_count = 9;
+        assert!(encode(&too_many).is_err());
+
+        // 目录密钥数不能超过受管条目数
+        let mut extra_keys = sample(true);
+        extra_keys.managed_count = 1;
+        extra_keys.parent_keys = vec![[0x5a; 16], [0x5b; 16]];
+        assert!(encode(&extra_keys).is_err());
     }
 
     #[test]
@@ -329,11 +416,8 @@ mod tests {
             native_source("https://pan.quark.cn/s/3a5f8b2c1d0e"),
             Some("quark")
         );
-        // 阿里云盘快传短链 `/t/{id}` 也应识别为 aliyundrive 源
-        assert_eq!(
-            native_source("https://www.alipan.com/t/aB12cd34"),
-            Some("aliyundrive")
-        );
+        // 阿里云盘快传短链 `/t/{id}` 不在支持范围内
+        assert!(native_source("https://www.alipan.com/t/aB12cd34").is_none());
         // 同域名但不是分享短链
         assert!(native_source("https://pan.baidu.com/disk/home").is_none());
         assert!(native_source("https://www.alipan.com/").is_none());
@@ -342,19 +426,6 @@ mod tests {
         assert!(native_source("sd://abcdef").is_none());
         // 域名后缀伪装不能蒙混（evil-baidu.com 不属于 baidu.com）
         assert!(native_source("https://evil-baidu.com/s/1abc").is_none());
-    }
-
-    /// 快传短链（`/t/`）判为快传；普通分享短链与非阿里链接判否。
-    #[test]
-    fn detects_quick_native_share() {
-        assert!(is_quick_native("https://www.alipan.com/t/aB12cd34"));
-        assert!(is_quick_native(
-            "https://www.aliyundrive.com/t/aB12cd34?x=1"
-        ));
-        assert!(!is_quick_native("https://www.alipan.com/s/3XCkDNb1Cfa"));
-        assert!(!is_quick_native("https://pan.baidu.com/s/1abc"));
-        assert!(!is_quick_native("https://pan.quark.cn/s/3a5f8b2c1d0e"));
-        assert!(!is_quick_native("https://example.com/t/aB12cd34"));
     }
 
     /// 链接内嵌的 `?pwd=` 提取码能被取出；没有或为空则判 None。
@@ -389,8 +460,10 @@ mod tests {
     fn items_from_one_parent_do_not_grow_the_link() {
         let mut one = sample(true);
         one.item_count = 1;
+        one.managed_count = 1;
         let mut hundred = one.clone();
         hundred.item_count = 100;
+        hundred.managed_count = 100;
         assert_eq!(encode(&one).unwrap().len(), encode(&hundred).unwrap().len());
     }
 
@@ -413,9 +486,9 @@ mod tests {
             .unwrap();
         let encrypted_pad = *wire.last().unwrap() & 0xf0;
         assert_eq!(wire.last().unwrap() & 0x0f, VERSION);
-        *wire.last_mut().unwrap() = encrypted_pad | 2;
+        *wire.last_mut().unwrap() = encrypted_pad | 7;
         let changed = format!("sd://{}", URL_SAFE_NO_PAD.encode(wire));
-        assert_eq!(decode(&changed), Err(DecodeError::UnsupportedVersion(2)));
+        assert_eq!(decode(&changed), Err(DecodeError::UnsupportedVersion(7)));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { QrcodeOutlined, ReloadOutlined } from '@ant-design/icons';
-import { App, Button, Card, Checkbox, Form, Input, Modal, QRCode, Select, Spin, Switch, Typography } from 'antd';
+import { App, Button, Card, Divider, Form, Input, Modal, QRCode, Select, Spin, Switch, Typography } from 'antd';
 import { useCallback, useEffect, useState } from 'react';
 import { api, type AliyunApp, type AliyunAppInput, type BaiduApp, type DsRecord, type DsType } from '../api/client';
 import { useSources } from '../stores/sources';
@@ -11,9 +11,90 @@ interface FormValues {
   clientId?: string; clientSecret?: string; refreshToken?: string;
   /** 阿里云盘：内置第三方应用键，或 CUSTOM_APP */
   app?: string; webRefreshToken?: string;
-  apiBase?: string; cookie?: string; encryptionEnabled: boolean;
+  apiBase?: string; cookie?: string;
+  /** 数据保护总开关：等价于「加密/分卷/伪装任一开启」，服务端据三者自行推导 */
+  protectionEnabled: boolean;
+  encryptionEnabled: boolean;
   encryptionPassword?: string; volumeEnabled: boolean; volumeText: string;
-  volumeStrategy: 'fixed' | 'random'; volumeNameFormat: string; cacheEnabled: boolean;
+  volumeStrategy: 'fixed' | 'random'; leafNameFormat: string;
+  disguiseEnabled: boolean; disguiseAlgorithm: string; cacheEnabled: boolean;
+}
+
+/** 叶子名模版的占位符（与服务端 crate::naming 一致）。 */
+const TOKEN_SOURCE = '{s}';
+const TOKEN_STEM = '{n}';
+const TOKEN_EXTENSION = '{x}';
+const TOKEN_ENVELOPE = '{e}';
+const TOKEN_INDEX = '{i}';
+
+/** 拆出「主名 / 扩展名」，与服务端 naming::split_extension 一致。 */
+function splitExtension(source: string): [string, string] {
+  const dot = source.lastIndexOf('.');
+  return dot > 0 ? [source.slice(0, dot), source.slice(dot + 1)] : [source, ''];
+}
+
+/** 按模版展开一个叶子名（与服务端 naming::render 的占位符语义一致）。 */
+function renderLeafName(format: string, source: string, envelope: string, index: string): string {
+  const [stem, extension] = splitExtension(source);
+  return format
+    .split(TOKEN_SOURCE).join(source)
+    .split(TOKEN_STEM).join(stem)
+    .split(TOKEN_EXTENSION).join(extension)
+    .split(TOKEN_ENVELOPE).join(envelope)
+    .split(TOKEN_INDEX).join(index);
+}
+
+/**
+ * 三个开关能推出来的默认叶子名模版（与服务端 naming::default_format 一致）：
+ * 加密用 {e}（不泄露明文名），否则用 {s}；分卷再带等宽序号；开了伪装则在末尾
+ * 加上算法扩展名。
+ */
+function defaultLeafFormat(encrypted: boolean, volume: boolean, disguise: string): string {
+  const base = encrypted ? TOKEN_ENVELOPE : volume ? `${TOKEN_SOURCE}.${TOKEN_INDEX}` : TOKEN_SOURCE;
+  const extension = DISGUISE_EXTENSIONS[disguise];
+  return extension ? `${base}.${extension}` : base;
+}
+
+/** 模版校验，规则与服务端 naming::validate_format 一一对应。 */
+function validateLeafFormat(format: string, encrypted: boolean, volume: boolean): string | null {
+  if (!format.trim()) return '叶子文件名模版不能为空';
+  const hasEnvelope = format.includes(TOKEN_ENVELOPE);
+  const hasIndex = format.includes(TOKEN_INDEX);
+  if (encrypted && !hasEnvelope) return `加密数据源的模版必须包含 ${TOKEN_ENVELOPE}（可逆索引凭据，同时避免泄露明文名）`;
+  if (!encrypted && hasEnvelope) return `${TOKEN_ENVELOPE} 只在启用加密时可用`;
+  if (volume && !encrypted && !hasIndex) return `未加密的分卷数据源必须包含 ${TOKEN_INDEX}，否则无法确定分卷序号`;
+  if (!volume && hasIndex) return `${TOKEN_INDEX} 只在启用分卷时可用`;
+  const residue = [TOKEN_SOURCE, TOKEN_STEM, TOKEN_EXTENSION, TOKEN_ENVELOPE, TOKEN_INDEX]
+    .reduce((rest, token) => rest.split(token).join(''), format);
+  if (residue.includes('{') || residue.includes('}')) {
+    return `模版里有无法识别的占位符；只支持 ${TOKEN_SOURCE} / ${TOKEN_STEM} / ${TOKEN_EXTENSION} / ${TOKEN_ENVELOPE} / ${TOKEN_INDEX}`;
+  }
+  // 带扩展名与不带扩展名两种取样都得站得住：{x} 对后者展开成空。
+  for (const source of ['sample.bin', 'sample']) {
+    const sample = renderLeafName(format, source, 'a1', '01');
+    if (sample.includes('/') || sample.includes('\\') || sample === '.' || sample === '..') {
+      return '模版展开后包含非法路径字符';
+    }
+    if (!sample) {
+      return `模版对没有扩展名的文件会展开成空名字；请至少再带上 ${TOKEN_STEM} / ${TOKEN_SOURCE} / ${TOKEN_ENVELOPE} / ${TOKEN_INDEX} 或固定文字`;
+    }
+  }
+  return null;
+}
+
+/** 预览用的示例文件名与凭据取样。 */
+const PREVIEW_SOURCE = '电影.mkv';
+const PREVIEW_ENVELOPE = ['3f', 'a1', 'c8'];
+
+/**
+ * 按模版展开出示例叶子名。带 {i} 或 {e} 时给三个（能看出序号/凭据怎么变），
+ * 否则一个就够。
+ */
+function previewLeafNames(format: string): string[] {
+  const count = format.includes(TOKEN_INDEX) || format.includes(TOKEN_ENVELOPE) ? 3 : 1;
+  return Array.from({ length: count }, (_, i) =>
+    renderLeafName(format, PREVIEW_SOURCE, PREVIEW_ENVELOPE[i], String(i + 1).padStart(2, '0')),
+  );
 }
 
 const DS_TYPES: { label: string; value: DsType }[] = [
@@ -23,6 +104,13 @@ const DS_TYPES: { label: string; value: DsType }[] = [
   { label: '阿里云盘', value: 'aliyundrive' },
   { label: '夸克网盘', value: 'quark' },
 ];
+
+/** 伪装算法下拉表（与服务端 disguise::ALGORITHMS 一致，默认取第一项）。 */
+const DISGUISE_ALGORITHMS = [
+  { label: 'BMP 位图（54 字节标准头部）', value: 'bmp' },
+];
+/** 各算法对应的叶子名扩展名（与服务端 Disguise::extension 一致）。 */
+const DISGUISE_EXTENSIONS: Record<string, string | undefined> = { bmp: 'bmp' };
 
 /** 用户自备 client_id / client_secret 的伪应用键（与服务端一致）。 */
 const CUSTOM_APP = 'custom';
@@ -85,8 +173,15 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
   const [aliSilentLoading, setAliSilentLoading] = useState(false);
   const [form] = Form.useForm<FormValues>();
   const type = Form.useWatch('type', form) ?? 'localfs';
-  const encrypted = Form.useWatch('encryptionEnabled', form) ?? true;
-  const volume = Form.useWatch('volumeEnabled', form) ?? true;
+  // 数据保护总开关。服务端没有这个字段 —— 它就是「加密/分卷/伪装任一开启」，
+  // 关掉即三者全关。开启后文件落进由根密码加密命名的信封目录，于是根密码与
+  // 叶子名模版成了三者共用的配置。
+  const protection = Form.useWatch('protectionEnabled', form) ?? true;
+  const encrypted = (Form.useWatch('encryptionEnabled', form) ?? true) && protection;
+  const volume = (Form.useWatch('volumeEnabled', form) ?? true) && protection;
+  const disguised = (Form.useWatch('disguiseEnabled', form) ?? false) && protection;
+  const disguiseAlgorithm = Form.useWatch('disguiseAlgorithm', form) ?? DISGUISE_ALGORITHMS[0].value;
+  const leafFormat = Form.useWatch('leafNameFormat', form) ?? '';
   const clientId = Form.useWatch('clientId', form) ?? '';
   const clientSecret = Form.useWatch('clientSecret', form) ?? '';
   // `app` 字段由阿里云盘与百度网盘共用（同一时刻只有一种类型在编辑）。
@@ -111,12 +206,29 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
         apiBase:d.config.apiBase, cookie:d.config.cookie,
         encryptionEnabled:d.encryptionEnabled, encryptionPassword:d.password,
         volumeEnabled:d.volumeEnabled, volumeText:sizeToInput(d.volumeSize),
-        volumeStrategy:d.volumeStrategy, volumeNameFormat:d.volumeNameFormat, cacheEnabled:d.cacheEnabled });
+        volumeStrategy:d.volumeStrategy, leafNameFormat:d.leafNameFormat,
+        disguiseEnabled:d.disguiseEnabled, disguiseAlgorithm:d.disguiseAlgorithm || DISGUISE_ALGORITHMS[0].value,
+        // 服务端不存这个开关，按三者是否有开的推回来。
+        protectionEnabled:d.encryptionEnabled || d.volumeEnabled || d.disguiseEnabled,
+        cacheEnabled:d.cacheEnabled });
     } else {
-      form.setFieldsValue({ type: 'localfs', encryptionEnabled: true, volumeEnabled: true,
-        volumeText: '300M', volumeStrategy: 'random', volumeNameFormat: '{s}_{i}.bin', cacheEnabled: true });
+      form.setFieldsValue({ type: 'localfs', protectionEnabled: true,
+        encryptionEnabled: true, volumeEnabled: true,
+        volumeText: '300M', volumeStrategy: 'random',
+        leafNameFormat: defaultLeafFormat(true, true, ''),
+        disguiseEnabled: false, disguiseAlgorithm: DISGUISE_ALGORITHMS[0].value, cacheEnabled: true });
     }
   }, [open, editing, cloneFrom, form]);
+
+  // 新建时开关一动就把叶子名模版重置成该组合的默认值：既省得用户手填，也
+  // 避免留下一个与新开关不自洽的模版（如关掉加密后还剩着 {e}）。编辑时不动
+  // —— 模版创建后不可更改。
+  useEffect(() => {
+    if (!open || editing) return;
+    form.setFieldsValue({
+      leafNameFormat: defaultLeafFormat(encrypted, volume, disguised ? disguiseAlgorithm : ''),
+    });
+  }, [open, editing, encrypted, volume, disguised, disguiseAlgorithm, form]);
 
   // 内置应用清单：进了阿里云盘表单才拉，取不到也不影响「自定义应用」。
   useEffect(() => {
@@ -204,11 +316,21 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
 
   const onSubmit = async () => {
     const v = await form.validateFields();
+    // 总开关只是前端的分组：关掉即三者全关，服务端据三者推导「是否受管」。
+    const on = v.protectionEnabled;
+    const enc = on && v.encryptionEnabled;
+    const vol = on && v.volumeEnabled;
+    const dis = on && v.disguiseEnabled;
+    if (on && !enc && !vol && !dis) {
+      message.error('启用数据保护后，至少要开启内容加密、分卷存储、存储侧伪装中的一项');
+      return;
+    }
     const config = buildConfig(v, editing);
-    const body = {name:v.name,type:v.type,config,encryptionEnabled:v.encryptionEnabled,
-      password:v.encryptionPassword || undefined,volumeEnabled:v.volumeEnabled,
-      volumeSize:v.volumeEnabled ? parseSize(v.volumeText) ?? 0 : 0,volumeStrategy:v.volumeStrategy,
-      volumeNameFormat:v.volumeNameFormat,cacheEnabled:v.cacheEnabled};
+    const body = {name:v.name,type:v.type,config,encryptionEnabled:enc,
+      password:on ? (v.encryptionPassword || undefined) : undefined,volumeEnabled:vol,
+      volumeSize:vol ? parseSize(v.volumeText) ?? 0 : 0,volumeStrategy:v.volumeStrategy,
+      leafNameFormat:on ? v.leafNameFormat : undefined,disguiseEnabled:dis,
+      disguiseAlgorithm:v.disguiseAlgorithm || DISGUISE_ALGORITHMS[0].value,cacheEnabled:v.cacheEnabled};
     setSaving(true);
     try {
       const saved = editing ? await api.updateDs(editing.id, body) : await api.createDs(body);
@@ -291,34 +413,88 @@ function buildConfig(v: FormValues, editing: DsRecord | null): Record<string, st
 
   return <Modal title={editing?'编辑数据源':cloneFrom?'克隆数据源':'添加数据源'} open={open} confirmLoading={saving} onOk={()=>void onSubmit()} onCancel={confirmClose} destroyOnHidden width={620}>
     <Form form={form} layout="vertical" name="ds">
-      <Form.Item name="name" label="数据源名称" rules={[{required:true}]}><Input/></Form.Item>
-      <Form.Item name="type" label="类型" rules={[{required:true}]}><Select disabled={!!editing} options={DS_TYPES}/></Form.Item>
-      {type==='localfs'&&<Form.Item name="root" label="根目录" rules={[{required:true}]}><Input/></Form.Item>}
-      {type==='webdav'&&<><Form.Item name="url" label="WebDAV 地址" rules={[{required:true},{pattern:/^https?:\/\//}]}><Input/></Form.Item><Form.Item name="username" label="用户名"><Input/></Form.Item><Form.Item name="password" label="密码"><Input.Password/></Form.Item></>}
-      {type==='baidupan'&&<><Form.Item name="root" label="网盘根目录" extra="留空即网盘根目录；建议单独用一个目录"><Input placeholder="/safedrive"/></Form.Item>
-      <Form.Item name="bduss" label="BDUSS" rules={[{required:true,message:'请扫码登录获取，或手动粘贴'}]} extra={<Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>setQrOpen(true)}>扫码登录自动获取</Button>}><Input.Password placeholder="点击下方扫码登录自动获取，或手动粘贴 Cookie 中的 BDUSS"/></Form.Item>
-      <Form.Item name="app" label="第三方应用" extra={baiduAppNote ?? '内置应用无需自建：扫码拿到 BDUSS 后自动授权换取令牌'}><Select options={baiduAppOptions} placeholder="ES 文件管理器"/></Form.Item>
-      {selectedApp===CUSTOM_APP&&<><Form.Item name="clientId" label="API Key（client_id）" rules={[{required:true}]} extra="百度网盘开放平台自建应用的凭据；只在本机与百度官方接口之间流转"><Input/></Form.Item>
-      <Form.Item name="clientSecret" label="Secret Key（client_secret）" rules={[{required:true}]}><Input.Password/></Form.Item></>}
-      <Form.Item name="userAgent" label="下载 User-Agent" extra="留空使用默认值，仅影响下载数据流量的 UA 标识"><Input placeholder="netdisk;P2SP;2.2.61.31;android"/></Form.Item></>}
-      {type==='aliyundrive'&&<><Form.Item name="root" label="网盘根目录" extra="留空即网盘根目录；建议单独用一个目录"><Input placeholder="/safedrive"/></Form.Item>
-      <Form.Item name="webRefreshToken" label="官网令牌（推荐）" extra={<><Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>setAliWebQrOpen(true)}>扫码登录官网获取</Button><div><Typography.Text type="secondary">扫码登录后可免扫码换取下方开放平台 refresh_token；分享与转存走官网 PDS 接口，必须配置官网令牌才可用。不需要分享/转存可留空。</Typography.Text></div></>}><Input.Password placeholder="扫码登录官网自动填入，可免扫码授权下方应用"/></Form.Item>
-      <Form.Item name="app" label="第三方应用" extra={aliAppNote ?? '内置应用无需自建：扫码即用；填入已有 refresh_token 时会自动识别归属'}><Select options={aliAppOptions} placeholder="阿里云盘TV"/></Form.Item>
-      {selectedApp===CUSTOM_APP&&<><Form.Item name="clientId" label="client_id" rules={[{required:true}]} extra="阿里云盘开放平台自建应用的凭据；只在本机与阿里官方接口之间流转"><Input/></Form.Item>
-      <Form.Item name="clientSecret" label="client_secret" rules={[{required:true}]}><Input.Password/></Form.Item></>}
-      <Form.Item name="refreshToken" label="refresh_token" rules={[{required:true,message:'请扫码授权获取，或手动粘贴'}]} extra={<><Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>void openAliyunQr()}>扫码授权自动获取</Button>{aliWebRefreshToken&&<Button type="link" size="small" loading={aliSilentLoading} style={{padding:0,marginLeft:12}} onClick={()=>void runSilentGrant()}>用官网令牌免扫码获取</Button>}{aliDetected&&<div><Typography.Text type="secondary">{aliDetected}</Typography.Text></div>}</>}><Input.Password placeholder="点击下方扫码授权自动获取，令牌过期会自动轮换"/></Form.Item></>}
-      {type==='quark'&&<><Form.Item name="root" label="网盘根目录" extra="留空即网盘根目录；建议单独用一个目录"><Input placeholder="/safedrive"/></Form.Item>
-      <Form.Item name="cookie" label="Cookie" rules={[{required:true}]} extra="浏览器登录 pan.quark.cn 后复制整串 Cookie（需包含 __puus）；后台会自动续期并回写"><Input.TextArea rows={3} autoComplete="off" placeholder="__pus=...; __puus=...; ..."/></Form.Item>
-      <Form.Item name="apiBase" label="接口地址" extra="留空使用 https://drive.quark.cn/1/clouddrive"><Input placeholder="https://drive.quark.cn/1/clouddrive"/></Form.Item></>}
+      <Form.Item name="name" label="数据源名称" tooltip="仅用于本机识别，同时是 WebDAV 路径的一段（/dav/<数据源名>/…）。随时可改。" rules={[{required:true}]}><Input/></Form.Item>
+      <Form.Item name="type" label="类型" tooltip="存储后端。本地文件系统与 WebDAV 直连，三家网盘走各自的官方/官网接口。创建后不可更改。" rules={[{required:true}]}><Select disabled={!!editing} options={DS_TYPES}/></Form.Item>
+      {type==='localfs'&&<Form.Item name="root" label="根目录" tooltip="服务端本机的绝对路径，SafeDrive 只在该目录内读写；目录不存在会自动创建。" rules={[{required:true}]}><Input/></Form.Item>}
+      {type==='webdav'&&<><Form.Item name="url" label="WebDAV 地址" tooltip="WebDAV 服务的完整地址，必须以 http:// 或 https:// 开头，可带子路径（如 /remote.php/dav）。" rules={[{required:true},{pattern:/^https?:\/\//}]}><Input/></Form.Item><Form.Item name="username" label="用户名" tooltip="WebDAV Basic 认证用户名；服务端免鉴权时可留空。"><Input/></Form.Item><Form.Item name="password" label="密码" tooltip="WebDAV Basic 认证密码；只存在本机 datasources.json 里。"><Input.Password/></Form.Item></>}
+      {type==='baidupan'&&<><Form.Item name="root" label="网盘根目录" tooltip="SafeDrive 在该网盘里的工作目录，所有读写都限定在它之内。留空即网盘根目录；建议单独用一个目录，便于与网盘里的其它文件隔离。"><Input placeholder="/safedrive"/></Form.Item>
+      <Form.Item name="bduss" label="BDUSS" tooltip="百度账号的登录凭证（浏览器 Cookie 里的 BDUSS 字段），用于下载与分享等网页接口。推荐用扫码登录自动获取，免去手动翻 Cookie。" rules={[{required:true,message:'请扫码登录获取，或手动粘贴'}]} extra={<Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>setQrOpen(true)}>扫码登录自动获取</Button>}><Input.Password placeholder="点击下方扫码登录自动获取，或手动粘贴 Cookie 中的 BDUSS"/></Form.Item>
+      <Form.Item name="app" label="第三方应用" tooltip="用哪个开放平台应用来读写文件。内置应用无需自建，扫码拿到 BDUSS 后会自动完成设备授权换取令牌；也可改选「自定义应用」填自己申请的凭据。" extra={baiduAppNote}><Select options={baiduAppOptions} placeholder="ES 文件管理器"/></Form.Item>
+      {selectedApp===CUSTOM_APP&&<><Form.Item name="clientId" label="API Key（client_id）" tooltip="百度网盘开放平台自建应用的 API Key；只在本机与百度官方接口之间流转。" rules={[{required:true}]}><Input/></Form.Item>
+      <Form.Item name="clientSecret" label="Secret Key（client_secret）" tooltip="与 API Key 配对的 Secret Key，必须同时填写。" rules={[{required:true}]}><Input.Password/></Form.Item></>}
+      <Form.Item name="userAgent" label="下载 User-Agent" tooltip="发起下载请求时使用的 UA 标识。留空使用默认值；个别网络环境下换一个 UA 能改善下载速度。" ><Input placeholder="netdisk;P2SP;2.2.61.31;android"/></Form.Item></>}
+      {type==='aliyundrive'&&<><Form.Item name="root" label="网盘根目录" tooltip="SafeDrive 在该网盘里的工作目录，所有读写都限定在它之内。留空即网盘根目录；建议单独用一个目录。"><Input placeholder="/safedrive"/></Form.Item>
+      <Form.Item name="webRefreshToken" label="官网令牌（推荐）" tooltip="阿里云盘官网（PDS）令牌。一份顶两用：可免扫码换取下方开放平台 refresh_token；分享与转存只能走官网接口，不配置就没有分享入口。不需要分享/转存可留空。" extra={<Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>setAliWebQrOpen(true)}>扫码登录官网获取</Button>}><Input.Password placeholder="扫码登录官网自动填入，可免扫码授权下方应用"/></Form.Item>
+      <Form.Item name="app" label="第三方应用" tooltip="日常读写走开放平台，需要一个应用的凭据。内置应用无需自建、扫码即用；填入已有 refresh_token 时会按签发者自动识别归属。也可改选「自定义应用」填自己申请的凭据。" extra={aliAppNote}><Select options={aliAppOptions} placeholder="阿里云盘TV"/></Form.Item>
+      {selectedApp===CUSTOM_APP&&<><Form.Item name="clientId" label="client_id" tooltip="阿里云盘开放平台自建应用的 client_id；只在本机与阿里官方接口之间流转。" rules={[{required:true}]}><Input/></Form.Item>
+      <Form.Item name="clientSecret" label="client_secret" tooltip="与 client_id 配对的密钥，必须同时填写。" rules={[{required:true}]}><Input.Password/></Form.Item></>}
+      <Form.Item name="refreshToken" label="refresh_token" tooltip="开放平台长期令牌，日常读写都靠它换取 access token（到期自动轮换并写回配置）。可扫码授权获取，或用上面的官网令牌免扫码获取。" rules={[{required:true,message:'请扫码授权获取，或手动粘贴'}]} extra={<><Button type="link" size="small" icon={<QrcodeOutlined/>} style={{padding:0}} onClick={()=>void openAliyunQr()}>扫码授权自动获取</Button>{aliWebRefreshToken&&<Button type="link" size="small" loading={aliSilentLoading} style={{padding:0,marginLeft:12}} onClick={()=>void runSilentGrant()}>用官网令牌免扫码获取</Button>}{aliDetected&&<div><Typography.Text type="secondary">{aliDetected}</Typography.Text></div>}</>}><Input.Password placeholder="点击下方扫码授权自动获取，令牌过期会自动轮换"/></Form.Item></>}
+      {type==='quark'&&<><Form.Item name="root" label="网盘根目录" tooltip="SafeDrive 在该网盘里的工作目录，所有读写都限定在它之内。留空即网盘根目录；建议单独用一个目录。"><Input placeholder="/safedrive"/></Form.Item>
+      <Form.Item name="cookie" label="Cookie" tooltip="浏览器登录 pan.quark.cn 后复制的整串 Cookie，必须包含 __puus。__puus 会不断轮换，后台自动续期并写回配置，同一份填一次即可长期使用。" rules={[{required:true}]}><Input.TextArea rows={3} autoComplete="off" placeholder="__pus=...; __puus=...; ..."/></Form.Item>
+      <Form.Item name="apiBase" label="接口地址" tooltip="夸克网盘 API 域名，一般不用改。留空使用 https://drive.quark.cn/1/clouddrive。"><Input placeholder="https://drive.quark.cn/1/clouddrive"/></Form.Item></>}
+      <Form.Item name="cacheEnabled" label="持久下载缓存" valuePropName="checked"
+        tooltip="允许该数据源把云端密文按 1 MiB 块缓存到本地磁盘，命中后不再回源，重复播放/下载更快。还受设置页的全局缓存总开关约束。随时可改。">
+        <Switch/>
+      </Form.Item>
       <Card size="small" title="数据保护" style={{marginBottom:16}}>
-        <Form.Item name="encryptionEnabled" label="内容加密" valuePropName="checked" extra={editing?'创建后不可修改；如需切换请新建数据源。':'该选择创建后不可更改。'}><Switch disabled={!!editing}/></Form.Item>
-        {encrypted&&<Form.Item name="encryptionPassword" label="根密码" rules={[{required:!editing,message:'请输入密码'}]} extra={editing?'修改后会重命名存储端根层加密文件名；留空保持原密码。':'丢失后无法恢复数据。'}><Input.Password/></Form.Item>}
-        <Form.Item name="volumeEnabled" valuePropName="checked" extra={editing?'创建后不可修改。':''}><Checkbox disabled={!!editing}>启用分卷</Checkbox></Form.Item>
-        {volume&&<><Form.Item name="volumeText" label="最大分卷大小" rules={[{required:true},{validator:(_,v)=>{const n=parseSize(v??'');return n!=null&&n>=64*1024?Promise.resolve():Promise.reject(new Error('至少 64K，例如 300M'));}}]}><Input/></Form.Item>
-        <Form.Item name="volumeStrategy" label="分卷策略"><Select options={[{label:'随机大小（默认，卷数与固定策略一致）',value:'random'},{label:'固定大小',value:'fixed'}]}/></Form.Item>
-        {!encrypted&&<Form.Item name="volumeNameFormat" label="分卷名称格式" rules={[{required:true},{validator:(_,v:string)=>v?.includes('{i}')?Promise.resolve():Promise.reject(new Error('必须包含 {i}'))}]} extra="{s} 为原文件名，{i} 为位数对齐的分卷序号"><Input placeholder="{s}_{i}.bin"/></Form.Item>}</>}
-        {encrypted&&volume&&<Typography.Text type="secondary">加密场景沿用由文件密钥派生的随机分卷名称，不开放自定义模板。</Typography.Text>}
-        <Form.Item name="cacheEnabled" valuePropName="checked" style={{marginTop:12}}><Checkbox>允许该数据源使用持久下载缓存</Checkbox></Form.Item>
+        <Form.Item name="protectionEnabled" label="启用数据保护" valuePropName="checked"
+          tooltip="开启后每个文件在存储端落进一个由根密码加密命名的「信封目录」，可按需叠加内容加密 / 分卷存储 / 存储侧伪装；关闭则原样存明文文件。该选择创建后不可更改。"
+          extra={editing?'创建后不可修改；如需切换请新建数据源。':undefined}>
+          <Switch disabled={!!editing}/>
+        </Form.Item>
+        {protection&&<>
+          <Form.Item name="encryptionPassword" label="根密码" rules={[{required:!editing,message:'请输入密码'}]}
+            tooltip="整个数据源的主密钥。信封目录名与内容加密密钥都由它派生，同时是「这个存储对象是不是 SafeDrive 写的」的唯一判据。丢失后无法恢复数据，请另行备份。"
+            extra={editing?'修改后会重命名存储端根层加密文件名；留空保持原密码。':undefined}>
+            <Input.Password/>
+          </Form.Item>
+          <Form.Item name="leafNameFormat" label="叶子文件名模版" rules={[{required:true},{validator:(_,v:string)=>{const error=validateLeafFormat(v??'',encrypted,volume);return error?Promise.reject(new Error(error)):Promise.resolve();}}]}
+            tooltip={`信封目录里每个叶子对象的名字。${TOKEN_SOURCE} 原始文件名（含扩展名）、${TOKEN_STEM} 主名（不含扩展名）、${TOKEN_EXTENSION} 原扩展名、${TOKEN_ENVELOPE} 文件密钥派生的可逆索引凭据（加密时必填，且不泄露明文名）、${TOKEN_INDEX} 等宽分卷序号（未加密分卷时必填）。创建后不可修改。`}
+            extra={<>
+              <div>可用占位符：{TOKEN_SOURCE} 原文件名、{TOKEN_STEM} 主名（不含扩展名）、{TOKEN_EXTENSION} 扩展名{encrypted&&<>、{TOKEN_ENVELOPE} 索引凭据</>}{volume&&<>、{TOKEN_INDEX} 分卷序号</>}。{editing&&'创建后不可修改。'}</div>
+              {!validateLeafFormat(leafFormat,encrypted,volume)&&
+                <div style={{marginTop:4,display:'flex',flexWrap:'wrap',gap:6,alignItems:'baseline'}}>
+                  <span>示例（原文件名 {PREVIEW_SOURCE}）：</span>
+                  {previewLeafNames(leafFormat).map((name,index)=>
+                    <Typography.Text key={index} code>{name}</Typography.Text>)}
+                </div>}
+            </>}>
+            <Input disabled={!!editing} placeholder={defaultLeafFormat(encrypted,volume,disguised?disguiseAlgorithm:'')}/>
+          </Form.Item>
+          <Divider style={{margin:'0 0 16px'}}/>
+          <Form.Item name="encryptionEnabled" label="内容加密" valuePropName="checked"
+            tooltip="文件内容过 ChaCha20 加密；密文长度与明文相同，不影响任何大小计算。开启后叶子名模版必须用 {e}，云端连文件名都看不到。创建后不可修改。"
+            extra={editing?'创建后不可修改。':undefined}>
+            <Switch disabled={!!editing}/>
+          </Form.Item>
+          <Divider style={{margin:'0 0 16px'}}/>
+          <Form.Item name="volumeEnabled" label="分卷存储" valuePropName="checked"
+            tooltip="把一个文件切成多个叶子对象落地，绕开网盘的单文件大小限制。是否分卷创建后不可修改，但分卷大小与固定/随机策略之后可调。"
+            extra={editing?'创建后不可修改；最大分卷大小与固定/随机策略之后可调。':undefined}>
+            <Switch disabled={!!editing}/>
+          </Form.Item>
+          {volume&&<>
+            <Form.Item name="volumeText" label="最大分卷大小" rules={[{required:true},{validator:(_,v)=>{const n=parseSize(v??'');return n!=null&&n>=64*1024?Promise.resolve():Promise.reject(new Error('至少 64K，例如 300M'));}}]}
+              tooltip="单个落地对象的字节上限，支持 K/M/G 单位（至少 64K）。开了伪装时每个对象要多带 54 字节头部，数据区上限会自动缩到该值减 54。随时可改，只影响之后上传的文件。">
+              <Input/>
+            </Form.Item>
+            <Form.Item name="volumeStrategy" label="分卷策略"
+              tooltip="随机大小：每卷在上限附近随机取值，卷数与固定策略一致，但落地大小不呈规律。固定大小：除最后一卷外都正好是上限。随时可改。">
+              <Select options={[{label:'随机大小（默认，卷数与固定策略一致）',value:'random'},{label:'固定大小',value:'fixed'}]}/>
+            </Form.Item>
+          </>}
+          <Divider style={{margin:'0 0 16px'}}/>
+          <Form.Item name="disguiseEnabled" label="存储侧伪装" valuePropName="checked"
+            tooltip="给每个落地对象套一层伪装头部（分卷则每个卷各一份），云端看到的是一个格式合法的普通文件。同时开了加密则先加密再伪装。创建后不可修改。"
+            extra={editing?'创建后不可修改。':undefined}>
+            <Switch disabled={!!editing}/>
+          </Form.Item>
+          {disguised&&<Form.Item name="disguiseAlgorithm" label="伪装算法" rules={[{required:true}]}
+            tooltip="按文件大小动态生成标准的 54 字节 BMP 头部；默认模版会补上 .bmp 后缀，云端看到的连名字带内容都像一张位图。创建后不可修改。"
+            extra={editing?'创建后不可修改。':undefined}>
+            <Select disabled={!!editing} options={DISGUISE_ALGORITHMS}/>
+          </Form.Item>}
+        </>}
       </Card>
     </Form>
     <BaiduQrModal open={qrOpen} onClose={()=>setQrOpen(false)} onSuccess={onQrSuccess}/>

@@ -71,7 +71,9 @@ body > #root { min-height: 100vh; }
 .ant-input, .ant-input-affix-wrapper, .ant-select-selector, .ant-input-number { background: #0e1119 !important; border-color: var(--sd-border) !important; }
 .ant-table-wrapper { min-height: 240px; }
 .ant-table { background: transparent !important; }
-.ant-table-container { border: 1px solid var(--sd-border); border-radius: 10px; overflow: hidden; }
+/* clip 而非 hidden：hidden 会把容器变成滚动容器，里面的吸顶表头就只会相对它定位、
+   永远吸不到视口上；clip 同样按圆角裁切，但不建立滚动容器。 */
+.ant-table-container { border: 1px solid var(--sd-border); border-radius: 10px; overflow: clip; }
 .ant-table-thead > tr > th { height: 46px; color: #8994a8 !important; font-size: 11px; letter-spacing: .45px;
   text-transform: uppercase; border-bottom-color: var(--sd-border) !important; }
 .ant-table-tbody > tr > td { height: 54px; border-bottom-color: rgba(38,44,58,.72) !important; }
@@ -118,14 +120,37 @@ body > #root { min-height: 100vh; }
 .drive-pill .ant-segmented-item-selected .ant-segmented-item-label { color: #09101a; font-weight: 650; }
 .drive-pill .ant-segmented-item-label { padding: 0 12px; }
 /* 数据源列表顶部筛选条：搜索 + 类型过滤，右侧显示匹配计数。 */
-.ds-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 18px; }
-.ds-toolbar-search.ant-input-affix-wrapper { width: 260px; border-radius: 999px; padding-inline: 14px; }
+/* ---------- 数据源工具条：吸顶 + 多维筛选 ---------- */
+/* 顶栏 70px 高，工具条吸在它正下方；列表视图的表头再吸在工具条下方（offsetHeader 由 JS 实测） */
+.ds-sticky { position: sticky; z-index: 20; margin: 0 0 18px; padding: 12px 14px;
+  border: 1px solid var(--sd-border); border-radius: 14px;
+  background: rgba(15, 18, 27, .92); backdrop-filter: blur(16px) saturate(140%);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .34); }
+.ds-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ds-toolbar-search.ant-input-affix-wrapper { width: 240px; border-radius: 999px; padding-inline: 14px; }
 .ds-toolbar-search .ant-input-prefix { margin-right: 8px; color: var(--sd-muted); }
-.ds-toolbar-type { min-width: 132px; }
-.ds-toolbar-type .ant-select-selector { border-radius: 999px !important; padding-inline: 14px !important; }
-.ds-toolbar-count { margin-left: auto; color: var(--sd-muted); font-size: 12px;
-  font-variant-numeric: tabular-nums; }
-@media (max-width: 560px) { .ds-toolbar-search.ant-input-affix-wrapper { width: 100%; } .ds-toolbar-count { margin-left: 0; } }
+.ds-filter { min-width: 116px; }
+.ds-filter .ant-select-selector { border-radius: 999px !important; padding-inline: 14px !important; }
+/* 生效中的维度描个高亮边，一眼看出筛了哪几项 */
+.ds-filter.is-active .ant-select-selector { border-color: rgba(110, 168, 255, .6) !important;
+  background: rgba(110, 168, 255, .1) !important; }
+.ds-filter.is-active .ant-select-selection-item { color: var(--sd-accent); }
+.ds-toolbar-tail { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+.ds-toolbar-count { color: var(--sd-muted); font-size: 12px; font-variant-numeric: tabular-nums;
+  white-space: nowrap; }
+/* 批量操作条：选中后从工具条下缘展开，同样跟着吸顶 */
+.ds-batchbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(38, 44, 58, .8); }
+.ds-batchbar-count { color: var(--sd-accent); font-size: 12px; font-variant-numeric: tabular-nums; }
+/* 吸顶表头要盖住底下滚过去的行，antd 默认是透明的 */
+.ant-table-sticky-holder { background: rgba(15, 18, 27, .96) !important;
+  backdrop-filter: blur(12px) saturate(130%); }
+@media (max-width: 640px) {
+  .ds-sticky { padding: 10px; }
+  .ds-toolbar-search.ant-input-affix-wrapper { width: 100%; }
+  .ds-filter { flex: 1 1 132px; min-width: 0; }
+  .ds-toolbar-tail { width: 100%; margin-left: 0; justify-content: space-between; }
+}
 
 /* ---------- 文件预览：跟随暗色主题 ---------- */
 .text-preview { max-height: 65vh; overflow: auto; background: #10141e; border: 1px solid #262c3a;

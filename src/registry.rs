@@ -28,12 +28,40 @@ pub struct DataSource {
     pub volume_size: u64,
     #[serde(default = "default_volume_strategy")]
     pub volume_strategy: String,
-    #[serde(default = "default_volume_name_format")]
-    pub volume_name_format: String,
+    /// 存储端**叶子对象**的名字模版（仅受管数据源有意义）。支持 `{s}` 原始
+    /// 文件名、`{e}` 文件密钥派生的可逆索引凭据、`{i}` 等宽序号，详见
+    /// [`crate::naming`]。与三个开关一样在创建后不可更改 —— 读取靠按模版生成
+    /// 候选名再查表，改了模版已写下去的叶子就再也认不出来。
+    #[serde(default = "default_leaf_name_format", alias = "volumeNameFormat")]
+    pub leaf_name_format: String,
+    /// 存储侧文件伪装。与加密、分卷并列的第三个开关，同样只能在创建时决定
+    /// （它改变落地字节，翻转会让已有对象读不回来）。
+    #[serde(default)]
+    pub disguise_enabled: bool,
+    #[serde(default = "default_disguise_algorithm")]
+    pub disguise_algorithm: String,
     /// 数据源级缓存开关；还会受全局缓存总开关约束。
     #[serde(default = "default_cache_enabled")]
     pub cache_enabled: bool,
     pub created_at: u64,
+}
+
+impl DataSource {
+    /// 是否走「受管信封」链路：一个文件在存储端是一个**信封目录**，目录名由
+    /// 根密码派生的密钥链加密，装着明文文件名、明文大小和该文件自己的密钥；
+    /// 目录里是按模版命名的若干叶子对象。
+    ///
+    /// 加密、分卷、伪装任一开启即受管，理由各不相同但都刚性：
+    /// - **加密**要藏起文件名与密钥；
+    /// - **伪装**改变了落地字节，读回来前必须先确认「这个对象确实是 SafeDrive
+    ///   写的」，否则外部上传的普通文件、乃至一张真的 BMP，都会被砍掉头部；
+    /// - **分卷**要把若干卷收在一处，并记住合起来的明文大小。
+    ///
+    /// 于是判据统一成一句话：**解得开信封就是受管对象**（该解密解密、该脱伪装
+    /// 脱伪装、该合卷合卷），解不开就是外来对象，一个字节都不动。
+    pub fn managed(&self) -> bool {
+        self.encryption_enabled || self.volume_enabled || self.disguise_enabled
+    }
 }
 
 pub const DEFAULT_VOLUME_SIZE: u64 = 300 * 1024 * 1024;
@@ -56,8 +84,13 @@ fn default_volume_size() -> u64 {
 fn default_volume_strategy() -> String {
     "random".into()
 }
-fn default_volume_name_format() -> String {
+fn default_leaf_name_format() -> String {
+    // 注册表里缺这一项的老配置只可能是「未加密 + 分卷」（那时只有这种组合有
+    // 模版），回落到当年的默认值 —— 它与现在的默认值不同，所以写死。
     "{s}_{i}.bin".into()
+}
+fn default_disguise_algorithm() -> String {
+    crate::disguise::DEFAULT_ALGORITHM.into()
 }
 fn default_cache_enabled() -> bool {
     true
@@ -362,7 +395,9 @@ mod tests {
             volume_enabled: true,
             volume_size: DEFAULT_VOLUME_SIZE,
             volume_strategy: "random".into(),
-            volume_name_format: "{s}_{i}.bin".into(),
+            leaf_name_format: "{e}".into(),
+            disguise_enabled: false,
+            disguise_algorithm: default_disguise_algorithm(),
             cache_enabled: true,
             created_at: 1,
         }

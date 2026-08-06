@@ -81,37 +81,18 @@ pub fn share_url(share_id: &str) -> String {
     format!("https://www.alipan.com/s/{share_id}")
 }
 
-/// 快传短链。备份盘文件不能走普通分享（`/s/`），只能走快传（`/t/`）。
-pub fn quick_share_url(share_id: &str) -> String {
-    format!("https://www.alipan.com/t/{share_id}")
-}
-
 /// 从分享链接里取回 `share_id`。阿里的短链有 alipan.com / aliyundrive.com
-/// 两个域名，后面还常带 `?` 查询串。普通分享是 `/s/{id}`、快传是 `/t/{id}`，
-/// 两者的 `share_id` 都在同一位置，这里一并识别。
+/// 两个域名，后面还常带 `?` 查询串。只认普通分享 `/s/{id}` —— 快传（`/t/`）
+/// 不受支持。
 pub fn share_id_from_url(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url.trim()).ok()?;
     let segments: Vec<&str> = parsed.path_segments()?.collect();
     segments
         .windows(2)
-        .find(|parts| parts[0] == "s" || parts[0] == "t")
+        .find(|parts| parts[0] == "s")
         .map(|parts| parts[1])
         .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()))
         .map(str::to_owned)
-}
-
-/// 判断分享链接是不是**快传**（`/t/{id}`）。快传没有提取码，语义与普通分享
-/// （`/s/`）不同：转存时 share_token 的密码留空，失败也不该向用户索要提取码。
-pub fn is_quick_share_url(url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
-        return false;
-    };
-    let Some(segments) = parsed.path_segments().map(|segs| segs.collect::<Vec<_>>()) else {
-        return false;
-    };
-    segments
-        .windows(2)
-        .any(|parts| parts[0] == "t" && !parts[1].is_empty())
 }
 
 /// 生成 4 位分享密码。
@@ -451,37 +432,6 @@ impl WebClient {
             ));
         }
         Ok(format!("https://{domain}.api.aliyunpds.com"))
-    }
-
-    /// 创建**快传**分享，返回快传短链。备份盘文件无法走普通分享（会被拒），
-    /// 只能快传：body 只带 `drive_file_list`，没有提取码，通常自带有效期。
-    pub async fn create_quick_share(
-        &self,
-        drive_id: &str,
-        file_ids: &[String],
-    ) -> ApiResult<String> {
-        let drive_file_list: Vec<Value> = file_ids
-            .iter()
-            .map(|file_id| json!({ "drive_id": drive_id, "file_id": file_id }))
-            .collect();
-        let body = json!({ "drive_file_list": drive_file_list });
-        let value = self
-            .post("/adrive/v1/share/create", &body, "创建快传", None)
-            .await?;
-        // 优先用响应自带的完整短链；缺了再用 share_id 拼快传短链。
-        if let Some(url) = value
-            .get("share_url")
-            .and_then(Value::as_str)
-            .filter(|url| !url.is_empty())
-        {
-            return Ok(url.to_owned());
-        }
-        value
-            .get("share_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .map(quick_share_url)
-            .ok_or_else(|| ApiError::Upstream("阿里云盘快传响应缺少 share_url / share_id".into()))
     }
 
     /// 用分享 ID + 密码换取一次性的 share_token。
@@ -978,7 +928,6 @@ mod tests {
                 .all(|byte| SHARE_PASSWORD_ALPHABET.contains(&byte))
         );
         assert_eq!(share_url("abc123"), "https://www.alipan.com/s/abc123");
-        assert_eq!(quick_share_url("abc123"), "https://www.alipan.com/t/abc123");
     }
 
     #[test]
@@ -997,24 +946,10 @@ mod tests {
         }
         assert!(share_id_from_url("https://www.alipan.com/").is_none());
         assert!(share_id_from_url("https://pan.baidu.com/s/1abc").is_some_and(|id| id == "1abc"));
-        // 快传短链 `/t/{id}` 的 share_id 同样能被识别
-        assert_eq!(
-            share_id_from_url("https://www.alipan.com/t/aB12cd34").as_deref(),
-            Some("aB12cd34")
-        );
+        // 快传短链 `/t/` 不受支持
+        assert!(share_id_from_url("https://www.alipan.com/t/aB12cd34").is_none());
         // 路径注入不能混进 share_id
         assert!(share_id_from_url("https://www.alipan.com/s/..%2Ffoo").is_none());
         assert!(share_id_from_url("not a url").is_none());
-    }
-
-    #[test]
-    fn distinguishes_quick_share_links() {
-        assert!(is_quick_share_url("https://www.alipan.com/t/aB12cd34"));
-        assert!(is_quick_share_url(
-            " https://www.aliyundrive.com/t/aB12cd34?x=1 "
-        ));
-        assert!(!is_quick_share_url("https://www.alipan.com/s/3XCkDNb1Cfa"));
-        assert!(!is_quick_share_url("https://www.alipan.com/"));
-        assert!(!is_quick_share_url("not a url"));
     }
 }

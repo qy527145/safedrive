@@ -15,7 +15,13 @@ export interface DsRecord {
   volumeEnabled: boolean;
   volumeSize: number;
   volumeStrategy: 'fixed' | 'random';
-  volumeNameFormat: string;
+  /** 存储端叶子对象的名字模版（仅受管数据源有意义）：{s} 原始文件名、
+   *  {e} 文件密钥派生的可逆索引凭据（加密时必填）、{i} 等宽序号（分卷时可用） */
+  leafNameFormat: string;
+  /** 存储侧文件伪装（与加密、分卷并列，创建后不可更改） */
+  disguiseEnabled: boolean;
+  /** 伪装算法，目前仅 'bmp' */
+  disguiseAlgorithm: string;
   cacheEnabled: boolean;
   createdAt: number;
 }
@@ -82,7 +88,11 @@ export interface DsConfig {
   /** 夸克网盘：浏览器 Cookie 全串 */
   cookie?: string;
 }
-export type DsInput = Omit<DsRecord, 'id' | 'createdAt' | 'password'> & { password?: string };
+export type DsInput = Omit<DsRecord, 'id' | 'createdAt' | 'password' | 'leafNameFormat'> & {
+  password?: string;
+  /** 非受管数据源（加密/分卷/伪装全关）没有叶子可命名，此项须省略 */
+  leafNameFormat?: string;
+};
 
 /** 内置的阿里云盘第三方应用：扫码与刷新走该应用作者的中转服务，用户不必自备应用。 */
 export interface AliyunApp {
@@ -371,7 +381,7 @@ export const api = {
   createShare: (ds: string, paths: string[], native = false, password = '') =>
     request<
       | { native: false; link: string }
-      | { native: true; url: string; password: string; quick?: boolean }
+      | { native: true; url: string; password: string }
     >(`/api/files/${ds}/share`, {
       method: 'POST',
       body: JSON.stringify({ paths, native, password }),
